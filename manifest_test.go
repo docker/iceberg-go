@@ -1641,3 +1641,89 @@ func (m *ManifestTestSuite) TestWriteManifestClosesWriterOnEntryError() {
 	m.Require().ErrorContains(err, "only entries with status ADDED")
 	m.Require().ErrorIs(err, errLimitedWrite)
 }
+
+// TestReadManifestListAthenaFieldNames verifies that manifest list entries written
+// with Athena's non-standard field names (added_data_files_count, etc.) are decoded
+// correctly via the Avro field aliases defined in the reader schema.
+func (m *ManifestTestSuite) TestReadManifestListAthenaFieldNames() {
+	// Athena writes added_data_files_count / existing_data_files_count /
+	// deleted_data_files_count instead of the spec names. Simulate that by
+	// encoding an OCF file whose embedded schema uses the Athena names.
+	athenaSchema := `{
+		"type": "record",
+		"name": "manifest_file",
+		"fields": [
+			{"name": "manifest_path",      "type": "string",           "field-id": 500},
+			{"name": "manifest_length",     "type": "long",             "field-id": 501},
+			{"name": "partition_spec_id",   "type": "int",              "field-id": 502},
+			{"name": "content",             "type": "int", "default": 0, "field-id": 517},
+			{"name": "sequence_number",     "type": "long", "default": 0, "field-id": 515},
+			{"name": "min_sequence_number", "type": "long", "default": 0, "field-id": 516},
+			{"name": "added_snapshot_id",   "type": "long",             "field-id": 503},
+			{"name": "added_data_files_count",    "type": "int",        "field-id": 504},
+			{"name": "existing_data_files_count", "type": "int",        "field-id": 505},
+			{"name": "deleted_data_files_count",  "type": "int",        "field-id": 506},
+			{"name": "added_rows_count",    "type": "long",             "field-id": 512},
+			{"name": "existing_rows_count", "type": "long",             "field-id": 513},
+			{"name": "deleted_rows_count",  "type": "long",             "field-id": 514},
+			{"name": "key_metadata", "type": ["null", "bytes"], "default": null, "field-id": 519}
+		]
+	}`
+
+	writerSchema, err := avro.Parse(athenaSchema)
+	m.Require().NoError(err)
+
+	type athenaManifestRecord struct {
+		Path              string `avro:"manifest_path"`
+		Len               int64  `avro:"manifest_length"`
+		SpecID            int32  `avro:"partition_spec_id"`
+		Content           int32  `avro:"content"`
+		SeqNumber         int64  `avro:"sequence_number"`
+		MinSeqNumber      int64  `avro:"min_sequence_number"`
+		AddedSnapshotID   int64  `avro:"added_snapshot_id"`
+		AddedDataFiles    int32  `avro:"added_data_files_count"`
+		ExistingDataFiles int32  `avro:"existing_data_files_count"`
+		DeletedDataFiles  int32  `avro:"deleted_data_files_count"`
+		AddedRows         int64  `avro:"added_rows_count"`
+		ExistingRows      int64  `avro:"existing_rows_count"`
+		DeletedRows       int64  `avro:"deleted_rows_count"`
+		Key               []byte `avro:"key_metadata"`
+	}
+
+	record := athenaManifestRecord{
+		Path:            "s3://bucket/metadata/athena-m0.avro",
+		Len:             1024,
+		SpecID:          0,
+		AddedSnapshotID: 42,
+		AddedDataFiles:  7,
+		ExistingDataFiles: 3,
+		AddedRows:       100,
+	}
+
+	var buf bytes.Buffer
+	enc, err := ocf.NewEncoderWithSchema(writerSchema, &buf,
+		ocf.WithSchemaMarshaler(func(schema avro.Schema) ([]byte, error) {
+			return []byte(athenaSchema), nil
+		}),
+		ocf.WithMetadata(map[string][]byte{
+			"format-version":     {'2'},
+			"snapshot-id":        []byte("42"),
+			"sequence-number":    []byte("1"),
+			"parent-snapshot-id": []byte("null"),
+		}),
+	)
+	m.Require().NoError(err)
+	m.Require().NoError(enc.Encode(record))
+	m.Require().NoError(enc.Close())
+
+	files, err := ReadManifestList(&buf)
+	m.Require().NoError(err)
+	m.Require().Len(files, 1)
+
+	f := files[0]
+	m.Equal("s3://bucket/metadata/athena-m0.avro", f.FilePath())
+	// Athena's added_data_files_count must be decoded into AddedFilesCount via alias.
+	m.EqualValues(7, f.AddedDataFiles(), "alias-decoded added count")
+	m.EqualValues(3, f.ExistingDataFiles(), "alias-decoded existing count")
+	m.True(f.HasAddedFiles(), "HasAddedFiles must be true")
+}
