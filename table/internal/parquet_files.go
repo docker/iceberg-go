@@ -65,6 +65,8 @@ const (
 	ParquetBloomFilterMaxBytesKey            = "write.parquet.bloom-filter-max-bytes"
 	ParquetBloomFilterMaxBytesDefault        = 1024 * 1024
 	ParquetBloomFilterColumnEnabledKeyPrefix = "write.parquet.bloom-filter-enabled.column"
+	ParquetRootRepetitionKey                = "write.parquet.root-repetition"
+	ParquetRootRepetitionDefault            = "required"
 )
 
 type parquetFormat struct{}
@@ -256,8 +258,23 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 		slog.Warn("unrecognized compression codec, falling back to uncompressed", "codec", compression)
 	}
 
+	var rootRepetition parquet.Repetition
+	switch props.Get(ParquetRootRepetitionKey, ParquetRootRepetitionDefault) {
+	case "required":
+		rootRepetition = parquet.Repetitions.Required
+	case "optional":
+		rootRepetition = parquet.Repetitions.Optional
+	case "repeated":
+		rootRepetition = parquet.Repetitions.Repeated
+	default:
+		slog.Warn("unrecognized root repetition, falling back to required",
+			"repetition", props.Get(ParquetRootRepetitionKey, ParquetRootRepetitionDefault))
+		rootRepetition = parquet.Repetitions.Required
+	}
+
 	return append(writerProps, parquet.WithCompression(codec),
-		parquet.WithCompressionLevel(compressionLevel))
+		parquet.WithCompressionLevel(compressionLevel),
+		parquet.WithRootRepetition(rootRepetition))
 }
 
 func (p parquetFormat) WriteDataFile(ctx context.Context, fs iceio.WriteFileIO, partitionValues map[int]any, info WriteFileInfo, batches []arrow.RecordBatch) (iceberg.DataFile, error) {

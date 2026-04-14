@@ -309,24 +309,45 @@ func (m *manifestFileV1) FetchEntries(fs iceio.IO, discardDeleted bool) ([]Manif
 }
 
 type manifestFile struct {
-	Path               string          `avro:"manifest_path"`
-	Len                int64           `avro:"manifest_length"`
-	SpecID             int32           `avro:"partition_spec_id"`
-	Content            ManifestContent `avro:"content"`
-	SeqNumber          int64           `avro:"sequence_number"`
-	MinSeqNumber       int64           `avro:"min_sequence_number"`
-	AddedSnapshotID    int64           `avro:"added_snapshot_id"`
-	AddedFilesCount    int32           `avro:"added_files_count"`
-	ExistingFilesCount int32           `avro:"existing_files_count"`
-	DeletedFilesCount  int32           `avro:"deleted_files_count"`
-	AddedRowsCount     int64           `avro:"added_rows_count"`
-	ExistingRowsCount  int64           `avro:"existing_rows_count"`
-	DeletedRowsCount   int64           `avro:"deleted_rows_count"`
-	PartitionList      *[]FieldSummary `avro:"partitions"`
-	Key                []byte          `avro:"key_metadata"`
-	FirstRowId         *int64          `avro:"first_row_id"`
+	Path            string          `avro:"manifest_path"`
+	Len             int64           `avro:"manifest_length"`
+	SpecID          int32           `avro:"partition_spec_id"`
+	Content         ManifestContent `avro:"content"`
+	SeqNumber       int64           `avro:"sequence_number"`
+	MinSeqNumber    int64           `avro:"min_sequence_number"`
+	AddedSnapshotID int64           `avro:"added_snapshot_id"`
+	// Canonical count fields (spec / Spark / Trino names).
+	AddedFilesCount    int32 `avro:"added_files_count"`
+	ExistingFilesCount int32 `avro:"existing_files_count"`
+	DeletedFilesCount  int32 `avro:"deleted_files_count"`
+	// Legacy count fields used by pre-1.4 Java Iceberg and Athena.
+	// Populated by the OCF decoder when the writer schema uses these names;
+	// normalizeLegacyCounts() promotes them into the canonical fields above.
+	LegacyAddedFilesCount    int32 `avro:"added_data_files_count"`
+	LegacyExistingFilesCount int32 `avro:"existing_data_files_count"`
+	LegacyDeletedFilesCount  int32 `avro:"deleted_data_files_count"`
+	AddedRowsCount           int64           `avro:"added_rows_count"`
+	ExistingRowsCount        int64           `avro:"existing_rows_count"`
+	DeletedRowsCount         int64           `avro:"deleted_rows_count"`
+	PartitionList            *[]FieldSummary `avro:"partitions"`
+	Key                      []byte          `avro:"key_metadata"`
+	FirstRowId               *int64          `avro:"first_row_id"`
 
 	version int `avro:"-"`
+}
+
+// normalizeLegacyCounts promotes pre-1.4 Java Iceberg field values (Athena names)
+// into the canonical count fields. Must be called once immediately after Avro decode.
+func (m *manifestFile) normalizeLegacyCounts() {
+	if m.AddedFilesCount <= 0 && m.LegacyAddedFilesCount > 0 {
+		m.AddedFilesCount = m.LegacyAddedFilesCount
+	}
+	if m.ExistingFilesCount <= 0 && m.LegacyExistingFilesCount > 0 {
+		m.ExistingFilesCount = m.LegacyExistingFilesCount
+	}
+	if m.DeletedFilesCount <= 0 && m.LegacyDeletedFilesCount > 0 {
+		m.DeletedFilesCount = m.LegacyDeletedFilesCount
+	}
 }
 
 func (m *manifestFile) setVersion(v int) {
@@ -341,20 +362,23 @@ func (m *manifestFile) toV1(v1file *manifestFileV1) {
 	v1file.PartitionList = m.PartitionList
 	v1file.Key = m.Key
 
-	if m.AddedFilesCount >= 0 {
-		v1file.AddedFilesCount = &m.AddedFilesCount
+	addedCount := m.AddedDataFiles()
+	if addedCount >= 0 {
+		v1file.AddedFilesCount = &addedCount
 	} else {
 		v1file.AddedFilesCount = nil
 	}
 
-	if m.ExistingFilesCount >= 0 {
-		v1file.ExistingFilesCount = &m.ExistingFilesCount
+	existingCount := m.ExistingDataFiles()
+	if existingCount >= 0 {
+		v1file.ExistingFilesCount = &existingCount
 	} else {
 		v1file.ExistingFilesCount = nil
 	}
 
-	if m.DeletedFilesCount >= 0 {
-		v1file.DeletedFilesCount = &m.DeletedFilesCount
+	deletedCount := m.DeletedDataFiles()
+	if deletedCount >= 0 {
+		v1file.DeletedFilesCount = &deletedCount
 	} else {
 		v1file.DeletedFilesCount = nil
 	}
@@ -384,15 +408,18 @@ func (m *manifestFile) Length() int64                    { return m.Len }
 func (m *manifestFile) PartitionSpecID() int32           { return m.SpecID }
 func (m *manifestFile) ManifestContent() ManifestContent { return m.Content }
 func (m *manifestFile) SnapshotID() int64                { return m.AddedSnapshotID }
-func (m *manifestFile) AddedDataFiles() int32            { return m.AddedFilesCount }
-func (m *manifestFile) ExistingDataFiles() int32         { return m.ExistingFilesCount }
-func (m *manifestFile) DeletedDataFiles() int32          { return m.DeletedFilesCount }
-func (m *manifestFile) AddedRows() int64                 { return m.AddedRowsCount }
-func (m *manifestFile) ExistingRows() int64              { return m.ExistingRowsCount }
-func (m *manifestFile) DeletedRows() int64               { return m.DeletedRowsCount }
-func (m *manifestFile) SequenceNum() int64               { return m.SeqNumber }
-func (m *manifestFile) MinSequenceNum() int64            { return m.MinSeqNumber }
-func (m *manifestFile) KeyMetadata() []byte              { return m.Key }
+
+func (m *manifestFile) AddedDataFiles() int32  { return m.AddedFilesCount }
+func (m *manifestFile) ExistingDataFiles() int32 { return m.ExistingFilesCount }
+func (m *manifestFile) DeletedDataFiles() int32  { return m.DeletedFilesCount }
+func (m *manifestFile) AddedRows() int64         { return m.AddedRowsCount }
+func (m *manifestFile) ExistingRows() int64      { return m.ExistingRowsCount }
+func (m *manifestFile) DeletedRows() int64       { return m.DeletedRowsCount }
+func (m *manifestFile) SequenceNum() int64       { return m.SeqNumber }
+func (m *manifestFile) MinSequenceNum() int64    { return m.MinSeqNumber }
+func (m *manifestFile) KeyMetadata() []byte      { return m.Key }
+func (m *manifestFile) HasAddedFiles() bool      { return m.AddedFilesCount != 0 }
+func (m *manifestFile) HasExistingFiles() bool   { return m.ExistingFilesCount != 0 }
 func (m *manifestFile) Partitions() []FieldSummary {
 	if m.PartitionList == nil {
 		return nil
@@ -400,9 +427,6 @@ func (m *manifestFile) Partitions() []FieldSummary {
 
 	return *m.PartitionList
 }
-
-func (m *manifestFile) HasAddedFiles() bool    { return m.AddedFilesCount != 0 }
-func (m *manifestFile) HasExistingFiles() bool { return m.ExistingFilesCount != 0 }
 func (m *manifestFile) FetchEntries(fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error) {
 	return fetchManifestEntries(m, fs, discardDeleted)
 }
@@ -537,6 +561,7 @@ type ManifestFile interface {
 	// WriteEntries(out io.Writer, entries []ManifestEntry) error
 
 	setVersion(int)
+	normalizeLegacyCounts()
 }
 
 type fallbackManifest[T any] interface {
@@ -553,7 +578,9 @@ func decodeManifestsWithFallback[P fallbackManifest[T], T any](dec *ocf.Decoder)
 			return nil, err
 		}
 
-		results = append(results, tmp.toFile())
+		result := tmp.toFile()
+		result.normalizeLegacyCounts()
+		results = append(results, result)
 	}
 
 	return results, dec.Error()
@@ -571,6 +598,7 @@ func decodeManifests[I interface {
 		}
 
 		tmp.setVersion(version)
+		tmp.normalizeLegacyCounts()
 		results = append(results, tmp)
 	}
 
@@ -1440,6 +1468,8 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 			}
 
 			wrapped := *(file.(*manifestFile))
+
+
 			if m.version == 3 {
 				// Ref: https://github.com/apache/iceberg/blob/ea2071568dc66148b483a82eefedcd2992b435f7/core/src/main/java/org/apache/iceberg/ManifestListWriter.java#L157-L168
 				if wrapped.Content == ManifestContentData && wrapped.FirstRowId == nil {
