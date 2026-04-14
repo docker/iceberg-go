@@ -1643,8 +1643,8 @@ func (m *ManifestTestSuite) TestWriteManifestClosesWriterOnEntryError() {
 }
 
 // TestReadManifestListAthenaFieldNames verifies that manifest list entries written
-// with Athena's non-standard field names (added_data_files_count, etc.) are decoded
-// correctly via the Avro field aliases defined in the reader schema.
+// with pre-1.4 Java Iceberg / Athena field names (added_data_files_count, etc.) are
+// decoded correctly via post-decode normalization into the canonical count fields.
 func (m *ManifestTestSuite) TestReadManifestListAthenaFieldNames() {
 	// Athena writes added_data_files_count / existing_data_files_count /
 	// deleted_data_files_count instead of the spec names. Simulate that by
@@ -1722,7 +1722,7 @@ func (m *ManifestTestSuite) TestReadManifestListAthenaFieldNames() {
 
 	f := files[0]
 	m.Equal("s3://bucket/metadata/athena-m0.avro", f.FilePath())
-	// Athena's added_data_files_count must be decoded into AddedFilesCount via alias.
+	// Athena's added_data_files_count must be normalized into AddedFilesCount.
 	m.EqualValues(7, f.AddedDataFiles(), "alias-decoded added count")
 	m.EqualValues(3, f.ExistingDataFiles(), "alias-decoded existing count")
 	m.True(f.HasAddedFiles(), "HasAddedFiles must be true")

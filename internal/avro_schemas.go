@@ -191,10 +191,8 @@ func init() {
 			avro.WithDoc("Snapshot ID that added the manifest"),
 			WithFieldID(503))),
 		// added_files_count is the spec/Spark/Trino name for field 504.
-		// added_data_files_count is the Athena name for the same logical field.
-		// Both carry field-id 504 because they are the same Iceberg field — Athena
-		// simply chose a different name. Writing both lets each reader find the name
-		// it expects; reading coalesces whichever is non-zero (see manifestFile).
+		// added_data_files_count is the pre-1.4 Java Iceberg / Athena name for the same
+		// logical field. Both are written so that Athena readers find their expected name.
 		Must(avro.NewField("added_files_count",
 			IntSchema,
 			avro.WithDoc("Added entry count"),
