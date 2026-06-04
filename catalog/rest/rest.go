@@ -65,6 +65,8 @@ const (
 	keyMetadataLocation  = "metadata_location"
 	keyOauthCredential   = "credential"
 	keyScope             = "scope"
+	keyAudience          = "audience"
+	keyResource          = "resource"
 
 	authorizationHeader = "Authorization"
 	bearerPrefix        = "Bearer"
@@ -88,9 +90,12 @@ var (
 	ErrAuthorizationExpired = fmt.Errorf("%w: authorization expired", ErrRESTError)
 	ErrServiceUnavailable   = fmt.Errorf("%w: service unavailable", ErrRESTError)
 	ErrServerError          = fmt.Errorf("%w: server error", ErrRESTError)
-	ErrCommitFailed         = fmt.Errorf("%w: commit failed, refresh and try again", ErrRESTError)
-	ErrCommitStateUnknown   = fmt.Errorf("%w: commit failed due to unknown reason", ErrRESTError)
-	ErrOAuthError           = fmt.Errorf("%w: oauth error", ErrRESTError)
+	// ErrCommitFailed wraps both ErrRESTError and table.ErrCommitFailed
+	// so that callers can detect retryable commit conflicts via
+	// errors.Is(err, table.ErrCommitFailed).
+	ErrCommitFailed       = fmt.Errorf("%w: %w", ErrRESTError, table.ErrCommitFailed)
+	ErrCommitStateUnknown = fmt.Errorf("%w: commit failed due to unknown reason", ErrRESTError)
+	ErrOAuthError         = fmt.Errorf("%w: oauth error", ErrRESTError)
 )
 
 func init() {
@@ -115,7 +120,18 @@ type contextKey string
 
 func (e errorResponse) Unwrap() error { return e.wrapping }
 func (e errorResponse) Error() string {
-	return e.Type + ": " + e.Message
+	switch {
+	case e.Type != "" && e.Message != "":
+		return e.Type + ": " + e.Message
+	case e.Message != "":
+		return e.Message
+	case e.Type != "":
+		return e.Type
+	case e.wrapping != nil:
+		return e.wrapping.Error()
+	default:
+		return "unknown REST error"
+	}
 }
 
 type identifier struct {
@@ -362,11 +378,23 @@ func handleNon200(rsp *http.Response, override map[int]error) error {
 
 	// Only try to decode if there's a body (HEAD requests don't have one)
 	if rsp.ContentLength != 0 {
-		decErr := json.NewDecoder(rsp.Body).Decode(&struct {
-			Error *errorResponse `json:"error"`
-		}{Error: &e})
+
+		payload := struct {
+			Error   *errorResponse `json:"error"`
+			Message string         `json:"message"`
+			Type    string         `json:"type"`
+		}{
+			Error: &e,
+		}
+
+		decErr := json.NewDecoder(rsp.Body).Decode(&payload)
 		if decErr != nil && decErr != io.EOF {
 			return fmt.Errorf("%w: failed to decode error response: %s", ErrRESTError, decErr.Error())
+		}
+
+		if e.Message == "" && e.Type == "" {
+			e.Message = payload.Message
+			e.Type = payload.Type
 		}
 	}
 
@@ -427,6 +455,10 @@ func fromProps(props iceberg.Properties, o *options) {
 			o.credential = v
 		case keyScope:
 			o.scope = v
+		case keyAudience:
+			o.audience = v
+		case keyResource:
+			o.resource = v
 		case keyPrefix:
 			o.prefix = v
 		case keyTlsSkipVerify:
@@ -467,6 +499,17 @@ func toProps(o *options) iceberg.Properties {
 		props[keyRestSigV4] = "true"
 		setIf(keyRestSigV4Region, o.sigv4Region)
 		setIf(keyRestSigV4Service, o.sigv4Service)
+
+		// Best-effort fallback: propagate the SigV4 signing region as
+		// a client region hint so that S3 I/O can determine the correct
+		// regional endpoint when s3.region is not explicitly set.
+		// Only applied for S3/S3Tables services where the signing region
+		// is likely to match the bucket region.
+		if o.sigv4Region != "" && (o.sigv4Service == "s3" || o.sigv4Service == "s3tables") {
+			if _, ok := props[iceio.S3ClientRegion]; !ok {
+				props[iceio.S3ClientRegion] = o.sigv4Region
+			}
+		}
 	}
 
 	setIf(keyPrefix, o.prefix)
@@ -557,9 +600,33 @@ func setupOAuthManager(r *Catalog, cl *http.Client, opts *options) AuthManager {
 	}
 	cfg.Scopes = []string{scope}
 
+	if opts.audience != "" || opts.resource != "" {
+		cfg.EndpointParams = url.Values{}
+		if opts.audience != "" {
+			cfg.EndpointParams.Set("audience", opts.audience)
+		}
+		if opts.resource != "" {
+			cfg.EndpointParams.Set("resource", opts.resource)
+		}
+	}
+
 	// Add skip oauth so we don't get in cycles trying to refresh the token
 	ctx := context.WithValue(context.Background(), skipOAuth, true)
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, cl)
+
+	// If a separate TLS config is provided for the OAuth2 server, create a
+	// dedicated HTTP client for token requests instead of reusing the catalog
+	// client. This is needed when the OAuth2 server is a different host with
+	// different TLS requirements.
+	oauthClient := cl
+	if opts.oauthTLSConfig != nil {
+		oauthClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy:           http.ProxyFromEnvironment,
+				TLSClientConfig: opts.oauthTLSConfig,
+			},
+		}
+	}
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, oauthClient)
 
 	return &Oauth2AuthManager{
 		tokenSource: cfg.TokenSource(ctx),
@@ -611,6 +678,12 @@ func (r *Catalog) createSession(ctx context.Context, opts *options) (*http.Clien
 
 	for k, v := range opts.headers {
 		session.defaultHeaders.Set(k, v)
+	}
+
+	for k, v := range opts.additionalProps {
+		if headerKey, found := strings.CutPrefix(k, "header."); found {
+			session.defaultHeaders.Set(headerKey, v)
+		}
 	}
 
 	if opts.authManager != nil {

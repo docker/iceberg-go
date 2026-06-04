@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
@@ -50,13 +51,22 @@ func (s snapshotUpdate) fastAppend() *snapshotProducer {
 	return newFastAppendFilesProducer(OpAppend, s.txn, s.io, nil, s.snapshotProps)
 }
 
-func (s snapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID) *snapshotProducer {
+// mergeOverwrite builds an overwrite producer. filter is the
+// row-level predicate the caller declared (typically the same one
+// used to plan the deletion); pass nil for a full-table overwrite.
+// validate() reads it to decide between filter-bounded and full
+// checks.
+func (s snapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID, filter iceberg.BooleanExpression) *snapshotProducer {
 	op := s.operation
 	if s.operation == OpOverwrite && s.txn.meta.currentSnapshot() == nil {
 		op = OpAppend
 	}
+	prod := newOverwriteFilesProducer(op, s.txn, s.io, commitUUID, s.snapshotProps)
+	if filter != nil {
+		prod.producerImpl.(*overwriteFiles).filter = filter
+	}
 
-	return newOverwriteFilesProducer(op, s.txn, s.io, commitUUID, s.snapshotProps)
+	return prod
 }
 
 func (s snapshotUpdate) mergeAppend() *snapshotProducer {
@@ -64,10 +74,20 @@ func (s snapshotUpdate) mergeAppend() *snapshotProducer {
 }
 
 type Transaction struct {
-	tbl  *Table
-	meta *MetadataBuilder
+	tbl    *Table
+	meta   *MetadataBuilder
+	branch string
 
 	reqs []Requirement
+
+	// validators collects per-producer conflict checks registered
+	// during this transaction's lifetime. doCommit runs them against
+	// the current catalog state before sending CommitTable so
+	// producers can reject commits whose semantics are violated by
+	// concurrent peers (partition-filter overlap, referenced-file
+	// removal). Fast/merge-append producers do not register a
+	// validator (they are safe under any isolation).
+	validators []conflictValidatorFunc
 
 	mx        sync.Mutex
 	committed bool
@@ -149,6 +169,12 @@ func (t *Transaction) SetProperties(props iceberg.Properties) error {
 	return nil
 }
 
+// UpgradeFormatVersion upgrades the table to the given format version. Downgrading
+// is not allowed. If the table is already at the given version, this is a no-op.
+func (t *Transaction) UpgradeFormatVersion(version int) error {
+	return t.apply([]Update{NewUpgradeFormatVersionUpdate(version)}, nil)
+}
+
 func (t *Transaction) UpdateSpec(caseSensitive bool) *UpdateSpec {
 	return NewUpdateSpec(t, caseSensitive)
 }
@@ -214,6 +240,15 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		opt(&cfg)
 	}
 
+	// Read table-level retention properties as the last-resort defaults,
+	// mirroring the Java implementation. When neither the ref nor the
+	// caller provides a value, fall back to the table property; when the
+	// table property is also absent use the constant default (math.MaxInt,
+	// meaning "keep everything").
+	propMaxRefAgeMs := int64(t.meta.props.GetInt(MaxRefAgeMsKey, MaxRefAgeMsDefault))
+	propMinSnapshotsToKeep := t.meta.props.GetInt(MinSnapshotsToKeepKey, MinSnapshotsToKeepDefault)
+	propMaxSnapshotAgeMs := int64(t.meta.props.GetInt(MaxSnapshotAgeMsKey, MaxSnapshotAgeMsDefault))
+
 	for refName, ref := range t.meta.refs {
 		// Assert that this ref's snapshot ID hasn't changed concurrently.
 		// This ensures we don't accidentally expire snapshots that are now
@@ -230,10 +265,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 			return err
 		}
 
-		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxSnapshotAgeMs)
-		if maxRefAgeMs == nil {
-			return errors.New("cannot find a valid value for maxRefAgeMs")
-		}
+		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxSnapshotAgeMs, &propMaxRefAgeMs)
 
 		refAge := nowMs - snap.TimestampMs
 		if refAge > *maxRefAgeMs && refName != MainBranch {
@@ -243,13 +275,9 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		}
 
 		var (
-			minSnapshotsToKeep = cmp.Or(ref.MinSnapshotsToKeep, cfg.minSnapshotsToKeep)
-			maxSnapshotAgeMs   = cmp.Or(ref.MaxSnapshotAgeMs, cfg.maxSnapshotAgeMs)
+			minSnapshotsToKeep = cmp.Or(ref.MinSnapshotsToKeep, cfg.minSnapshotsToKeep, &propMinSnapshotsToKeep)
+			maxSnapshotAgeMs   = cmp.Or(ref.MaxSnapshotAgeMs, cfg.maxSnapshotAgeMs, &propMaxSnapshotAgeMs)
 		)
-
-		if minSnapshotsToKeep == nil || maxSnapshotAgeMs == nil {
-			return errors.New("cannot find a valid value for minSnapshotsToKeep and maxSnapshotAgeMs")
-		}
 
 		if ref.SnapshotRefType != BranchRef {
 			snapsToKeep[ref.SnapshotID] = struct{}{}
@@ -329,7 +357,7 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 		appendFiles.appendDataFile(df)
 	}
 
-	updates, reqs, err := appendFiles.commit()
+	updates, reqs, err := appendFiles.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -414,7 +442,7 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID)
+	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID, nil)
 
 	for _, df := range markedForDeletion {
 		updater.deleteDataFile(df)
@@ -428,7 +456,7 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 		updater.appendDataFile(dataFile)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -515,6 +543,21 @@ type WriteOption func(*dataFileCfg)
 
 type dataFileCfg struct {
 	skipAutoNameMapping bool
+	skipDuplicateCheck  bool
+	rewriteSemantics    bool
+}
+
+// withRewriteSemantics marks an overwrite/replace operation as a
+// rewrite (compaction) rather than a user-facing overwrite. The
+// overwrite producer's default pre-commit conflict validator is
+// bypassed; the caller registers a rewrite-specific validator on the
+// transaction separately via validateNoNewDeletesForRewrittenFiles.
+// Unexported: only RewriteDataFiles passes this; there is no public
+// surface for user code to bypass overwrite isolation.
+func withRewriteSemantics() WriteOption {
+	return func(cfg *dataFileCfg) {
+		cfg.rewriteSemantics = true
+	}
 }
 
 // WithoutAutoNameMapping disables the automatic setting of the schema name
@@ -525,6 +568,18 @@ type dataFileCfg struct {
 func WithoutAutoNameMapping() WriteOption {
 	return func(cfg *dataFileCfg) {
 		cfg.skipAutoNameMapping = true
+	}
+}
+
+// WithoutDuplicateCheck disables the duplicate file path check against
+// existing data files in the current snapshot. By default, [Transaction.AddDataFiles]
+// scans all manifests to ensure no file being added already exists in the
+// table. For tables with many manifests this scan can be expensive because
+// each manifest must be read from storage. Use this option when the caller
+// can guarantee that the files being added are not already in the table.
+func WithoutDuplicateCheck() WriteOption {
+	return func(cfg *dataFileCfg) {
+		cfg.skipDuplicateCheck = true
 	}
 }
 
@@ -585,20 +640,22 @@ func (t *Transaction) AddDataFiles(ctx context.Context, dataFiles []iceberg.Data
 		return err
 	}
 
-	if s := t.meta.currentSnapshot(); s != nil {
-		referenced := make([]string, 0)
-		for df, err := range s.dataFiles(fs, nil) {
-			if err != nil {
-				return err
+	if !cfg.skipDuplicateCheck {
+		if s := t.meta.currentSnapshot(); s != nil {
+			referenced := make([]string, 0)
+			for df, err := range s.dataFiles(fs, nil) {
+				if err != nil {
+					return err
+				}
+
+				if _, ok := setToAdd[df.FilePath()]; ok {
+					referenced = append(referenced, df.FilePath())
+				}
 			}
 
-			if _, ok := setToAdd[df.FilePath()]; ok {
-				referenced = append(referenced, df.FilePath())
+			if len(referenced) > 0 {
+				return fmt.Errorf("cannot add files that are already referenced by table, files: %v", referenced)
 			}
-		}
-
-		if len(referenced) > 0 {
-			return fmt.Errorf("cannot add files that are already referenced by table, files: %v", referenced)
 		}
 	}
 
@@ -607,7 +664,7 @@ func (t *Transaction) AddDataFiles(ctx context.Context, dataFiles []iceberg.Data
 		appendFiles.appendDataFile(df)
 	}
 
-	updates, reqs, err := appendFiles.commit()
+	updates, reqs, err := appendFiles.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -709,7 +766,11 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID)
+	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID, nil)
+	if cfg.rewriteSemantics {
+		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
+		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
+	}
 
 	for _, df := range markedForDeletion {
 		updater.deleteDataFile(df)
@@ -719,7 +780,126 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 		updater.appendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(ctx)
+	if err != nil {
+		return err
+	}
+
+	return t.apply(updates, reqs)
+}
+
+// ReplaceFiles atomically replaces data files and removes associated delete files
+// in a single snapshot. This is the commit primitive for compaction: old data files
+// are replaced with new (compacted) data files, and delete files that are fully
+// applied are removed.
+func (t *Transaction) ReplaceFiles(ctx context.Context, dataFilesToDelete, dataFilesToAdd, deleteFilesToRemove []iceberg.DataFile, snapshotProps iceberg.Properties, opts ...WriteOption) error {
+	// Delegate data file replacement to existing logic.
+	if len(deleteFilesToRemove) == 0 {
+		return t.ReplaceDataFilesWithDataFiles(ctx, dataFilesToDelete, dataFilesToAdd, snapshotProps, opts...)
+	}
+
+	var cfg dataFileCfg
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	setToAdd, err := t.validateDataFilesToAdd(dataFilesToAdd, "ReplaceFiles")
+	if err != nil {
+		return err
+	}
+
+	setToDelete := make(map[string]struct{}, len(dataFilesToDelete))
+	for i, df := range dataFilesToDelete {
+		if df == nil {
+			return fmt.Errorf("nil data file at index %d for ReplaceFiles", i)
+		}
+		path := df.FilePath()
+		if path == "" {
+			return errors.New("delete data file paths must be non-empty for ReplaceFiles")
+		}
+		if _, ok := setToDelete[path]; ok {
+			return errors.New("delete data file paths must be unique for ReplaceFiles")
+		}
+		setToDelete[path] = struct{}{}
+	}
+
+	setDeleteFilesToRemove := make(map[string]struct{}, len(deleteFilesToRemove))
+	for i, df := range deleteFilesToRemove {
+		if df == nil {
+			return fmt.Errorf("nil delete file at index %d for ReplaceFiles", i)
+		}
+		path := df.FilePath()
+		if path == "" {
+			return errors.New("delete file paths must be non-empty for ReplaceFiles")
+		}
+		if _, ok := setDeleteFilesToRemove[path]; ok {
+			return errors.New("delete file paths must be unique for ReplaceFiles")
+		}
+		setDeleteFilesToRemove[path] = struct{}{}
+	}
+
+	s := t.meta.currentSnapshot()
+	if s == nil {
+		return fmt.Errorf("%w: cannot replace files in a table without an existing snapshot", ErrInvalidOperation)
+	}
+
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Scan all entries (data + delete files) in a single pass to validate
+	// that all files to delete/remove actually exist in the table.
+	markedDataForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
+	markedDeleteForRemoval := make([]iceberg.DataFile, 0, len(setDeleteFilesToRemove))
+	for df, err := range s.dataFiles(fs, nil) {
+		if err != nil {
+			return err
+		}
+		path := df.FilePath()
+		isData := df.ContentType() == iceberg.EntryContentData
+		if _, ok := setToDelete[path]; ok && isData {
+			markedDataForDeletion = append(markedDataForDeletion, df)
+		}
+		if _, ok := setDeleteFilesToRemove[path]; ok && !isData {
+			markedDeleteForRemoval = append(markedDeleteForRemoval, df)
+		}
+		if _, ok := setToAdd[path]; ok {
+			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", path)
+		}
+	}
+
+	if len(markedDataForDeletion) != len(setToDelete) {
+		return errors.New("cannot delete data files that do not belong to the table")
+	}
+	if len(markedDeleteForRemoval) != len(setDeleteFilesToRemove) {
+		return errors.New("cannot remove delete files that do not belong to the table")
+	}
+
+	if !cfg.skipAutoNameMapping {
+		if err := t.ensureNameMapping(); err != nil {
+			return err
+		}
+	}
+
+	commitUUID := uuid.New()
+	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID, nil)
+	if cfg.rewriteSemantics {
+		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
+		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
+	}
+
+	for _, df := range markedDataForDeletion {
+		updater.deleteDataFile(df)
+	}
+	for _, df := range dataFilesToAdd {
+		updater.appendDataFile(df)
+	}
+	for _, df := range markedDeleteForRemoval {
+		updater.removeDeleteFile(df)
+	}
+
+	updates, reqs, err := updater.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -808,7 +988,7 @@ func (t *Transaction) AddFiles(ctx context.Context, filePaths []string, snapshot
 		updater.appendDataFile(dataFile)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -934,7 +1114,25 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		updater.appendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	// Diagnostic: warn when an overwrite writes fewer rows than it deletes.
+	// This is not always a bug (the caller may intentionally reduce data),
+	// but it surfaces silent row loss from broken RecordReader adapters
+	// or iterator issues that would otherwise go unnoticed (#860).
+	var addedRows, deletedRows int64
+	for _, df := range updater.addedFiles {
+		addedRows += df.Count()
+	}
+	for _, df := range updater.deletedFiles {
+		deletedRows += df.Count()
+	}
+	if deletedRows > 0 && addedRows < deletedRows {
+		slog.Warn("Overwrite produced fewer rows than deleted",
+			"added_rows", addedRows,
+			"deleted_rows", deletedRows,
+			"delta", addedRows-deletedRows)
+	}
+
+	updates, reqs, err := updater.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -961,7 +1159,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, operation).mergeOverwrite(&commitUUID)
+	updater := t.updateSnapshot(fs, snapshotProps, operation).mergeOverwrite(&commitUUID, filter)
 
 	filesToDelete, filesToRewrite, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
 	if err != nil {
@@ -1000,7 +1198,7 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, OpDelete).mergeOverwrite(&commitUUID)
+	updater := t.updateSnapshot(fs, snapshotProps, OpDelete).mergeOverwrite(&commitUUID, filter)
 
 	filesToDelete, withPartialDeletions, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
 	if err != nil {
@@ -1094,7 +1292,7 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 		return fmt.Errorf("unsupported write mode: '%s'", writeDeleteMode)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.commit(ctx)
 	if err != nil {
 		return err
 	}
@@ -1202,15 +1400,13 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 				}
 			}
 
-			entries, err := manifest.FetchEntries(fs, false)
-			if err != nil {
-				return fmt.Errorf("failed to fetch manifest entries: %w", err)
-			}
-
 			localDelete := make([]iceberg.DataFile, 0)
 			localRewrite := make([]iceberg.DataFile, 0)
 
-			for _, entry := range entries {
+			for entry, err := range manifest.Entries(fs, false) {
+				if err != nil {
+					return fmt.Errorf("failed to fetch manifest entries: %w", err)
+				}
 				if entry.Status() == iceberg.EntryStatusDELETED {
 					continue
 				}
@@ -1513,7 +1709,10 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 
 	if len(t.meta.updates) > 0 {
 		t.reqs = append(t.reqs, AssertTableUUID(t.meta.uuid))
-		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs)
+		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs,
+			withCommitBranch(t.branch),
+			withCommitValidators(t.validators...),
+		)
 		if err != nil {
 			return tbl, err
 		}

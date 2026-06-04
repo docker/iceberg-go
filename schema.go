@@ -76,7 +76,62 @@ func NewSchemaWithIdentifiers(id int, identifierIDs []int, fields ...NestedField
 	s := &Schema{ID: id, fields: fields, IdentifierFieldIDs: identifierIDs}
 	s.init()
 
+	// Eagerly check for duplicate field IDs, mirroring Java's Schema.<init>.
+	// We use a lightweight walker that only inspects IDs and does not
+	// dereference field types, so schemas with nil types (used in some
+	// tests) are not affected.
+	if err := checkDuplicateFieldIDs(nil, fields); err != nil {
+		panic(err)
+	}
+
 	return s
+}
+
+// checkDuplicateFieldIDs recursively walks a list of fields and returns an
+// error if any field ID appears more than once anywhere in the tree. The
+// seen map is lazily created on the first call so the top-level caller can
+// pass nil.
+func checkDuplicateFieldIDs(seen map[int]string, fields []NestedField) error {
+	if seen == nil {
+		seen = make(map[int]string)
+	}
+	for _, f := range fields {
+		// Negative IDs (e.g. -1) are used as unassigned placeholders during
+		// schema construction; only positive IDs must be unique per the spec.
+		if f.ID > 0 {
+			if prev, ok := seen[f.ID]; ok {
+				return fmt.Errorf("%w: multiple fields for id %d: %s and %s",
+					ErrInvalidSchema, f.ID, prev, f.Name)
+			}
+			seen[f.ID] = f.Name
+		}
+
+		// Recurse into nested types without touching the type pointer for
+		// primitives — only StructType, ListType, and MapType carry child fields.
+		switch t := f.Type.(type) {
+		case *StructType:
+			if t != nil {
+				if err := checkDuplicateFieldIDs(seen, t.FieldList); err != nil {
+					return err
+				}
+			}
+		case *ListType:
+			if t != nil {
+				elem := t.ElementField()
+				if err := checkDuplicateFieldIDs(seen, []NestedField{elem}); err != nil {
+					return err
+				}
+			}
+		case *MapType:
+			if t != nil {
+				if err := checkDuplicateFieldIDs(seen, []NestedField{t.KeyField(), t.ValueField()}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (s *Schema) init() {
@@ -234,17 +289,21 @@ func (s *Schema) UnmarshalJSON(b []byte) error {
 }
 
 func (s *Schema) MarshalJSON() ([]byte, error) {
-	if s.IdentifierFieldIDs == nil {
-		s.IdentifierFieldIDs = []int{}
+	ids := s.IdentifierFieldIDs
+	if ids == nil {
+		ids = []int{}
 	}
 
 	type Alias Schema
+
+	aliasCopy := *(*Alias)(s)
+	aliasCopy.IdentifierFieldIDs = ids
 
 	return json.Marshal(struct {
 		Type   string        `json:"type"`
 		Fields []NestedField `json:"fields"`
 		*Alias
-	}{Type: "struct", Fields: s.fields, Alias: (*Alias)(s)})
+	}{Type: "struct", Fields: s.fields, Alias: &aliasCopy})
 }
 
 // FindColumnName returns the name of the column identified by the

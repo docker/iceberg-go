@@ -315,6 +315,8 @@ func (c convertToIceberg) Primitive(dt arrow.DataType) (result iceberg.NestedFie
 		return c.Primitive(dt.Encoded())
 	case *arrow.BooleanType:
 		result.Type = iceberg.PrimitiveTypes.Bool
+	case *arrow.NullType:
+		result.Type = iceberg.PrimitiveTypes.Unknown
 	case *arrow.Uint8Type, *arrow.Uint16Type, *arrow.Uint32Type,
 		*arrow.Int8Type, *arrow.Int16Type, *arrow.Int32Type:
 		result.Type = iceberg.PrimitiveTypes.Int32
@@ -625,9 +627,7 @@ func (c convertToArrow) VisitUUID() arrow.Field {
 }
 
 func (c convertToArrow) VisitUnknown() arrow.Field {
-	return arrow.Field{
-		Type: extensions.NewOpaqueType(arrow.Null, "unknown", "apache.iceberg"),
-	}
+	return arrow.Field{Type: arrow.Null}
 }
 
 var _ iceberg.SchemaVisitorPerPrimitiveType[arrow.Field] = convertToArrow{}
@@ -1096,7 +1096,6 @@ func ToRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schem
 	if err != nil {
 		return nil, err
 	}
-	st.Release()
 	out := array.RecordFromStructArray(result.(*array.Struct), nil)
 	result.Release()
 
@@ -1371,7 +1370,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.props)
+			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props)
 
 			return nil
 		})
@@ -1384,7 +1383,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 	return dataFiles, nil
 }
 
-func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, props iceberg.Properties) iceberg.DataFile {
+func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) iceberg.DataFile {
 	format := tblutils.FormatFromFileName(filePath)
 	rdr := must(format.Open(ctx, fileIO, filePath))
 	defer rdr.Close()
@@ -1418,7 +1417,16 @@ func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, curre
 		}
 	}
 
-	return statistics.ToDataFile(currentSchema, currentSpec, filePath, iceberg.ParquetFile, iceberg.EntryContentData, rdr.SourceFileSize(), partitionValues)
+	return statistics.ToDataFile(tblutils.DataFileOpts{
+		Schema:          currentSchema,
+		Spec:            currentSpec,
+		Path:            filePath,
+		Format:          iceberg.ParquetFile,
+		Content:         iceberg.EntryContentData,
+		FileSize:        rdr.SourceFileSize(),
+		PartitionValues: partitionValues,
+		SortOrderID:     sortOrderID,
+	})
 }
 
 func recordNBytes(rec arrow.RecordBatch) (total int64) {
@@ -1445,11 +1453,13 @@ func binPackRecords(itr iter.Seq2[arrow.RecordBatch, error], recordLookback int,
 }
 
 type recordWritingArgs struct {
-	sc        *arrow.Schema
-	itr       iter.Seq2[arrow.RecordBatch, error]
-	fs        iceio.WriteFileIO
-	writeUUID *uuid.UUID
-	counter   iter.Seq[int]
+	sc              *arrow.Schema
+	itr             iter.Seq2[arrow.RecordBatch, error]
+	fs              iceio.WriteFileIO
+	writeUUID       *uuid.UUID
+	counter         iter.Seq[int]
+	maxWriteWorkers int
+	clustered       bool
 }
 
 func recordsToDataFiles(ctx context.Context, rootLocation string, meta *MetadataBuilder, args recordWritingArgs) (ret iter.Seq2[iceberg.DataFile, error]) {
@@ -1488,10 +1498,6 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 		}
 	}
 
-	cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
-		return newDataFileWriter(rootLocation, fs, meta, props, opts...)
-	})
-
 	factory, err := newWriterFactory(rootLocation, args, meta, taskSchema, targetFileSize)
 	if err != nil {
 		panic(err)
@@ -1501,8 +1507,19 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 		return unpartitionedWrite(ctx, factory, args.itr)
 	}
 
+	if args.clustered {
+		return clusteredPartitionedWrite(ctx, factory.currentSpec, meta.CurrentSchema(), factory, args.itr)
+	}
+
+	cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
+		return newDataFileWriter(rootLocation, fs, meta, props, opts...)
+	})
+
 	partitionWriter := newPartitionedFanoutWriter(factory.currentSpec, cw, meta.CurrentSchema(), args.itr, factory)
 	workers := config.EnvConfig.MaxWorkers
+	if args.maxWriteWorkers > 0 {
+		workers = args.maxWriteWorkers
+	}
 
 	return partitionWriter.Write(ctx, workers)
 }
@@ -1601,8 +1618,8 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 	cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
 		return newPositionDeleteWriter(rootLocation, fs, meta, props, opts...)
 	}, withSchemaSanitization(false))
-	nextCount, stopCount := iter.Pull(args.counter)
 	if latestMetadata.PartitionSpec().IsUnpartitioned() {
+		nextCount, stopCount := iter.Pull(args.counter)
 		tasks := func(yield func(WriteTask) bool) {
 			defer stopCount()
 
@@ -1617,6 +1634,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 					FileCount:   fileCount,
 					Schema:      iceberg.PositionalDeleteSchema,
 					Batches:     batch,
+					SortOrderID: meta.defaultSortOrderID,
 				}
 				if !yield(t) {
 					return

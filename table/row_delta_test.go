@@ -381,10 +381,8 @@ func TestRowDeltaManifestContents(t *testing.T) {
 
 	// Verify manifest entries have correct content types
 	for _, m := range manifests {
-		entries, err := m.FetchEntries(fs, true)
-		require.NoError(t, err)
-
-		for _, e := range entries {
+		for e, err := range m.Entries(fs, true) {
+			require.NoError(t, err)
 			if m.ManifestContent() == iceberg.ManifestContentData {
 				assert.Equal(t, iceberg.EntryContentData, e.DataFile().ContentType())
 			} else {
@@ -422,7 +420,7 @@ func TestRowDeltaMultipleCommitsOnSameTransaction(t *testing.T) {
 }
 
 // writeParquetFile writes Arrow records to a Parquet file on local disk.
-func writeParquetFile(t *testing.T, path string, sc *arrow.Schema, jsonData string) {
+func writeParquetFile(t testing.TB, path string, sc *arrow.Schema, jsonData string) {
 	t.Helper()
 
 	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, sc, strings.NewReader(jsonData))

@@ -65,6 +65,9 @@ const (
 	ParquetBloomFilterMaxBytesKey            = "write.parquet.bloom-filter-max-bytes"
 	ParquetBloomFilterMaxBytesDefault        = 1024 * 1024
 	ParquetBloomFilterColumnEnabledKeyPrefix = "write.parquet.bloom-filter-enabled.column"
+
+	ParquetBatchSizeKey     = "read.parquet.batch-size"
+	ParquetBatchSizeDefault = 1 << 17 // 131072 rows
 )
 
 type parquetFormat struct{}
@@ -256,8 +259,30 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 		slog.Warn("unrecognized compression codec, falling back to uncompressed", "codec", compression)
 	}
 
-	return append(writerProps, parquet.WithCompression(codec),
+	writerProps = append(writerProps, parquet.WithCompression(codec),
 		parquet.WithCompressionLevel(compressionLevel))
+
+	// Bloom filter properties.
+	// write.parquet.bloom-filter-max-bytes caps the per-column bloom filter size.
+	bloomMaxBytes := props.GetInt(ParquetBloomFilterMaxBytesKey, ParquetBloomFilterMaxBytesDefault)
+	writerProps = append(writerProps, parquet.WithMaxBloomFilterBytes(int64(bloomMaxBytes)))
+
+	// write.parquet.bloom-filter-enabled.column.<col-name> enables bloom filters
+	// for individual columns. Scan all properties for the prefix.
+	prefix := ParquetBloomFilterColumnEnabledKeyPrefix + "."
+	for key, val := range props {
+		colName, ok := strings.CutPrefix(key, prefix)
+		if !ok || colName == "" {
+			continue
+		}
+		// EqualFold matches Java's Boolean.parseBoolean: only "true"
+		// (case-insensitive) is true; anything else, including "1" or
+		// "yes", is false. strconv.ParseBool behaves differently ("1" → true).
+		enabled := strings.EqualFold(val, "true")
+		writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(colName, enabled))
+	}
+
+	return writerProps
 }
 
 func (p parquetFormat) WriteDataFile(ctx context.Context, fs iceio.WriteFileIO, partitionValues map[int]any, info WriteFileInfo, batches []arrow.RecordBatch) (iceberg.DataFile, error) {
@@ -358,7 +383,20 @@ func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 	stats := w.format.DataFileStatsFromMeta(filemeta, w.info.StatsCols, w.colMapping)
 	stats.EqualityFieldIDs = w.info.EqualityFieldIDs
 
-	return stats.ToDataFile(w.info.FileSchema, w.info.Spec, w.info.FileName, iceberg.ParquetFile, w.info.Content, w.counter.Count, w.partition), nil
+	return stats.ToDataFile(DataFileOpts{
+		Schema:          w.info.FileSchema,
+		Spec:            w.info.Spec,
+		Path:            w.info.FileName,
+		Format:          iceberg.ParquetFile,
+		Content:         w.info.Content,
+		FileSize:        w.counter.Count,
+		PartitionValues: w.partition,
+		SortOrderID:     w.info.SortOrderID,
+	}), nil
+}
+
+func (w *ParquetFileWriter) Abort() error {
+	return w.fileCloser.Close()
 }
 
 type decAsIntAgg[T int32 | int64] struct {
@@ -639,6 +677,21 @@ type ParquetFileSource struct {
 	file iceberg.DataFile
 }
 
+// RowGroupBloomPred holds the physical-encoded bytes for each literal in a
+// bloom-filterable predicate on one field. A row group can be skipped when
+// NONE of the bytes appear in the column's bloom filter.
+type RowGroupBloomPred struct {
+	FieldID   int
+	PhysBytes [][]byte // one entry for EqualTo; one per value for In
+}
+
+// ParquetRowGroupTester combines stats-based and bloom filter row group pruning.
+// Pass it as the tester argument to wrapPqArrowReader.GetRecords.
+type ParquetRowGroupTester struct {
+	StatsFn    func(*metadata.RowGroupMetaData, []int) (bool, error)
+	BloomPreds []RowGroupBloomPred // nil = no bloom filter pass
+}
+
 type wrapPqArrowReader struct {
 	*pqarrow.FileReader
 }
@@ -660,27 +713,55 @@ func (w wrapPqArrowReader) PrunedSchema(projectedIDs map[int]struct{}, mapping i
 }
 
 func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester any) (array.RecordReader, error) {
-	var (
-		testRg func(*metadata.RowGroupMetaData, []int) (bool, error)
-		ok     bool
-	)
+	var rowGroupTester *ParquetRowGroupTester
 
 	if tester != nil {
-		testRg, ok = tester.(func(*metadata.RowGroupMetaData, []int) (bool, error))
+		var ok bool
+		rowGroupTester, ok = tester.(*ParquetRowGroupTester)
 		if !ok {
-			return nil, fmt.Errorf("%w: invalid tester function", iceberg.ErrInvalidArgument)
+			return nil, fmt.Errorf("%w: invalid tester type", iceberg.ErrInvalidArgument)
 		}
 	}
 
 	var rgList []int
-	if testRg != nil {
+	if rowGroupTester != nil && (rowGroupTester.StatsFn != nil || len(rowGroupTester.BloomPreds) > 0) {
+		fileMeta := w.ParquetReader().MetaData()
+		numRg := w.ParquetReader().NumRowGroups()
+
+		var (
+			fieldIDToColIdx map[int]int
+			bfReader        *metadata.BloomFilterReader
+		)
+
+		if len(rowGroupTester.BloomPreds) > 0 {
+			fieldIDToColIdx = buildFieldIDToColIdx(fileMeta)
+			bfReader = w.ParquetReader().GetBloomFilterReader()
+		}
+
 		rgList = make([]int, 0)
-		fileMeta, numRg := w.ParquetReader().MetaData(), w.ParquetReader().NumRowGroups()
 		for rg := 0; rg < numRg; rg++ {
-			rgMeta := fileMeta.RowGroup(rg)
-			use, err := testRg(rgMeta, cols)
-			if err != nil {
-				return nil, err
+			use := true
+
+			if rowGroupTester.StatsFn != nil {
+				rgMeta := fileMeta.RowGroup(rg)
+
+				var err error
+				use, err = rowGroupTester.StatsFn(rgMeta, cols)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			if !use {
+				continue
+			}
+
+			if bfReader != nil {
+				var err error
+				use, err = checkRowGroupBloomFilters(bfReader, rg, fieldIDToColIdx, rowGroupTester.BloomPreds)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			if use {
@@ -690,6 +771,69 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 	}
 
 	return w.GetRecordReader(ctx, cols, rgList)
+}
+
+// buildFieldIDToColIdx maps each Iceberg field ID to its 0-based column index in
+// the Parquet file schema. Used to translate bloom filter predicates (which carry
+// field IDs) into the column positions required by BloomFilterReader.
+func buildFieldIDToColIdx(meta *metadata.FileMetaData) map[int]int {
+	sc := meta.Schema
+	result := make(map[int]int, sc.NumColumns())
+	for i := 0; i < sc.NumColumns(); i++ {
+		fieldID := int(sc.Column(i).SchemaNode().FieldID())
+		result[fieldID] = i
+	}
+
+	return result
+}
+
+// checkRowGroupBloomFilters checks each bloom predicate against the bloom filter
+// for its column in row group rg. Returns false (skip) if ANY predicate has none
+// of its values present in the bloom filter. Returns true (keep) on any error or
+// missing bloom filter data — bloom filters are an optimisation, never a
+// correctness gate.
+func checkRowGroupBloomFilters(
+	bfReader *metadata.BloomFilterReader,
+	rg int,
+	fieldIDToColIdx map[int]int,
+	preds []RowGroupBloomPred,
+) (bool, error) {
+	rgBFReader, err := bfReader.RowGroup(rg)
+	if err != nil {
+		return false, err
+	}
+
+	if rgBFReader == nil {
+		return true, nil
+	}
+
+	for _, pred := range preds {
+		colIdx, ok := fieldIDToColIdx[pred.FieldID]
+		if !ok {
+			continue
+		}
+
+		bf, err := rgBFReader.GetColumnBloomFilter(colIdx)
+		if err != nil || bf == nil {
+			continue
+		}
+
+		hasher := bf.Hasher()
+		anyFound := false
+		for _, physBytes := range pred.PhysBytes {
+			if bf.CheckHash(hasher.Sum64(physBytes)) {
+				anyFound = true
+
+				break
+			}
+		}
+
+		if !anyFound {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func (pfs *ParquetFileSource) GetReader(ctx context.Context) (FileReader, error) {
@@ -704,10 +848,10 @@ func (pfs *ParquetFileSource) GetReader(ctx context.Context) (FileReader, error)
 		return nil, err
 	}
 
-	// TODO: grab these from the context
+	props := TablePropertiesFromContext(ctx)
 	arrProps := pqarrow.ArrowReadProperties{
 		Parallel:  true,
-		BatchSize: 1 << 17,
+		BatchSize: int64(props.GetInt(ParquetBatchSizeKey, ParquetBatchSizeDefault)),
 	}
 
 	if pfs.file.ContentType() == iceberg.EntryContentPosDeletes {

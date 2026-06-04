@@ -44,15 +44,17 @@ type writerFactory struct {
 	taskSchema     *iceberg.Schema
 	targetFileSize int64
 
-	locProvider LocationProvider
-	fileSchema  *iceberg.Schema
-	arrowSchema *arrow.Schema
-	writeProps  any
-	statsCols   map[int]tblutils.StatisticsCollector
-	currentSpec iceberg.PartitionSpec
-	fileFormat  iceberg.FileFormat
-	format      tblutils.FileFormat
-	content     iceberg.ManifestEntryContent
+	locProvider      LocationProvider
+	fileSchema       *iceberg.Schema
+	arrowSchema      *arrow.Schema
+	writeProps       any
+	statsCols        map[int]tblutils.StatisticsCollector
+	currentSpec      iceberg.PartitionSpec
+	fileFormat       iceberg.FileFormat
+	format           tblutils.FileFormat
+	content          iceberg.ManifestEntryContent
+	equalityFieldIDs []int
+	sortOrderID      int
 
 	writers               sync.Map
 	partitionLocProviders sync.Map
@@ -68,6 +70,12 @@ type writerFactoryOption func(*writerFactory)
 func withContentType(content iceberg.ManifestEntryContent) writerFactoryOption {
 	return func(w *writerFactory) {
 		w.content = content
+	}
+}
+
+func withFactoryEqualityFieldIDs(ids []int) writerFactoryOption {
+	return func(w *writerFactory) {
+		w.equalityFieldIDs = ids
 	}
 }
 
@@ -152,6 +160,7 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		format:         format,
 		nextCount:      nextCount,
 		stopCount:      stopCount,
+		sortOrderID:    meta.defaultSortOrderID,
 	}
 	for _, apply := range opts {
 		apply(f)
@@ -193,12 +202,14 @@ func (w *writerFactory) openFileWriter(ctx context.Context, partitionPath string
 	}
 
 	return w.format.NewFileWriter(ctx, w.fs, partitionValues, tblutils.WriteFileInfo{
-		FileSchema: w.fileSchema,
-		FileName:   filePath,
-		StatsCols:  w.statsCols,
-		WriteProps: w.writeProps,
-		Spec:       w.currentSpec,
-		Content:    w.content,
+		FileSchema:       w.fileSchema,
+		FileName:         filePath,
+		StatsCols:        w.statsCols,
+		WriteProps:       w.writeProps,
+		Spec:             w.currentSpec,
+		Content:          w.content,
+		EqualityFieldIDs: w.equalityFieldIDs,
+		SortOrderID:      w.sortOrderID,
 	}, w.arrowSchema)
 }
 
@@ -298,7 +309,7 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 	var currentWriter tblutils.FileWriter
 	defer func() {
 		if currentWriter != nil {
-			currentWriter.Close()
+			_ = currentWriter.Abort()
 		}
 	}()
 
@@ -380,17 +391,11 @@ func (r *RollingDataWriter) closeAndWait() error {
 	r.factory.writers.Delete(r.partitionKey)
 	r.wg.Wait()
 
-	select {
-	case err := <-r.errorCh:
-		if err != nil {
-			return fmt.Errorf("error in rolling data writer: %w", err)
-		}
-
-		return nil
-	default:
-
-		return nil
+	if err := <-r.errorCh; err != nil {
+		return fmt.Errorf("error in rolling data writer: %w", err)
 	}
+
+	return nil
 }
 
 func (w *writerFactory) closeAll() error {

@@ -18,9 +18,12 @@
 package table
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -467,4 +470,153 @@ func TestOrphanCleanup_EdgeCases(t *testing.T) {
 		result = applyAuthorityEquivalence("host", nil)
 		assert.Equal(t, "host", result)
 	})
+}
+
+func TestGetReferencedFiles_IncludesStatisticsFiles(t *testing.T) {
+	const metaJSON = `{
+  "format-version": 2,
+  "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+  "location": "s3://bucket/test/location",
+  "last-sequence-number": 0,
+  "last-updated-ms": 1602638573590,
+  "last-column-id": 1,
+  "current-schema-id": 0,
+  "schemas": [
+    {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]}
+  ],
+  "default-spec-id": 0,
+  "partition-specs": [{"spec-id": 0, "fields": []}],
+  "last-partition-id": 0,
+  "default-sort-order-id": 0,
+  "sort-orders": [{"order-id": 0, "fields": []}],
+  "metadata-log": [],
+  "snapshot-log": [],
+  "statistics": [
+    {
+      "snapshot-id": 1,
+      "statistics-path": "s3://bucket/stats/table-stats.puffin",
+      "file-size-in-bytes": 1024,
+      "file-footer-size-in-bytes": 512,
+      "blob-metadata": []
+    },
+    {
+      "snapshot-id": 2,
+      "statistics-path": "",
+      "file-size-in-bytes": 0,
+      "file-footer-size-in-bytes": 0,
+      "blob-metadata": []
+    }
+  ],
+  "partition-statistics": [
+    {
+      "snapshot-id": 1,
+      "statistics-path": "s3://bucket/stats/part-stats.puffin",
+      "file-size-in-bytes": 512
+    }
+  ]
+}`
+
+	meta, err := ParseMetadataString(metaJSON)
+	require.NoError(t, err)
+
+	tbl := Table{
+		metadata:         meta,
+		metadataLocation: "s3://bucket/test/location/metadata/v1.metadata.json",
+	}
+
+	// No snapshots: FileIO is not used; statistics paths must still be referenced.
+	refs, err := tbl.getReferencedFiles(nil)
+	require.NoError(t, err)
+
+	assert.True(t, refs["s3://bucket/stats/table-stats.puffin"])
+	assert.True(t, refs["s3://bucket/stats/part-stats.puffin"])
+	assert.True(t, refs[tbl.metadataLocation])
+	assert.False(t, refs["s3://bucket/stats/not-referenced.puffin"])
+	assert.False(t, refs[""])
+}
+
+// mockBulkRemovableIO is a test double that implements BulkRemovableIO.
+type mockBulkRemovableIO struct {
+	bulkCalled bool
+	bulkPaths  []string
+}
+
+func (m *mockBulkRemovableIO) Open(string) (io.File, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *mockBulkRemovableIO) Remove(string) error {
+	return errors.New("Remove should not be called when BulkRemovableIO is available")
+}
+
+func (m *mockBulkRemovableIO) DeleteFiles(_ context.Context, paths []string) ([]string, error) {
+	m.bulkCalled = true
+	m.bulkPaths = paths
+
+	return paths, nil
+}
+
+func TestDeleteFilesUsesBulkRemovableIO(t *testing.T) {
+	mock := &mockBulkRemovableIO{}
+	orphans := []string{"s3://bucket/data/orphan1.parquet", "s3://bucket/data/orphan2.parquet"}
+	cfg := &orphanCleanupConfig{}
+
+	deleted, err := deleteFiles(context.Background(), mock, orphans, cfg)
+	require.NoError(t, err)
+	assert.True(t, mock.bulkCalled)
+	assert.Equal(t, orphans, mock.bulkPaths)
+	assert.Equal(t, orphans, deleted)
+}
+
+func TestDeleteFilesWithCustomDeleteFunc(t *testing.T) {
+	mock := &mockBulkRemovableIO{}
+
+	var customDeleted []string
+	cfg := &orphanCleanupConfig{
+		deleteFunc: func(path string) error {
+			customDeleted = append(customDeleted, path)
+
+			return nil
+		},
+		maxConcurrency: 1,
+	}
+	orphans := []string{"s3://bucket/data/orphan1.parquet"}
+
+	deleted, err := deleteFiles(context.Background(), mock, orphans, cfg)
+	require.NoError(t, err)
+	assert.False(t, mock.bulkCalled, "BulkRemovableIO should not be used when deleteFunc is set")
+	assert.Equal(t, orphans, customDeleted)
+	assert.Equal(t, orphans, deleted)
+}
+
+func TestDeleteFilesEmpty(t *testing.T) {
+	deleted, err := deleteFiles(context.Background(), nil, nil, &orphanCleanupConfig{})
+	require.NoError(t, err)
+	assert.Nil(t, deleted)
+}
+
+// mockPlainIO implements only IO (no BulkRemovableIO) to verify fallback behavior.
+type mockPlainIO struct {
+	removed []string
+}
+
+func (m *mockPlainIO) Open(string) (io.File, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *mockPlainIO) Remove(name string) error {
+	m.removed = append(m.removed, name)
+
+	return nil
+}
+
+func TestDeleteFilesFallsBackToExistingBehavior(t *testing.T) {
+	mock := &mockPlainIO{}
+	orphans := []string{"s3://bucket/data/orphan1.parquet", "s3://bucket/data/orphan2.parquet"}
+	cfg := &orphanCleanupConfig{maxConcurrency: 1}
+
+	deleted, err := deleteFiles(context.Background(), mock, orphans, cfg)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, orphans, mock.removed)
+	assert.ElementsMatch(t, orphans, deleted)
 }

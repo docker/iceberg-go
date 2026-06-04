@@ -18,7 +18,9 @@
 package table
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path"
 	"slices"
@@ -29,6 +31,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -208,12 +211,12 @@ func TestMetadataV1Parsing(t *testing.T) {
 	assert.True(t, meta.CurrentSchema().Equals(expected))
 	assert.Equal(t, []iceberg.PartitionSpec{
 		iceberg.NewPartitionSpec(iceberg.PartitionField{
-			SourceID: 1, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
+			SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
 		}),
 	}, meta.PartitionSpecs())
 
 	assert.Equal(t, iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceID: 1, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
+		SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
 	}), meta.PartitionSpec())
 
 	assert.Equal(t, 0, meta.DefaultPartitionSpec())
@@ -723,10 +726,10 @@ func TestNewMetadataWithExplicitV1Format(t *testing.T) {
 	)
 
 	partitionSpec := iceberg.NewPartitionSpecID(10,
-		iceberg.PartitionField{SourceID: 22, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+		iceberg.PartitionField{SourceIDs: []int{22}, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
 
 	sortOrder, err := NewSortOrder(10, []SortField{{
-		SourceID:  10,
+		SourceIDs: []int{10},
 		Transform: iceberg.IdentityTransform{},
 		Direction: SortASC, NullOrder: NullsLast,
 	}})
@@ -741,10 +744,10 @@ func TestNewMetadataWithExplicitV1Format(t *testing.T) {
 		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
 
 	expectedSpec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 2, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+		iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
 
 	expectedSortOrder, err := NewSortOrder(1, []SortField{{
-		SourceID: 1, Transform: iceberg.IdentityTransform{},
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
 		Direction: SortASC, NullOrder: NullsLast,
 	}})
 	require.NoError(t, err)
@@ -786,10 +789,10 @@ func TestNewMetadataV2Format(t *testing.T) {
 	)
 
 	partitionSpec := iceberg.NewPartitionSpecID(10,
-		iceberg.PartitionField{SourceID: 22, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+		iceberg.PartitionField{SourceIDs: []int{22}, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
 
 	sortOrder, err := NewSortOrder(10, []SortField{{
-		SourceID:  10,
+		SourceIDs: []int{10},
 		Transform: iceberg.IdentityTransform{},
 		Direction: SortASC, NullOrder: NullsLast,
 	}})
@@ -806,10 +809,10 @@ func TestNewMetadataV2Format(t *testing.T) {
 		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
 
 	expectedSpec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 2, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+		iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
 
 	expectedSortOrder, err := NewSortOrder(1, []SortField{{
-		SourceID: 1, Transform: iceberg.IdentityTransform{},
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
 		Direction: SortASC, NullOrder: NullsLast,
 	}})
 	require.NoError(t, err)
@@ -1230,7 +1233,7 @@ func TestTableMetadataV1PartitionSpecsWithoutDefaultId(t *testing.T) {
 	require.Equal(t, spec.NumFields(), 1)
 	require.Equal(t, spec.Field(0).Name, "y")
 	require.Equal(t, spec.Field(0).Transform, iceberg.IdentityTransform{})
-	require.Equal(t, spec.Field(0).SourceID, 2)
+	require.Equal(t, spec.Field(0).SourceID(), 2)
 }
 
 func TestTableMetadataV2MissingPartitionSpecs(t *testing.T) {
@@ -1796,4 +1799,58 @@ func getTestTableMetadata(fileName string) (Metadata, error) {
 	}
 
 	return meta, nil
+}
+
+func TestV3PartitionStatisticsRoundTrip(t *testing.T) {
+	const testFile = "TableMetadataV3WithPartitionStatistics.json"
+
+	raw, err := os.ReadFile(path.Join("testdata", testFile))
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(raw)
+	require.NoError(t, err)
+	require.Equal(t, 3, meta.Version())
+
+	partStats := slices.Collect(meta.PartitionStatistics())
+	require.Len(t, partStats, 2)
+
+	assert.Equal(t, int64(3051729675574597004), partStats[0].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3051729675574597004.parquet", partStats[0].StatisticsPath)
+	assert.Equal(t, int64(42330), partStats[0].FileSizeInBytes)
+
+	assert.Equal(t, int64(3055729675574597004), partStats[1].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3055729675574597004.parquet", partStats[1].StatisticsPath)
+	assert.Equal(t, int64(65871), partStats[1].FileSizeInBytes)
+
+	serialized, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	reparsed, err := ParseMetadataBytes(serialized)
+	require.NoError(t, err)
+
+	roundTripStats := slices.Collect(reparsed.PartitionStatistics())
+	require.Len(t, roundTripStats, 2)
+	assert.Equal(t, partStats, roundTripStats)
+
+	assert.JSONEq(t, string(raw), string(serialized))
+}
+
+func TestZstdGoldenFixture(t *testing.T) {
+	compressed, err := os.ReadFile(path.Join("testdata", "TableMetadataV2Valid.zstd.metadata.json"))
+	require.NoError(t, err)
+
+	dec, err := zstd.NewReader(bytes.NewReader(compressed))
+	require.NoError(t, err)
+	defer dec.Close()
+
+	data, err := io.ReadAll(dec)
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(data)
+	require.NoError(t, err)
+
+	expected, err := getTestTableMetadata("TableMetadataV2ValidMinimal.json")
+	require.NoError(t, err)
+
+	assert.True(t, expected.Equals(meta))
 }

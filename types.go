@@ -71,6 +71,23 @@ func (p Properties) GetInt(key string, defVal int) int {
 	return defVal
 }
 
+// PropUInt reads an unsigned-integer property by key. A missing key,
+// an unparseable value, or a negative value returns defVal — PropUInt
+// uses strconv.ParseUint, which rejects negatives rather than silently
+// wrapping them to a large positive number.
+func PropUInt(p Properties, key string, defVal uint) uint {
+	v, ok := p[key]
+	if !ok {
+		return defVal
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return defVal
+	}
+
+	return uint(n)
+}
+
 // Type is an interface representing any of the available iceberg types,
 // such as primitives (int32/int64/etc.) or nested types (list/struct/map).
 type Type interface {
@@ -631,9 +648,9 @@ func (t Timestamp) ToTime() time.Time {
 }
 
 func (t Timestamp) ToDate() Date {
-	tm := time.UnixMicro(int64(t)).UTC()
+	const microsecondsPerDay = int64((time.Hour * 24) / time.Microsecond)
 
-	return Date(tm.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+	return Date(int32(floorDiv(int64(t), microsecondsPerDay)))
 }
 
 func (t Timestamp) ToNanos() TimestampNano {
@@ -651,9 +668,9 @@ func (t TimestampNano) ToMicros() Timestamp {
 }
 
 func (t TimestampNano) ToDate() Date {
-	tm := time.Unix(0, int64(t)).UTC()
+	const nanosecondsPerDay = int64(time.Hour * 24)
 
-	return Date(tm.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+	return Date(int32(floorDiv(int64(t), nanosecondsPerDay)))
 }
 
 // TimestampType represents a number of microseconds since the unix epoch

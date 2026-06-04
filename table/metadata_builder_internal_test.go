@@ -19,11 +19,13 @@ package table
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,7 +44,7 @@ func sortOrder() SortOrder {
 		1,
 		[]SortField{
 			{
-				SourceID:  3,
+				SourceIDs: []int{3},
 				Direction: SortDESC,
 				NullOrder: NullsFirst,
 				Transform: iceberg.BucketTransform{NumBuckets: 4},
@@ -59,7 +61,7 @@ func sortOrder() SortOrder {
 func partitionSpec() iceberg.PartitionSpec {
 	return iceberg.NewPartitionSpecID(0,
 		iceberg.PartitionField{
-			SourceID:  2,
+			SourceIDs: []int{2},
 			Name:      "y",
 			Transform: iceberg.IdentityTransform{},
 		},
@@ -192,7 +194,7 @@ func TestReassignIds(t *testing.T) {
 
 	sortOrder, err := NewSortOrder(10, []SortField{
 		{
-			SourceID:  11,
+			SourceIDs: []int{11},
 			Transform: iceberg.IdentityTransform{},
 			Direction: SortASC,
 			NullOrder: NullsFirst,
@@ -252,7 +254,7 @@ func TestReassignIds(t *testing.T) {
 
 	expectedSortOrder, err := NewSortOrder(1, []SortField{
 		{
-			SourceID:  1,
+			SourceIDs: []int{1},
 			Transform: iceberg.IdentityTransform{},
 			Direction: SortASC,
 			NullOrder: NullsFirst,
@@ -395,7 +397,7 @@ func TestSetSortOrder(t *testing.T) {
 	builder := builderWithoutChanges(2)
 	added, err := NewSortOrder(10, []SortField{
 		{
-			SourceID:  1,
+			SourceIDs: []int{1},
 			Transform: iceberg.IdentityTransform{}, Direction: SortASC, NullOrder: NullsFirst,
 		},
 	})
@@ -405,7 +407,7 @@ func TestSetSortOrder(t *testing.T) {
 	require.NoError(t, builder.AddSortOrder(&added))
 	expected, err := NewSortOrder(2, []SortField{
 		{
-			SourceID:  1,
+			SourceIDs: []int{1},
 			Transform: iceberg.IdentityTransform{}, Direction: SortASC, NullOrder: NullsFirst,
 		},
 	})
@@ -443,7 +445,9 @@ func TestSetRef(t *testing.T) {
 
 	require.NoError(t, builder.AddSnapshot(&snapshot))
 	err := builder.SetSnapshotRef(MainBranch, 10, BranchRef, WithMinSnapshotsToKeep(10))
-	require.ErrorContains(t, err, "can't set snapshot ref main to unknown snapshot 10: snapshot with id 10 not found")
+	require.ErrorIs(t, err, ErrSnapshotNotFound,
+		"missing snapshot lookup must wrap ErrSnapshotNotFound so callers can detect via errors.Is")
+	require.ErrorContains(t, err, "can't set snapshot ref main to unknown snapshot 10")
 	require.NoError(t, builder.SetSnapshotRef(MainBranch, 1, BranchRef, WithMinSnapshotsToKeep(10)))
 	require.Len(t, builder.snapshotList, 1)
 	snap, err := builder.SnapshotByID(1)
@@ -620,6 +624,128 @@ func TestRemoveSnapshotRemovesBranch(t *testing.T) {
 		require.NotEqual(t, r.SnapshotID, snapshot.SnapshotID)
 		require.NotEqual(t, k, "new_branch")
 	}
+}
+
+// TestRemoveSnapshotsPrunesStatistics verifies that RemoveSnapshots also
+// prunes StatisticsList and PartitionStatsList entries whose SnapshotID
+// matches a removed snapshot. See iceberg-go#836.
+func TestRemoveSnapshotsPrunesStatistics(t *testing.T) {
+	const (
+		removedID = int64(100)
+		keptID    = int64(200)
+	)
+
+	// Build minimal metadata directly so we can seed statistics and
+	// snapshots without going through AddSnapshot's timestamp checks.
+	currentID := int64(300)
+	lastPartitionID := 999
+	commonMeta := commonMetadata{
+		FormatVersion:   2,
+		UUID:            uuid.New(),
+		Loc:             "s3://test/table",
+		LastUpdatedMS:   1000,
+		LastColumnId:    1,
+		SchemaList:      []*iceberg.Schema{iceberg.NewSchema(0)},
+		CurrentSchemaID: 0,
+		Specs:           []iceberg.PartitionSpec{*iceberg.UnpartitionedSpec},
+		DefaultSpecID:   0,
+		LastPartitionID: &lastPartitionID,
+		Props:           iceberg.Properties{},
+		SnapshotList: []Snapshot{
+			{SnapshotID: removedID, TimestampMs: 1001, ManifestList: "/snap-100.avro"},
+			{SnapshotID: keptID, TimestampMs: 1002, ManifestList: "/snap-200.avro"},
+			{SnapshotID: currentID, TimestampMs: 1003, ManifestList: "/snap-300.avro"},
+		},
+		CurrentSnapshotID:  &currentID,
+		SnapshotLog:        []SnapshotLogEntry{{SnapshotID: currentID, TimestampMs: 1003}},
+		SortOrderList:      []SortOrder{UnsortedSortOrder},
+		DefaultSortOrderID: 0,
+		SnapshotRefs:       map[string]SnapshotRef{MainBranch: {SnapshotID: currentID, SnapshotRefType: BranchRef}},
+		StatisticsList: []StatisticsFile{
+			{SnapshotID: removedID, StatisticsPath: "s3://stats/removed.puffin"},
+			{SnapshotID: keptID, StatisticsPath: "s3://stats/kept.puffin"},
+		},
+		PartitionStatsList: []PartitionStatisticsFile{
+			{SnapshotID: removedID, StatisticsPath: "s3://partstats/removed.parquet"},
+			{SnapshotID: keptID, StatisticsPath: "s3://partstats/kept.parquet"},
+		},
+	}
+	meta := &metadataV2{LastSeqNum: 0, commonMetadata: commonMeta}
+
+	builder, err := MetadataBuilderFromBase(meta, "")
+	require.NoError(t, err)
+
+	// Sanity: MetadataBuilderFromBase must load statistics from the base.
+	require.Len(t, builder.statisticsList, 2,
+		"MetadataBuilderFromBase should load StatisticsList from the base metadata")
+	require.Len(t, builder.partitionStatsList, 2,
+		"MetadataBuilderFromBase should load PartitionStatsList from the base metadata")
+
+	require.NoError(t, builder.RemoveSnapshots([]int64{removedID}, false))
+
+	require.Len(t, builder.statisticsList, 1, "statistics for removed snapshot should be pruned")
+	require.Equal(t, keptID, builder.statisticsList[0].SnapshotID)
+
+	require.Len(t, builder.partitionStatsList, 1, "partition statistics for removed snapshot should be pruned")
+	require.Equal(t, keptID, builder.partitionStatsList[0].SnapshotID)
+
+	// And the kept entries survive a Build round trip.
+	rebuilt, err := builder.Build()
+	require.NoError(t, err)
+	require.Len(t, slices.Collect(rebuilt.Statistics()), 1)
+	require.Len(t, slices.Collect(rebuilt.PartitionStatistics()), 1)
+}
+
+// TestBuildPreservesStatistics pins the buildCommonMetadata fix: a plain
+// MetadataBuilderFromBase → Build() round-trip must preserve StatisticsList
+// and PartitionStatsList without any RemoveSnapshots call.  Before the fix,
+// Build() silently dropped all statistics on every builder operation.
+func TestBuildPreservesStatistics(t *testing.T) {
+	const snapID = int64(42)
+	currentID := snapID
+	lastPartitionID := 0
+	commonMeta := commonMetadata{
+		FormatVersion:   2,
+		UUID:            uuid.New(),
+		Loc:             "s3://test/table",
+		LastUpdatedMS:   1000,
+		LastColumnId:    1,
+		SchemaList:      []*iceberg.Schema{iceberg.NewSchema(0)},
+		CurrentSchemaID: 0,
+		Specs:           []iceberg.PartitionSpec{*iceberg.UnpartitionedSpec},
+		DefaultSpecID:   0,
+		LastPartitionID: &lastPartitionID,
+		Props:           iceberg.Properties{},
+		SnapshotList: []Snapshot{
+			{SnapshotID: snapID, TimestampMs: 1001, ManifestList: "/snap.avro"},
+		},
+		CurrentSnapshotID:  &currentID,
+		SnapshotLog:        []SnapshotLogEntry{{SnapshotID: snapID, TimestampMs: 1001}},
+		SortOrderList:      []SortOrder{UnsortedSortOrder},
+		DefaultSortOrderID: 0,
+		SnapshotRefs:       map[string]SnapshotRef{MainBranch: {SnapshotID: snapID, SnapshotRefType: BranchRef}},
+		StatisticsList: []StatisticsFile{
+			{SnapshotID: snapID, StatisticsPath: "s3://stats/snap.puffin"},
+		},
+		PartitionStatsList: []PartitionStatisticsFile{
+			{SnapshotID: snapID, StatisticsPath: "s3://partstats/snap.parquet"},
+		},
+	}
+	meta := &metadataV2{commonMetadata: commonMeta}
+
+	builder, err := MetadataBuilderFromBase(meta, "")
+	require.NoError(t, err)
+
+	// No mutations — just rebuild.
+	rebuilt, err := builder.Build()
+	require.NoError(t, err)
+
+	require.Len(t, slices.Collect(rebuilt.Statistics()), 1,
+		"Build() must not silently drop StatisticsList")
+	require.Len(t, slices.Collect(rebuilt.PartitionStatistics()), 1,
+		"Build() must not silently drop PartitionStatsList")
+	require.Equal(t, snapID, slices.Collect(rebuilt.Statistics())[0].SnapshotID)
+	require.Equal(t, snapID, slices.Collect(rebuilt.PartitionStatistics())[0].SnapshotID)
 }
 
 func TestExpireMetadataLog(t *testing.T) {
@@ -1688,6 +1814,22 @@ func TestUnknownTypeValidation(t *testing.T) {
 		require.ErrorContains(t, err, "must be optional")
 	})
 
+	t.Run("ReservedFieldIDRowID", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: iceberg.RowIDFieldID, Name: "bad_field", Type: iceberg.PrimitiveTypes.Int64},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "reserved metadata column ID")
+	})
+	t.Run("ReservedFieldIDLastUpdatedSeqNum", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: iceberg.LastUpdatedSequenceNumberFieldID, Name: "bad_field", Type: iceberg.PrimitiveTypes.Int64},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "reserved metadata column ID")
+	})
 	t.Run("InvalidUnknownMapValue", func(t *testing.T) {
 		invalidSchema := iceberg.NewSchema(1,
 			iceberg.NestedField{ID: 2, Name: "invalid_map", Type: &iceberg.MapType{KeyID: 3, KeyType: iceberg.StringType{}, ValueID: 4, ValueType: iceberg.UnknownType{}, ValueRequired: true}, Required: false},
@@ -1695,5 +1837,164 @@ func TestUnknownTypeValidation(t *testing.T) {
 		err := checkSchemaCompatibility(invalidSchema, 3)
 		require.Error(t, err, "should error when unknown type is used as map value")
 		require.ErrorContains(t, err, "must be optional")
+	})
+}
+
+func TestComplexTypeDefaultValidation(t *testing.T) {
+	t.Run("InvalidStructInitialDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "s", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.Int32Type{}, Required: false},
+				},
+			}, Required: false, InitialDefault: "not a struct"},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "struct type field 's' (id: 1) must have null or JSON object initial-default")
+	})
+
+	t.Run("InvalidStructWriteDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "s", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.Int32Type{}, Required: false},
+				},
+			}, Required: false, WriteDefault: float64(42)},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "struct type field 's' (id: 1) must have null or JSON object write-default")
+	})
+
+	t.Run("ValidStructNullDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "s", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.Int32Type{}, Required: false},
+				},
+			}, Required: false},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("ValidStructObjectDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "s", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.Int32Type{}, Required: false},
+				},
+			}, Required: false, InitialDefault: map[string]any{"x": float64(1)}},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("InvalidListInitialDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "l", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.StringType{}, ElementRequired: false,
+			}, Required: false, InitialDefault: "not a list"},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "list type field 'l' (id: 1) must have null or JSON array initial-default")
+	})
+
+	t.Run("InvalidListWriteDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "l", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.StringType{}, ElementRequired: false,
+			}, Required: false, WriteDefault: map[string]any{"a": "b"}},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "list type field 'l' (id: 1) must have null or JSON array write-default")
+	})
+
+	t.Run("ValidListNullDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "l", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.StringType{}, ElementRequired: false,
+			}, Required: false},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("ValidListArrayDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "l", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.StringType{}, ElementRequired: false,
+			}, Required: false, InitialDefault: []any{"a", "b"}},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("InvalidMapInitialDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.StringType{}, ValueID: 3, ValueType: iceberg.Int32Type{}, ValueRequired: false,
+			}, Required: false, InitialDefault: []any{"not", "a", "map"}},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "map type field 'm' (id: 1) must have null or JSON object initial-default")
+	})
+
+	t.Run("InvalidMapWriteDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.StringType{}, ValueID: 3, ValueType: iceberg.Int32Type{}, ValueRequired: false,
+			}, Required: false, WriteDefault: "not a map"},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "map type field 'm' (id: 1) must have null or JSON object write-default")
+	})
+
+	t.Run("ValidMapNullDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.StringType{}, ValueID: 3, ValueType: iceberg.Int32Type{}, ValueRequired: false,
+			}, Required: false},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("ValidMapObjectDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.StringType{}, ValueID: 3, ValueType: iceberg.Int32Type{}, ValueRequired: false,
+			}, Required: false, InitialDefault: map[string]any{"keys": []any{"a"}, "values": []any{float64(1)}}},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("PrimitiveDefaultPassesThrough", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "n", Type: iceberg.Int64Type{}, Required: false, InitialDefault: float64(42)},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.NoError(t, err)
+	})
+
+	t.Run("InvalidNestedStructDefault", func(t *testing.T) {
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "outer", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "inner", Type: &iceberg.ListType{
+						ElementID: 3, Element: iceberg.StringType{}, ElementRequired: false,
+					}, Required: false, InitialDefault: "not a list"},
+				},
+			}, Required: false},
+		)
+		err := checkSchemaCompatibility(schema, 3)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "list type field 'inner' (id: 2) must have null or JSON array initial-default")
 	})
 }

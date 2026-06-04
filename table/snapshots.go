@@ -345,20 +345,56 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 		}
 
 		for _, m := range manifests {
-			dataFiles, err := m.FetchEntries(fio, false)
-			if err != nil {
-				yield(nil, err)
+			for entry, err := range m.Entries(fio, false) {
+				if err != nil {
+					yield(nil, err)
 
-				return
-			}
+					return
+				}
 
-			for _, f := range dataFiles {
 				if fileFilter != nil {
-					if _, ok := fileFilter[f.DataFile().ContentType()]; !ok {
+					if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
 						continue
 					}
 				}
-				if !yield(f.DataFile(), nil) {
+				if !yield(entry.DataFile(), nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// entries iterates every manifest entry in the snapshot, filtered by
+// manifest content (data or deletes). It is the entry-level analog
+// of dataFiles and exposes the underlying ManifestEntry so callers
+// can inspect Status / SnapshotID / DataFile — needed by conflict
+// validation where attribution of an entry to a specific snapshot
+// matters.
+//
+// manifestContent < 0 yields entries across both data and delete
+// manifests.
+func (s Snapshot) entries(fio iceio.IO, manifestContent iceberg.ManifestContent) iter.Seq2[iceberg.ManifestEntry, error] {
+	return func(yield func(iceberg.ManifestEntry, error) bool) {
+		manifests, err := s.Manifests(fio)
+		if err != nil {
+			yield(nil, err)
+
+			return
+		}
+
+		for _, m := range manifests {
+			if manifestContent >= 0 && m.ManifestContent() != manifestContent {
+				continue
+			}
+
+			for entry, err := range m.Entries(fio, false) {
+				if err != nil {
+					yield(nil, err)
+
+					return
+				}
+				if !yield(entry, nil) {
 					return
 				}
 			}
@@ -465,7 +501,7 @@ func (s *SnapshotSummaryCollector) build() iceberg.Properties {
 
 func updateSnapshotSummaries(sum Summary, previous iceberg.Properties) (Summary, error) {
 	switch sum.Operation {
-	case OpAppend, OpOverwrite, OpDelete:
+	case OpAppend, OpOverwrite, OpDelete, OpReplace:
 	default:
 		return sum, fmt.Errorf("%w: operation: %s", iceberg.ErrNotImplemented, sum.Operation)
 	}

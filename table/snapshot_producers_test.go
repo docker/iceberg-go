@@ -31,7 +31,6 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
-	_ "github.com/apache/iceberg-go/io/gocloud"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,6 +40,14 @@ type limitedWriteCloser struct {
 	limit   int
 	written int
 	err     error
+
+	// parent and path, when both set, cause Close() to persist the
+	// successfully-written payload back into parent.files[path]. This makes
+	// the orphan/cleanup tests exercise the real write→delete cycle (R3)
+	// instead of pre-populating wfs.files with a placeholder.
+	parent *memIO
+	path   string
+	buf    bytes.Buffer
 }
 
 func (w *limitedWriteCloser) Write(p []byte) (int, error) {
@@ -48,11 +55,21 @@ func (w *limitedWriteCloser) Write(p []byte) (int, error) {
 		return 0, w.err
 	}
 	w.written += len(p)
+	if w.parent != nil {
+		w.buf.Write(p)
+	}
 
 	return len(p), nil
 }
 
 func (w *limitedWriteCloser) Close() error {
+	if w.parent == nil || w.path == "" {
+		return nil
+	}
+	w.parent.mu.Lock()
+	defer w.parent.mu.Unlock()
+	w.parent.files[w.path] = append([]byte(nil), w.buf.Bytes()...)
+
 	return nil
 }
 
@@ -63,6 +80,7 @@ func (w *limitedWriteCloser) ReadFrom(r io.Reader) (int64, error) {
 type memIO struct {
 	limit int
 	err   error
+	mu    sync.Mutex
 	files map[string][]byte
 }
 
@@ -75,7 +93,9 @@ func newMemIO(limit int, err error) *memIO {
 }
 
 func (m *memIO) Open(name string) (iceio.File, error) {
+	m.mu.Lock()
 	data, ok := m.files[name]
+	m.mu.Unlock()
 	if !ok {
 		return nil, fs.ErrNotExist
 	}
@@ -84,16 +104,20 @@ func (m *memIO) Open(name string) (iceio.File, error) {
 }
 
 func (m *memIO) Create(name string) (iceio.FileWriter, error) {
-	return &limitedWriteCloser{limit: m.limit, err: m.err}, nil
+	return &limitedWriteCloser{limit: m.limit, err: m.err, parent: m, path: name}, nil
 }
 
 func (m *memIO) WriteFile(name string, content []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.files[name] = append([]byte(nil), content...)
 
 	return nil
 }
 
 func (m *memIO) Remove(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.files, name)
 
 	return nil
@@ -167,7 +191,7 @@ func simpleSchema() *iceberg.Schema {
 
 func partitionedSpec() iceberg.PartitionSpec {
 	return iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceID: 1, FieldID: 1000, Name: "id", Transform: iceberg.IdentityTransform{},
+		SourceIDs: []int{1}, FieldID: 1000, Name: "id", Transform: iceberg.IdentityTransform{},
 	})
 }
 
@@ -197,7 +221,7 @@ func TestCommitV3RowLineage(t *testing.T) {
 	df := newTestDataFile(t, spec, "file://data.parquet", nil)
 	sp.appendDataFile(df)
 
-	updates, reqs, err := sp.commit()
+	updates, reqs, err := sp.commit(context.Background())
 	require.NoError(t, err, "commit should succeed")
 	require.Len(t, updates, 2, "expected AddSnapshot and SetSnapshotRef updates")
 	addSnap, ok := updates[0].(*addSnapshotUpdate)
@@ -228,7 +252,7 @@ func TestCommitV3RowLineageTwoSequentialCommits(t *testing.T) {
 	// First commit: new table, append one file (1 row).
 	sp1 := newFastAppendFilesProducer(OpAppend, txn, memIO, nil, nil)
 	sp1.appendDataFile(newTestDataFile(t, spec, "file://data-1.parquet", nil))
-	updates1, reqs1, err := sp1.commit()
+	updates1, reqs1, err := sp1.commit(context.Background())
 	require.NoError(t, err, "first commit should succeed")
 	addSnap1, ok := updates1[0].(*addSnapshotUpdate)
 	require.True(t, ok)
@@ -246,7 +270,7 @@ func TestCommitV3RowLineageTwoSequentialCommits(t *testing.T) {
 	txn2.meta.formatVersion = 3
 	sp2 := newFastAppendFilesProducer(OpAppend, txn2, memIO, nil, nil)
 	sp2.appendDataFile(newTestDataFile(t, spec, "file://data-2.parquet", nil))
-	updates2, reqs2, err := sp2.commit()
+	updates2, reqs2, err := sp2.commit(context.Background())
 	require.NoError(t, err, "second commit should succeed")
 	addSnap2, ok := updates2[0].(*addSnapshotUpdate)
 	require.True(t, ok)
@@ -272,7 +296,7 @@ func TestCommitV3RowLineageDeltaIncludesExistingRows(t *testing.T) {
 	// First commit: one file (1 row).
 	sp1 := newFastAppendFilesProducer(OpAppend, txn, memIO, nil, nil)
 	sp1.appendDataFile(newTestDataFile(t, spec, "file://data-1.parquet", nil))
-	updates1, reqs1, err := sp1.commit()
+	updates1, reqs1, err := sp1.commit(context.Background())
 	require.NoError(t, err, "first commit should succeed")
 	err = txn.apply(updates1, reqs1)
 	require.NoError(t, err)
@@ -291,7 +315,7 @@ func TestCommitV3RowLineageDeltaIncludesExistingRows(t *testing.T) {
 	txn2.meta.props[ManifestMinMergeCountKey] = "2"
 	sp2 := newMergeAppendFilesProducer(OpAppend, txn2, memIO, nil, nil)
 	sp2.appendDataFile(newTestDataFile(t, spec, "file://data-2.parquet", nil))
-	updates2, reqs2, err := sp2.commit()
+	updates2, reqs2, err := sp2.commit(context.Background())
 	require.NoError(t, err, "second commit (merge) should succeed")
 	addSnap2, ok := updates2[0].(*addSnapshotUpdate)
 	require.True(t, ok)
@@ -323,7 +347,7 @@ func manifestFirstRowIDForSnapshot(t *testing.T, manifests []iceberg.ManifestFil
 
 	type manifestRowLineage struct {
 		AddedSnapshotID int64  `json:"AddedSnapshotID"`
-		FirstRowID      *int64 `json:"FirstRowId"`
+		FirstRowID      *int64 `json:"FirstRowIDValue"`
 	}
 
 	for _, manifest := range manifests {
@@ -356,7 +380,7 @@ func TestCommitV3RowLineagePersistsManifestFirstRowID(t *testing.T) {
 	// Use multi-row files to make row-range starts obvious.
 	sp1 := newFastAppendFilesProducer(OpAppend, txn, memIO, nil, nil)
 	sp1.appendDataFile(newTestDataFileWithCount(t, spec, "file://data-1.parquet", nil, 3))
-	updates1, reqs1, err := sp1.commit()
+	updates1, reqs1, err := sp1.commit(context.Background())
 	require.NoError(t, err, "first commit should succeed")
 	addSnap1, ok := updates1[0].(*addSnapshotUpdate)
 	require.True(t, ok, "first update must be AddSnapshot")
@@ -378,7 +402,7 @@ func TestCommitV3RowLineagePersistsManifestFirstRowID(t *testing.T) {
 	txn2.meta.formatVersion = 3
 	sp2 := newFastAppendFilesProducer(OpAppend, txn2, memIO, nil, nil)
 	sp2.appendDataFile(newTestDataFileWithCount(t, spec, "file://data-2.parquet", nil, 5))
-	updates2, _, err := sp2.commit()
+	updates2, _, err := sp2.commit(context.Background())
 	require.NoError(t, err, "second commit should succeed")
 	addSnap2, ok := updates2[0].(*addSnapshotUpdate)
 	require.True(t, ok, "first update must be AddSnapshot")
@@ -401,7 +425,7 @@ func TestSnapshotProducerManifestsClosesWriterOnError(t *testing.T) {
 	sp.appendDataFile(newTestDataFile(t, spec, "file://data-1.parquet", validPartition))
 	sp.appendDataFile(newTestDataFile(t, spec, "file://data-2.parquet", nil))
 
-	_, err := sp.manifests()
+	_, err := sp.manifests(context.Background())
 	require.ErrorIs(t, err, errLimitedWrite)
 }
 
@@ -602,7 +626,7 @@ func TestManifestWriterClosesUnderlyingFile(t *testing.T) {
 	df := newTestDataFile(t, spec, "file://data-1.parquet", nil)
 	sp.appendDataFile(df)
 
-	manifests, err := sp.manifests()
+	manifests, err := sp.manifests(context.Background())
 	require.NoError(t, err, "manifests should succeed")
 	require.Len(t, manifests, 1, "should have one manifest")
 
@@ -709,7 +733,7 @@ func (e *errorOnDeletedEntries) existingManifests() ([]iceberg.ManifestFile, err
 	return nil, nil
 }
 
-func (e *errorOnDeletedEntries) deletedEntries() ([]iceberg.ManifestEntry, error) {
+func (e *errorOnDeletedEntries) deletedEntries(_ context.Context) ([]iceberg.ManifestEntry, error) {
 	if e.waitForWriter != nil {
 		select {
 		case <-e.waitForWriter:
@@ -720,6 +744,12 @@ func (e *errorOnDeletedEntries) deletedEntries() ([]iceberg.ManifestEntry, error
 
 	return nil, e.err
 }
+
+func (e *errorOnDeletedEntries) validate(_ *conflictContext) error {
+	return nil
+}
+
+func (e *errorOnDeletedEntries) needsValidation() bool { return true }
 
 // blockingTrackingIO extends trackingIO to signal when a writer is created.
 type blockingTrackingIO struct {
@@ -769,7 +799,7 @@ func TestManifestsClosesWriterWhenDeletedEntriesFails(t *testing.T) {
 	done := make(chan struct{})
 	var manifestsErr error
 	go func() {
-		_, manifestsErr = sp.manifests()
+		_, manifestsErr = sp.manifests(context.Background())
 		close(done)
 	}()
 
@@ -784,4 +814,157 @@ func TestManifestsClosesWriterWhenDeletedEntriesFails(t *testing.T) {
 		writerCount := blockingIO.GetWriterCount()
 		require.Zero(t, writerCount, "expected no writerFactory to be created when deletedEntries is called first")
 	}
+}
+
+// TestFastAppendInheritsZeroCountManifests verifies that fastAppendFiles.existingManifests
+// includes manifests with added_files_count=0 and existing_files_count=0. This is the
+// standard Iceberg v2 "inherited manifest" representation written by Athena and other
+// external writers. The previous filter (HasAddedFiles || HasExistingFiles) silently
+// dropped these manifests, causing data written by Athena to disappear after any
+// iceberg-go fast-append.
+func TestFastAppendInheritsZeroCountManifests(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+
+	// Use the mem blob FS so that files written via Create() can be read back.
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+
+	// Snapshot 1: a snapshot whose manifest list contains two manifest entries
+	// with added_files_count=0 and existing_files_count=0, simulating what
+	// Athena (and other Iceberg v2 writers) produce.
+	snap1ID := int64(1001)
+	seqNum1 := int64(1)
+
+	// These paths must be under the table location so the mem FS can locate them.
+	athenaManifest1 := iceberg.NewManifestFile(2,
+		"mem://default/table-location/metadata/athena-m0.avro", 512, 0, snap1ID).Build()
+	athenaManifest2 := iceberg.NewManifestFile(2,
+		"mem://default/table-location/metadata/athena-m1.avro", 256, 0, snap1ID).Build()
+
+	// Sanity check: both manifests have zero counts, so the old filter would drop them.
+	require.False(t, athenaManifest1.HasAddedFiles(), "test setup: manifest1 must have zero added count")
+	require.False(t, athenaManifest1.HasExistingFiles(), "test setup: manifest1 must have zero existing count")
+	require.False(t, athenaManifest2.HasAddedFiles(), "test setup: manifest2 must have zero added count")
+	require.False(t, athenaManifest2.HasExistingFiles(), "test setup: manifest2 must have zero existing count")
+
+	snap1ListPath := "mem://default/table-location/metadata/snap-1001.avro"
+
+	var listBuf bytes.Buffer
+	err := iceberg.WriteManifestList(2, &listBuf, snap1ID, nil, &seqNum1, 0,
+		[]iceberg.ManifestFile{athenaManifest1, athenaManifest2})
+	require.NoError(t, err, "write manifest list for snap1")
+	require.NoError(t, wfs.WriteFile(snap1ListPath, listBuf.Bytes()))
+
+	// Inject snap1 as the current snapshot in the transaction metadata.
+	txn.meta.snapshotList = []Snapshot{
+		{
+			SnapshotID:     snap1ID,
+			SequenceNumber: seqNum1,
+			TimestampMs:    time.Now().UnixMilli(),
+			ManifestList:   snap1ListPath,
+			Summary:        &Summary{Operation: OpAppend},
+		},
+	}
+	txn.meta.currentSnapshotID = &snap1ID
+
+	// Snapshot 2: fast-append one new data file on top of snap1.
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+	df := newTestDataFile(t, spec, "file://new-data.parquet", nil)
+	sp.appendDataFile(df)
+
+	updates, reqs, err := sp.commit(context.Background())
+	require.NoError(t, err, "fast-append commit must succeed")
+	require.NotEmpty(t, updates, "must produce updates")
+	require.NotEmpty(t, reqs, "must produce requirements")
+
+	addSnap, ok := updates[0].(*addSnapshotUpdate)
+	require.True(t, ok, "first update must be AddSnapshot")
+
+	// Read back the new manifest list and verify it contains all three manifests:
+	// the two Athena-written zero-count manifests plus the new one.
+	snap2Manifests := readManifestListFromPath(t, wfs, addSnap.Snapshot.ManifestList)
+
+	// Collect the manifest paths in the new snapshot.
+	paths := make([]string, 0, len(snap2Manifests))
+	for _, m := range snap2Manifests {
+		paths = append(paths, m.FilePath())
+	}
+
+	require.Contains(t, paths, athenaManifest1.FilePath(),
+		"new snapshot must carry forward the first Athena manifest (zero added_files_count)")
+	require.Contains(t, paths, athenaManifest2.FilePath(),
+		"new snapshot must carry forward the second Athena manifest (zero existing_files_count)")
+	require.Len(t, snap2Manifests, 3,
+		"new snapshot must have exactly 3 manifests: 2 inherited + 1 newly written")
+
+	// Verify the newly written manifest belongs to snap2.
+	snap2ID := addSnap.Snapshot.SnapshotID
+	var newManifestFound bool
+	for _, m := range snap2Manifests {
+		if m.SnapshotID() == snap2ID {
+			newManifestFound = true
+
+			break
+		}
+	}
+	require.True(t, newManifestFound, "new snapshot must include a manifest written by snap2")
+}
+
+// TestComputeOwnManifests_NewTable verifies that when there is no parent
+// snapshot (parentSnapshotID == 0) all manifests are returned as-is with no error.
+func TestComputeOwnManifests_NewTable(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	io := newMemIO(1<<20, nil)
+	txn := createTestTransaction(t, io, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, io, nil, nil)
+	// parentSnapshotID is 0 by default (new table) — all manifests belong to this producer.
+
+	got, err := sp.computeOwnManifests(nil)
+	require.NoError(t, err, "new table: computeOwnManifests must not error")
+	require.Nil(t, got, "new table: returned manifests must equal input")
+}
+
+// TestComputeOwnManifests_SnapshotByIDError verifies that when the parent
+// snapshot cannot be found an error is returned instead of silently claiming
+// all manifests as own.
+func TestComputeOwnManifests_SnapshotByIDError(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	io := newMemIO(1<<20, nil)
+	txn := createTestTransaction(t, io, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, io, nil, nil)
+	sp.parentSnapshotID = 9999 // no such snapshot in metadata
+
+	got, err := sp.computeOwnManifests(nil)
+	require.Error(t, err, "unknown parent snapshot ID: must return error, not silent fallback")
+	require.ErrorIs(t, err, ErrSnapshotNotFound,
+		"production wraps ErrSnapshotNotFound; pin meaning via errors.Is so a regression "+
+			"that swallows the lookup error and returns a programming-bug error would fail this test")
+	require.Nil(t, got, "error path must return nil manifest slice")
+}
+
+// TestComputeOwnManifests_ParentManifestsIOError verifies that when the parent
+// snapshot exists but its manifest list file cannot be read an error is returned
+// instead of silently claiming all manifests as own (which would cause duplicates
+// in the rebuilt manifest list).
+func TestComputeOwnManifests_ParentManifestsIOError(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	io := newMemIO(1<<20, nil)
+	txn := createTestTransaction(t, io, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, io, nil, nil)
+
+	// Add a snapshot with a manifest list path that does not exist in the IO.
+	// parent.Manifests will fail with fs.ErrNotExist when it tries to open it.
+	parentID := int64(42)
+	txn.meta.snapshotList = append(txn.meta.snapshotList, Snapshot{
+		SnapshotID:   parentID,
+		ManifestList: "mem://default/table-location/metadata/ghost-manifest-list.avro",
+		Summary:      &Summary{Operation: OpAppend},
+	})
+	sp.parentSnapshotID = parentID
+
+	got, err := sp.computeOwnManifests(nil)
+	require.Error(t, err, "IO error reading parent manifests: must return error, not silent fallback")
+	require.ErrorIs(t, err, fs.ErrNotExist,
+		"production wraps the underlying IO error; pin meaning via errors.Is so a regression that "+
+			"swallows the IO error and returns a programming-bug error would fail this test")
+	require.Nil(t, got, "error path must return nil manifest slice")
 }

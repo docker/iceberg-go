@@ -26,6 +26,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -49,6 +50,7 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pterm/pterm"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -170,6 +172,126 @@ func (t *TableTestSuite) TestNewTableFromReadFileGzipped() {
 	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
 }
 
+func (t *TableTestSuite) TestNewTableFromReadFileZstd() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.zstd.metadata.json").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.zstd.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromReadFileZstdAlternateSuffix() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.metadata.json.zstd").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json.zstd",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromOpenZstd() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfs internal.MockFS
+	mockfs.Test(t.T())
+	mockfs.On("Open", "s3://bucket/test/location/uuid.zstd.metadata.json").
+		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+	defer mockfs.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.zstd.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfs, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromOpenZstdAlternateSuffix() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfs internal.MockFS
+	mockfs.Test(t.T())
+	mockfs.On("Open", "s3://bucket/test/location/uuid.metadata.json.zstd").
+		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+	defer mockfs.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json.zstd",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfs, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
 func (t *TableTestSuite) TestSchema() {
 	t.True(t.tbl.Schema().Equals(iceberg.NewSchemaWithIdentifiers(1, []int{1, 2},
 		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true},
@@ -180,7 +302,7 @@ func (t *TableTestSuite) TestSchema() {
 
 func (t *TableTestSuite) TestPartitionSpec() {
 	t.Equal(iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 1, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x"},
+		iceberg.PartitionField{SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x"},
 	), t.tbl.Spec())
 }
 
@@ -188,8 +310,8 @@ func (t *TableTestSuite) TestSortOrder() {
 	expected, err := table.NewSortOrder(
 		3,
 		[]table.SortField{
-			{SourceID: 2, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst},
-			{SourceID: 3, Transform: iceberg.BucketTransform{NumBuckets: 4}, Direction: table.SortDESC, NullOrder: table.NullsLast},
+			{SourceIDs: []int{2}, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst},
+			{SourceIDs: []int{3}, Transform: iceberg.BucketTransform{NumBuckets: 4}, Direction: table.SortDESC, NullOrder: table.NullsLast},
 		},
 	)
 	require.NoError(t.T(), err)
@@ -424,12 +546,12 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":       "5",
-				"added-files-size":       "3600",
+				"added-files-size":       "3590",
 				"added-records":          "5",
 				"total-data-files":       "5",
 				"total-delete-files":     "0",
 				"total-equality-deletes": "0",
-				"total-files-size":       "3600",
+				"total-files-size":       "3590",
 				"total-position-deletes": "0",
 				"total-records":          "5",
 			},
@@ -608,8 +730,8 @@ func (t *TableWritingTestSuite) TestAddFilesFailsSchemaMismatch() {
 func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 	ident := table.Identifier{"default", "partitioned_table_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
-		iceberg.PartitionField{SourceID: 10, FieldID: 1001, Transform: iceberg.MonthTransform{}, Name: "qux_month"})
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+		iceberg.PartitionField{SourceIDs: []int{10}, FieldID: 1001, Transform: iceberg.MonthTransform{}, Name: "qux_month"})
 
 	tbl := t.createTable(ident, t.formatVersion,
 		spec, t.tableSchema)
@@ -645,13 +767,13 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":        "5",
-				"added-files-size":        "3600",
+				"added-files-size":        "3590",
 				"added-records":           "5",
 				"changed-partition-count": "1",
 				"total-data-files":        "5",
 				"total-delete-files":      "0",
 				"total-equality-deletes":  "0",
-				"total-files-size":        "3600",
+				"total-files-size":        "3590",
 				"total-position-deletes":  "0",
 				"total-records":           "5",
 			},
@@ -661,12 +783,10 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 	t.Require().NoError(err)
 
 	for _, manifest := range m {
-		entries, err := manifest.FetchEntries(mustFS(t.T(), tbl), false)
-		t.Require().NoError(err)
-
-		for _, e := range entries {
+		for e, err := range manifest.Entries(mustFS(t.T(), tbl), false) {
+			t.Require().NoError(err)
 			t.Equal(map[int]any{
-				1000: 123, 1001: 650,
+				1000: int32(123), 1001: int32(650),
 			}, e.DataFile().Partition())
 		}
 	}
@@ -675,7 +795,7 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 func (t *TableWritingTestSuite) TestAddFilesToBucketPartitionedTableFails() {
 	ident := table.Identifier{"default", "partitioned_table_bucket_fails_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.BucketTransform{NumBuckets: 3}, Name: "baz_bucket_3"})
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.BucketTransform{NumBuckets: 3}, Name: "baz_bucket_3"})
 
 	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
 	files := make([]string, 0)
@@ -700,7 +820,7 @@ func (t *TableWritingTestSuite) TestAddFilesToBucketPartitionedTableFails() {
 func (t *TableWritingTestSuite) TestAddFilesToPartitionedTableFailsLowerAndUpperMismatch() {
 	ident := table.Identifier{"default", "partitioned_table_bucket_fails_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"})
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"})
 
 	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
 	files := make([]string, 0)
@@ -1013,15 +1133,15 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 		Operation: table.OpOverwrite,
 		Properties: iceberg.Properties{
 			"added-data-files":       "1",
-			"added-files-size":       "1068",
+			"added-files-size":       "1066",
 			"added-records":          "4",
 			"deleted-data-files":     "2",
 			"deleted-records":        "4",
-			"removed-files-size":     "2136",
+			"removed-files-size":     "2132",
 			"total-data-files":       "4",
 			"total-delete-files":     "0",
 			"total-equality-deletes": "0",
-			"total-files-size":       "4272",
+			"total-files-size":       "4264",
 			"total-position-deletes": "0",
 			"total-records":          "10",
 		},
@@ -1158,7 +1278,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
 func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionSpecID() {
 	ident := table.Identifier{"default", "replace_data_files_with_datafiles_spec_validation_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
 	)
 	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
 
@@ -1171,7 +1291,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	t.Require().NoError(err)
 
 	invalidSpec := iceberg.NewPartitionSpecID(999,
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
 	)
 
 	deleteFile := mustDataFile(t.T(), spec, existingPath, map[int]any{1000: int32(123)}, 1, mustFileSize(t.T(), existingPath))
@@ -1188,7 +1308,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionData() {
 	ident := table.Identifier{"default", "replace_data_files_with_datafiles_partition_validation_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
-		iceberg.PartitionField{SourceID: 4, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
 	)
 	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
 
@@ -1248,6 +1368,36 @@ func (t *TableWritingTestSuite) TestAddDataFilesAlreadyReferencedByTable() {
 	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesWithoutDuplicateCheck() {
+	ident := table.Identifier{"default", "add_data_files_skip_dup_check_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_skip_dup_check_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	df := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	// Seed the table with an initial file.
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	// Adding the same file again without the option should fail.
+	tx = tbl.NewTransaction()
+	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table")
+
+	// Adding the same file again with WithoutDuplicateCheck should succeed.
+	tx = tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil, table.WithoutDuplicateCheck()))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpAppend, staged.CurrentSnapshot().Summary.Operation)
 }
 
 func (t *TableWritingTestSuite) TestAddDataFilesNilDataFile() {
@@ -1703,6 +1853,63 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsNoOpWhenNothingToExpire() {
 	// Verify no new metadata file was created (metadata location unchanged)
 	t.Require().Equal(metadataLocationBefore, tbl.MetadataLocation(),
 		"metadata location should not change when there are no snapshots to expire")
+}
+
+// TestExpireSnapshotsUsesTableProperties verifies that ExpireSnapshots reads
+// min-snapshots-to-keep and max-snapshot-age-ms from table properties when
+// no explicit options are provided by the caller (mirrors Java behaviour).
+func (t *TableWritingTestSuite) TestExpireSnapshotsUsesTableProperties() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_props_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_props_v" + strconv.Itoa(t.formatVersion)}
+	// Set table-level retention properties — no caller options will be passed to
+	// ExpireSnapshots, so these must be picked up automatically.
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{
+			table.PropertyFormatVersion: strconv.Itoa(t.formatVersion),
+			table.MinSnapshotsToKeepKey: "2",
+			table.MaxSnapshotAgeMsKey:   "0", // expire everything older than "now"
+			// max-ref-age-ms is intentionally absent to prove that a missing
+			// property correctly falls back to the math.MaxInt default.
+		})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Call ExpireSnapshots with NO options — must rely entirely on table properties.
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots())
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// min-snapshots-to-keep=2, so exactly 2 snapshots should survive.
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
 }
 
 func (t *TableWritingTestSuite) TestExpireSnapshotsWithMissingParent() {
@@ -2245,8 +2452,11 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 	t.Len(manifestList, 1)
 	t.validateManifestFileLength(mustFS(t.T(), tblA), manifestList[0])
 
-	entries, err := manifestList[0].FetchEntries(mustFS(t.T(), tblA), false)
-	t.Require().NoError(err)
+	entries := make([]iceberg.ManifestEntry, 0, 3)
+	for entry, err := range manifestList[0].Entries(mustFS(t.T(), tblA), false) {
+		t.Require().NoError(err)
+		entries = append(entries, entry)
+	}
 	t.Len(entries, 3)
 
 	// entries should match the snapshot ID they were added in
@@ -2335,6 +2545,47 @@ func (t *TableWritingTestSuite) TestOverwriteRecord() {
 	snapshot := resultTbl.CurrentSnapshot()
 	t.NotNil(snapshot)
 	t.Equal(table.OpAppend, snapshot.Summary.Operation) // Empty table overwrite becomes append
+}
+
+// TestOverwriteRowCountWarning verifies that Transaction.Overwrite emits a
+// slog.Warn when the written data files contain fewer rows than deleted.
+func (t *TableWritingTestSuite) TestOverwriteRowCountWarning() {
+	ident := table.Identifier{"default", "overwrite_row_warn_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	// Append two rows so there is data to overwrite.
+	initialData, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": true, "bar": "row1", "baz": 1, "qux": "2024-01-01"},
+		  {"foo": false, "bar": "row2", "baz": 2, "qux": "2024-01-02"}]`,
+	})
+	t.Require().NoError(err)
+	defer initialData.Release()
+
+	tbl, err = tbl.Append(t.ctx, array.NewTableReader(initialData, -1), nil)
+	t.Require().NoError(err)
+
+	// Capture slog output by installing a temporary handler on the default logger.
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(origLogger)
+
+	// Overwrite with only one row — fewer than the two rows deleted.
+	oneRow, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": true, "bar": "row1", "baz": 1, "qux": "2024-01-01"}]`,
+	})
+	t.Require().NoError(err)
+	defer oneRow.Release()
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.Overwrite(t.ctx, array.NewTableReader(oneRow, -1), nil))
+	_, err = tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	logged := buf.String()
+	t.Contains(logged, "Overwrite produced fewer rows than deleted")
+	t.Contains(logged, "added_rows=1")
+	t.Contains(logged, "deleted_rows=2")
 }
 
 // TestDelete verifies that Table.Delete properly delegates to Transaction.Delete
@@ -2926,6 +3177,61 @@ func (t *TableTestSuite) TestMetadataCompressionRoundTrip() {
 	t.Contains(metadata, "location")
 
 	// Verify that we can load the table from the metadata location
+	tbl2, err := cat.LoadTable(context.Background(), ident)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(tbl.Equals(*tbl2))
+}
+
+func (t *TableTestSuite) TestMetadataCompressionRoundTripZstd() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "zstd_compression_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{
+			table.MetadataCompressionKey: "zstd",
+		}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	metadataLoc := tbl.MetadataLocation()
+	t.Contains(metadataLoc, ".zstd.metadata.json")
+
+	fs, err := tbl.FS(context.Background())
+	t.Require().NoError(err)
+
+	file, err := fs.Open(metadataLoc)
+	t.Require().NoError(err)
+	defer file.Close()
+
+	metadataBytes, err := io.ReadAll(file)
+	t.Require().NoError(err)
+
+	dec, err := zstd.NewReader(bytes.NewReader(metadataBytes))
+	t.Require().NoError(err)
+	defer dec.Close()
+
+	decompressed, err := io.ReadAll(dec)
+	t.Require().NoError(err)
+
+	var metadata map[string]any
+	err = json.Unmarshal(decompressed, &metadata)
+	t.Require().NoError(err)
+
+	t.Contains(metadata, "format-version")
+	t.Contains(metadata, "table-uuid")
+	t.Contains(metadata, "location")
+
 	tbl2, err := cat.LoadTable(context.Background(), ident)
 	t.Require().NoError(err)
 	t.Require().NotNil(tbl2)

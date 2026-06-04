@@ -39,10 +39,22 @@ import (
 // API for CDC/streaming workloads where INSERTs, UPDATEs, and DELETEs
 // must be committed together.
 //
-// Note: conflict detection for concurrent writers is not yet implemented.
-// Concurrent RowDelta commits against the same table may produce incorrect
-// results if delete files miss newly appended data. For single-writer
-// workloads this is safe.
+// Client-side conflict validation runs before the commit is sent to
+// the catalog:
+//   - Position deletes: referenced data files must still be reachable
+//     from the current branch head (validateDataFilesExist).
+//   - Equality deletes under write.delete.isolation-level=serializable
+//     (the default): concurrent data files in the same partition(s) as
+//     the equality deletes are rejected. For partitioned tables an
+//     OR-of-equalities filter is built from the eq-delete files'
+//     partition tuples and routed through validateAddedDataFilesMatchingFilter
+//     (spec-evolution safe, manifest-summary pruning, type-aware evaluation).
+//     For unpartitioned tables the check is conservative (AlwaysTrue —
+//     any concurrent append is a conflict). Opt out by setting
+//     write.delete.isolation-level=snapshot.
+//
+// Refresh-and-replay between retries is deferred to a follow-up PR;
+// today the pre-flight runs once on the first attempt.
 //
 // Usage:
 //
@@ -153,12 +165,101 @@ func (rd *RowDelta) Commit(ctx context.Context) error {
 		producer.appendDeleteFile(f)
 	}
 
-	updates, reqs, err := producer.commit()
+	updates, reqs, err := producer.commit(ctx)
 	if err != nil {
 		return err
 	}
 
+	// Register RowDelta's pre-commit conflict validator. The underlying
+	// fast-append producer's validator is a no-op; RowDelta semantics
+	// (pos-delete references, eq-delete predicate) require a dedicated
+	// check that snapshot_producers does not know about.
+	rd.txn.validators = append(rd.txn.validators, rd.validate)
+
 	return rd.txn.apply(updates, reqs)
+}
+
+// validate is the client-side conflict check for a RowDelta commit. It
+// runs against cc, which reflects the branch state at the first commit
+// attempt. Two invariants are enforced:
+//
+//   - Every data file referenced by a position-delete in this RowDelta
+//     must still be reachable from the branch head. A concurrent
+//     compaction or overwrite that rewrote a referenced file would
+//     orphan this pos-delete and produce incorrect results — reject.
+//     Always runs, no isolation gating.
+//
+//   - When any equality-delete is included and isolation is
+//     SERIALIZABLE, reject the commit if a concurrent snapshot added
+//     conflicting data files. For unpartitioned tables the check is
+//     conservative (AlwaysTrue — any concurrent append is a conflict).
+//     For partitioned tables, an OR-of-equalities filter is built from
+//     the eq-delete files' partition tuples and routed through
+//     validateAddedDataFilesMatchingFilter, which performs per-spec
+//     projection (spec-evolution safe), manifest-summary pruning, and
+//     type-aware partition evaluation — so only concurrent data files
+//     in the same partitions as the equality deletes are rejected.
+//
+// Fast appends alongside a RowDelta see no validators from RowDelta:
+// data-only commits are as safe as a fastAppend.
+func (rd *RowDelta) validate(cc *conflictContext) error {
+	if cc == nil {
+		return nil
+	}
+
+	// Collect every data-file path the pos-deletes in this delta
+	// reference. A nil ReferencedDataFile means the pos-delete does
+	// not record its target — we cannot check it here; the file is
+	// still present in the per-row position_delete_file column and
+	// would apply correctly regardless of concurrent removals,
+	// matching Java's behavior when the referenced-file column is
+	// unset.
+	var referenced []string
+	var eqDeleteFiles []iceberg.DataFile
+	for _, f := range rd.delFiles {
+		switch f.ContentType() {
+		case iceberg.EntryContentPosDeletes:
+			if ref := f.ReferencedDataFile(); ref != nil && *ref != "" {
+				referenced = append(referenced, *ref)
+			}
+		case iceberg.EntryContentEqDeletes:
+			eqDeleteFiles = append(eqDeleteFiles, f)
+		}
+	}
+
+	if len(referenced) > 0 {
+		if err := validateDataFilesExist(cc, referenced); err != nil {
+			return err
+		}
+	}
+
+	if len(eqDeleteFiles) > 0 {
+		level := readIsolationLevel(rd.txn.meta.props,
+			WriteDeleteIsolationLevelKey, WriteDeleteIsolationLevelDefault)
+		// Route through the existing validateNoConflictingDataFiles path,
+		// which calls validateAddedDataFilesMatchingFilter internally.
+		// For unpartitioned tables, use AlwaysTrue conservatively — an
+		// equality delete can affect any row. For partitioned tables,
+		// build an OR-of-equalities filter from the eq-delete files'
+		// partition tuples so that concurrent appends to different
+		// partitions are not falsely rejected.
+		currentSpec, specErr := rd.txn.meta.CurrentSpec()
+		if specErr != nil {
+			return fmt.Errorf("reading current partition spec: %w", specErr)
+		}
+
+		var err error
+		if currentSpec == nil || currentSpec.NumFields() == 0 {
+			err = validateNoConflictingDataFiles(cc, iceberg.AlwaysTrue{}, level)
+		} else {
+			err = validateNoConflictingDataFilesInPartitions(cc, eqDeleteFiles, level)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Operation returns the snapshot operation type that will be used when

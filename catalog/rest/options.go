@@ -58,6 +58,19 @@ func WithTLSConfig(config *tls.Config) Option {
 	}
 }
 
+// WithOAuthTLSConfig sets a separate TLS configuration for the HTTP client
+// used to communicate with the OAuth2 server. This is useful when the OAuth2
+// server (oauth2-server-uri) is a different host than the catalog and requires
+// different TLS settings (e.g. a different CA or client certificate).
+//
+// If not set, the OAuth2 client reuses the catalog's HTTP client (and its TLS
+// configuration).
+func WithOAuthTLSConfig(config *tls.Config) Option {
+	return func(o *options) {
+		o.oauthTLSConfig = config
+	}
+}
+
 func WithWarehouseLocation(loc string) Option {
 	return func(o *options) {
 		o.warehouseLocation = loc
@@ -115,6 +128,22 @@ func WithScope(scope string) Option {
 	}
 }
 
+// WithAudience sets the audience parameter sent in OAuth token requests.
+// See RFC 8693 for details on token exchange audiences.
+func WithAudience(audience string) Option {
+	return func(o *options) {
+		o.audience = audience
+	}
+}
+
+// WithResource sets the resource parameter sent in OAuth token requests.
+// See RFC 8707 for details on resource indicators.
+func WithResource(resource string) Option {
+	return func(o *options) {
+		o.resource = resource
+	}
+}
+
 func WithAdditionalProps(props iceberg.Properties) Option {
 	return func(o *options) {
 		o.additionalProps = props
@@ -144,8 +173,12 @@ type options struct {
 	prefix            string
 	authUri           *url.URL
 	scope             string
+	audience          string
+	resource          string
 	transport         http.RoundTripper
 	headers           map[string]string
+
+	oauthTLSConfig *tls.Config
 
 	additionalProps iceberg.Properties
 }

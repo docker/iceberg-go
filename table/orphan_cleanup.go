@@ -215,7 +215,7 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 	if cfg.dryRun {
 		return result, nil
 	}
-	deletedFiles, err := deleteFiles(fs, orphanFiles, cfg)
+	deletedFiles, err := deleteFiles(ctx, fs, orphanFiles, cfg)
 	if err != nil {
 		return OrphanCleanupResult{}, fmt.Errorf("failed to delete orphan files: %w", err)
 	}
@@ -225,7 +225,9 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 	return result, nil
 }
 
-// getReferencedFiles collects all files referenced by current snapshots
+// getReferencedFiles collects all files referenced by table metadata: previous metadata
+// files, statistics and partition-statistics paths (Puffin, etc.), and all paths reachable
+// from current snapshots (manifest lists, manifests, data files).
 func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 	referenced := make(map[string]bool)
 	metadata := t.metadata
@@ -240,7 +242,18 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 	versionHintPath := filepath.Join(metadata.Location(), "metadata", "version-hint.text")
 	referenced[versionHintPath] = true
 
-	// TODO: Add statistics files support once iceberg-go exposes statisticsFiles()
+	for sf := range metadata.Statistics() {
+		// Guard against malformed metadata; statistics-path is required per spec.
+		if sf.StatisticsPath != "" {
+			referenced[sf.StatisticsPath] = true
+		}
+	}
+	for psf := range metadata.PartitionStatistics() {
+		// Guard against malformed metadata; statistics-path is required per spec.
+		if psf.StatisticsPath != "" {
+			referenced[psf.StatisticsPath] = true
+		}
+	}
 
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
@@ -255,12 +268,10 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		for _, manifest := range manifestFiles {
 			referenced[manifest.FilePath()] = true
 
-			entries, err := manifest.FetchEntries(fs, false)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read manifest entries: %w", err)
-			}
-
-			for _, entry := range entries {
+			for entry, err := range manifest.Entries(fs, false) {
+				if err != nil {
+					return nil, fmt.Errorf("failed to read manifest entries: %w", err)
+				}
 				referenced[entry.DataFile().FilePath()] = true
 			}
 		}
@@ -295,32 +306,29 @@ func (t Table) scanFiles(fs iceio.IO, location string, cfg *orphanCleanupConfig)
 	return allFiles, totalSize, nil
 }
 
-// getBucket gets the Bucket field from blob storage - absolute minimal approach
-func getBucketName(fsys iceio.IO) stdfs.FS {
-	v := reflect.ValueOf(fsys).Elem() // We know it's a pointer to struct
-
-	return v.FieldByName("Bucket").Interface().(stdfs.FS)
-}
-
-// makeFileWalkFunc creates a WalkDirFunc that processes only files with path transformation
-func makeFileWalkFunc(fn func(path string, info stdfs.FileInfo) error, pathTransform func(string) string) stdfs.WalkDirFunc {
-	return func(path string, d stdfs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		return fn(pathTransform(path), info)
-	}
-}
-
 func walkDirectory(fsys iceio.IO, root string, fn func(path string, info stdfs.FileInfo) error) error {
+	// Prefer ListableIO when available.
+	if listable, ok := fsys.(iceio.ListableIO); ok {
+		return listable.WalkDir(root, func(path string, d stdfs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if d.IsDir() {
+				return nil
+			}
+
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+
+			return fn(path, info)
+		})
+	}
+
+	// Fallback to original implementation for IO types that don't
+	// implement ListableIO yet.
 	switch v := fsys.(type) {
 	case iceio.LocalFS:
 		cleanRoot := strings.TrimPrefix(root, "file://")
@@ -333,7 +341,7 @@ func walkDirectory(fsys iceio.IO, root string, fn func(path string, info stdfs.F
 		}))
 
 	default:
-		// For blob storage: direct field access since we know the structure
+		// For blob storage: direct field access since we know the structure.
 		bucket := getBucketName(v)
 
 		parsed, err := url.Parse(root)
@@ -346,10 +354,36 @@ func walkDirectory(fsys iceio.IO, root string, fn func(path string, info stdfs.F
 			walkPath = "."
 		}
 
-		// URL transform - reconstruct full URL path
 		return stdfs.WalkDir(bucket, walkPath, makeFileWalkFunc(fn, func(path string) string {
 			return parsed.Scheme + "://" + parsed.Host + "/" + path
 		}))
+	}
+}
+
+// getBucketName gets the Bucket field from blob storage - absolute minimal approach.
+func getBucketName(fsys iceio.IO) stdfs.FS {
+	v := reflect.ValueOf(fsys).Elem()
+
+	return v.FieldByName("Bucket").Interface().(stdfs.FS)
+}
+
+// makeFileWalkFunc creates a WalkDirFunc that processes only files with path transformation.
+func makeFileWalkFunc(fn func(path string, info stdfs.FileInfo) error, pathTransform func(string) string) stdfs.WalkDirFunc {
+	return func(path string, d stdfs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		return fn(pathTransform(path), info)
 	}
 }
 
@@ -397,9 +431,16 @@ func isFileOrphan(file string, referencedFiles map[string]bool, normalizedRefere
 	return true, nil
 }
 
-func deleteFiles(fs iceio.IO, orphanFiles []string, cfg *orphanCleanupConfig) ([]string, error) {
+func deleteFiles(ctx context.Context, fs iceio.IO, orphanFiles []string, cfg *orphanCleanupConfig) ([]string, error) {
 	if len(orphanFiles) == 0 {
 		return nil, nil
+	}
+
+	// Use bulk delete when available and no custom deleteFunc is set.
+	if cfg.deleteFunc == nil {
+		if bulk, ok := fs.(iceio.BulkRemovableIO); ok {
+			return bulk.DeleteFiles(ctx, orphanFiles)
+		}
 	}
 
 	if cfg.maxConcurrency == 1 {

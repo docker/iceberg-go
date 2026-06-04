@@ -19,6 +19,7 @@ package table
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"iter"
 	"strconv"
@@ -34,12 +35,13 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table/internal"
 	"github.com/apache/iceberg-go/table/substrait"
-	"github.com/substrait-io/substrait-go/v7/expr"
+	"github.com/substrait-io/substrait-go/v8/expr"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
 	ScanOptionArrowUseLargeTypes = "arrow.use_large_types"
+	ScanOptionRowLineageEnabled  = "row_lineage.enabled"
 )
 
 var PositionalDeleteArrowSchema, _ = SchemaToArrowSchema(iceberg.PositionalDeleteSchema, nil, true, false)
@@ -385,6 +387,87 @@ func (as *arrowScan) getRecordFilter(ctx context.Context, fileSchema *iceberg.Sc
 	return nil, false, nil
 }
 
+// synthesizeRowLineageColumns fills _row_id and _last_updated_sequence_number from task constants
+// when those columns are present in the batch (e.g. from ToRequestedSchema). Per the Iceberg v3
+// row lineage spec: if the value is null in the file, it is inherited (synthesized) from the file's
+// first_row_id and data_sequence_number; otherwise the value from the file is kept.
+// rowOffset is the 0-based row index within the current file and is updated so _row_id stays
+// correct across multiple batches from the same file (first_row_id + row_position).
+func synthesizeRowLineageColumns(
+	ctx context.Context,
+	rowOffset *int64,
+	task FileScanTask,
+	batch arrow.RecordBatch,
+) (arrow.RecordBatch, error) {
+	alloc := compute.GetAllocator(ctx)
+	schema := batch.Schema()
+	nrows := batch.NumRows()
+
+	// Start from the existing columns; we'll replace the row lineage columns in-place
+	// when we need to synthesize values.
+	newCols := append([]arrow.Array(nil), batch.Columns()...)
+
+	// Resolve column indices by name; -1 if not present.
+	rowIDIndices := schema.FieldIndices(iceberg.RowIDColumnName)
+	seqNumIndices := schema.FieldIndices(iceberg.LastUpdatedSequenceNumberColumnName)
+	rowIDColIdx := -1
+	if len(rowIDIndices) > 0 {
+		rowIDColIdx = rowIDIndices[0]
+	}
+	seqNumColIdx := -1
+	if len(seqNumIndices) > 0 {
+		seqNumColIdx = seqNumIndices[0]
+	}
+
+	bldr := array.NewInt64Builder(alloc)
+	defer bldr.Release()
+
+	// _row_id: inherit first_row_id + row_position when null; else keep value from file.
+	if rowIDColIdx >= 0 && task.FirstRowID != nil {
+		if col, ok := newCols[rowIDColIdx].(*array.Int64); ok {
+			bldr.Reserve(int(nrows))
+			first := *task.FirstRowID
+			for k := range nrows {
+				if col.IsNull(int(k)) {
+					bldr.Append(first + *rowOffset + int64(k))
+				} else {
+					bldr.Append(col.Value(int(k)))
+				}
+			}
+
+			arr := bldr.NewArray()
+			newCols[rowIDColIdx] = arr
+			defer arr.Release()
+		}
+	}
+
+	// _last_updated_sequence_number: inherit file's data_sequence_number when null; else keep value from file.
+	if seqNumColIdx >= 0 && task.DataSequenceNumber != nil {
+		if col, ok := newCols[seqNumColIdx].(*array.Int64); ok {
+			bldr.Reserve(int(nrows))
+			seq := *task.DataSequenceNumber
+			for k := range nrows {
+				if col.IsNull(int(k)) {
+					bldr.Append(seq)
+				} else {
+					bldr.Append(col.Value(int(k)))
+				}
+			}
+
+			arr := bldr.NewArray()
+			newCols[seqNumColIdx] = arr
+			defer arr.Release()
+		}
+	}
+
+	// Advance so the next batch from this file uses the correct row position for _row_id.
+	*rowOffset += nrows
+
+	rec := array.NewRecordBatch(schema, newCols, nrows)
+
+	return rec, nil
+}
+
 func (as *arrowScan) processRecords(
 	ctx context.Context,
 	task internal.Enumerated[FileScanTask],
@@ -401,9 +484,19 @@ func (as *arrowScan) processRecords(
 
 	switch task.Value.File.FileFormat() {
 	case iceberg.ParquetFile:
-		testRowGroups, err = newParquetRowGroupStatsEvaluator(fileSchema, as.boundRowFilter, false)
+		statsFn, err := newParquetRowGroupStatsEvaluator(fileSchema, as.boundRowFilter, false)
 		if err != nil {
 			return err
+		}
+
+		bloomPreds, err := newBloomFilterPredicates(as.boundRowFilter)
+		if err != nil {
+			return err
+		}
+
+		testRowGroups = &internal.ParquetRowGroupTester{
+			StatsFn:    statsFn,
+			BloomPreds: bloomPreds,
 		}
 	}
 
@@ -521,6 +614,22 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 
 		return ToRequestedSchema(ctx, as.projectedSchema, iceSchema, r, SchemaOptions{UseLargeTypes: as.useLargeTypes})
 	})
+
+	// Row lineage: optionally fill _row_id and _last_updated_sequence_number from task
+	// constants when in projection.
+	rowLineageEnabled, err := strconv.ParseBool(as.options.Get(ScanOptionRowLineageEnabled, "true"))
+	if err != nil {
+		rowLineageEnabled = true
+	}
+	if rowLineageEnabled && (task.Value.FirstRowID != nil || task.Value.DataSequenceNumber != nil) {
+		var rowOffset int64
+		taskVal := task.Value
+		pipeline = append(pipeline, func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
+			defer r.Release()
+
+			return synthesizeRowLineageColumns(ctx, &rowOffset, taskVal, r)
+		})
+	}
 
 	err = as.processRecords(ctx, task, iceSchema, rdr, colIndices, pipeline, out)
 
@@ -753,11 +862,21 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 }
 
 func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
+	for _, t := range tasks {
+		if len(t.DeletionVectorFiles) > 0 {
+			return nil, nil, fmt.Errorf(
+				"%w: deletion vector read is not yet implemented, data file: %s has %d deletion vector(s)",
+				iceberg.ErrNotImplemented, t.File.FilePath(), len(t.DeletionVectorFiles))
+		}
+	}
+
 	var err error
 	as.useLargeTypes, err = strconv.ParseBool(as.options.Get(ScanOptionArrowUseLargeTypes, "false"))
 	if err != nil {
 		as.useLargeTypes = false
 	}
+
+	ctx = internal.WithTableProperties(ctx, as.metadata.Properties())
 
 	resultSchema, err := SchemaToArrowSchema(as.projectedSchema, nil, false, as.useLargeTypes)
 	if err != nil {

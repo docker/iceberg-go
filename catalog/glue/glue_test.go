@@ -179,11 +179,11 @@ var testSchema = iceberg.NewSchemaWithIdentifiers(0, []int{},
 	iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
 
 var testPartitionSpec = iceberg.NewPartitionSpec(
-	iceberg.PartitionField{SourceID: 2, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+	iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
 
 var testSortOrder, _ = table.NewSortOrder(1, []table.SortField{
 	{
-		SourceID: 1, Transform: iceberg.IdentityTransform{},
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
 		Direction: table.SortASC, NullOrder: table.NullsLast,
 	},
 })
@@ -1435,4 +1435,15 @@ func TestCommitTableOptimisticLockingIntegration(t *testing.T) {
 			t.Logf("⚠️  All concurrent commits succeeded - this suggests optimistic locking may not be as strict as expected")
 		}
 	})
+}
+
+func TestIsConcurrentModificationException(t *testing.T) {
+	sdkErr := &types.ConcurrentModificationException{Message: aws.String("oops")}
+	require.True(t, isConcurrentModificationException(sdkErr))
+
+	wrapped := fmt.Errorf("during update: %w", sdkErr)
+	require.True(t, isConcurrentModificationException(wrapped), "must walk the wrap chain")
+
+	require.False(t, isConcurrentModificationException(errors.New("network timeout")))
+	require.False(t, isConcurrentModificationException(nil))
 }

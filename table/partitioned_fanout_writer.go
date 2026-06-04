@@ -119,38 +119,53 @@ func (p *partitionedFanoutWriter) fanout(ctx context.Context, inputRecordsCh <-c
 			if !ok {
 				return nil
 			}
-			defer record.Release()
 
-			partitions, err := p.getPartitions(record)
-			if err != nil {
+			if err := p.processRecord(ctx, record, dataFilesChannel); err != nil {
 				return err
-			}
-
-			for _, val := range partitions {
-				select {
-				case <-ctx.Done():
-					return context.Cause(ctx)
-				default:
-				}
-
-				partitionRecord, err := partitionBatchByKey(ctx)(record, val.rows)
-				if err != nil {
-					return err
-				}
-
-				partitionPath := p.partitionPath(val.partitionRec)
-				rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(ctx, p.concurrentDataFileWriter, partitionPath, val.partitionValues, dataFilesChannel)
-				if err != nil {
-					return err
-				}
-
-				err = rollingDataWriter.Add(partitionRecord)
-				if err != nil {
-					return err
-				}
 			}
 		}
 	}
+}
+
+// processRecord partitions a single record batch and writes sub-batches to
+// the appropriate rolling data writers. The record is released when this
+// function returns, bounding Arrow memory to one batch per fanout worker.
+func (p *partitionedFanoutWriter) processRecord(ctx context.Context, record arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
+	defer record.Release()
+
+	partitions, err := p.getPartitions(record)
+	if err != nil {
+		return err
+	}
+
+	for _, val := range partitions {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+		}
+
+		partitionRecord, err := partitionBatchByKey(ctx)(record, val.rows)
+		if err != nil {
+			return err
+		}
+
+		partitionPath := p.partitionPath(val.partitionRec)
+		rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(ctx, p.concurrentDataFileWriter, partitionPath, val.partitionValues, dataFilesChannel)
+		if err != nil {
+			partitionRecord.Release()
+
+			return err
+		}
+
+		addErr := rollingDataWriter.Add(partitionRecord)
+		partitionRecord.Release()
+		if addErr != nil {
+			return addErr
+		}
+	}
+
+	return nil
 }
 
 func (p *partitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, outputDataFilesCh chan iceberg.DataFile) iter.Seq2[iceberg.DataFile, error] {
@@ -190,8 +205,12 @@ func yieldDataFiles(writerFactory *writerFactory, fanoutWorkers *errgroup.Group,
 }
 
 func (p *partitionedFanoutWriter) getPartitions(record arrow.RecordBatch) ([]*partitionInfo, error) {
+	return getRecordPartitions(p.partitionSpec, p.schema, record)
+}
+
+func getRecordPartitions(spec iceberg.PartitionSpec, schema *iceberg.Schema, record arrow.RecordBatch) ([]*partitionInfo, error) {
 	partitionMap := newPartitionMapNode()
-	partitionFields := p.partitionSpec.PartitionType(p.schema).FieldList
+	partitionFields := spec.PartitionType(schema).FieldList
 	partitionRec := make(partitionRecord, len(partitionFields))
 
 	partitionColumns := make([]arrow.Array, len(partitionFields))
@@ -201,8 +220,8 @@ func (p *partitionedFanoutWriter) getPartitions(record arrow.RecordBatch) ([]*pa
 	}, len(partitionFields))
 
 	for i := range partitionFields {
-		sourceField := p.partitionSpec.Field(i)
-		colName, _ := p.schema.FindColumnName(sourceField.SourceID)
+		sourceField := spec.Field(i)
+		colName, _ := schema.FindColumnName(sourceField.SourceID())
 		colIdx := record.Schema().FieldIndices(colName)[0]
 		partitionColumns[i] = record.Column(colIdx)
 		partitionFieldsInfo[i] = struct {
@@ -305,16 +324,17 @@ func (n *partitionMapNode) getOrCreate(partitionRec partitionRecord, fieldInfo [
 	return partVal
 }
 
-// collectPartitions recursively collects all partitionInfo into a slice
+// collectPartitions returns every partitionInfo in the tree in
+// arbitrary order. Callers that need a deterministic order (such as
+// the clustered writer, whose revisit check would otherwise depend on
+// Go's randomized map iteration) must sort the result themselves.
 func (n *partitionMapNode) collectPartitions() []*partitionInfo {
 	result := make([]*partitionInfo, 0, n.leafCount)
-
 	for _, v := range n.children {
 		switch node := v.(type) {
 		case *partitionInfo:
 			result = append(result, node)
 		case *partitionMapNode:
-			// Recursively collect from child nodes
 			result = append(result, node.collectPartitions()...)
 		}
 	}
