@@ -1,0 +1,405 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Metrics Reporting - Iceberg Golang</title>
+
+
+        <!-- Custom HTML head -->
+        <!--
+          ~ Licensed to the Apache Software Foundation (ASF) under one
+          ~ or more contributor license agreements.  See the NOTICE file
+          ~ distributed with this work for additional information
+          ~ regarding copyright ownership.  The ASF licenses this file
+          ~ to you under the Apache License, Version 2.0 (the
+          ~ "License"); you may not use this file except in compliance
+          ~ with the License.  You may obtain a copy of the License at
+          ~
+          ~   http://www.apache.org/licenses/LICENSE-2.0
+          ~
+          ~ Unless required by applicable law or agreed to in writing,
+          ~ software distributed under the License is distributed on an
+          ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+          ~ KIND, either express or implied.  See the License for the
+          ~ specific language governing permissions and limitations
+          ~ under the License.
+        -->
+          <!-- Matomo -->
+          <script>
+            var _paq = window._paq = window._paq || [];
+            /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+            _paq.push(["setDoNotTrack", true]);
+            _paq.push(["disableCookies"]);
+            _paq.push(['trackPageView']);
+            _paq.push(['enableLinkTracking']);
+            (function() {
+              var u="https://analytics.apache.org/";
+              _paq.push(['setTrackerUrl', u+'matomo.php']);
+              _paq.push(['setSiteId', '82']);
+              var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
+              g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
+            })();
+          </script>
+          <!-- End Matomo Code -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html" class="active">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Iceberg Golang</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go/edit/main/website/src/metrics-reporting.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="metrics-reporting"><a class="header" href="#metrics-reporting">Metrics Reporting</a></h1>
+<p>Iceberg Go implements Iceberg's Metrics Reporting API. After scan planning it can
+emit a <strong><code>ScanReport</code></strong> (files and manifests considered, scanned, and skipped;
+bytes read; planning duration), and after a commit a <strong><code>CommitReport</code></strong> (commit
+attempts, duration, and the added/removed/total file, record, and delete counts).
+These metrics are otherwise invisible from outside the client; a reporter gives
+operators a standard way to collect them.</p>
+<p>A pluggable <a href="https://pkg.go.dev/github.com/apache/iceberg-go/metrics#Reporter"><code>metrics.Reporter</code></a>
+is the sink that receives those reports.</p>
+<h2 id="opt-in-by-default"><a class="header" href="#opt-in-by-default">Opt-in by default</a></h2>
+<p>Reporting is <strong>strictly opt-in</strong>. With no reporter configured the instrumented
+code paths do no work, and the client emits no logs and no network traffic.</p>
+<p>This is a deliberate divergence from Iceberg Java, which defaults to the logging
+reporter. A library must not start emitting output the caller never asked for, so
+Iceberg Go defaults to a no-op reporter until you select one. Callers migrating
+from Java that want reports by default must select the <code>logging</code> reporter
+explicitly.</p>
+<h2 id="selecting-a-reporter"><a class="header" href="#selecting-a-reporter">Selecting a reporter</a></h2>
+<h3 id="catalog-wide-via-a-property"><a class="header" href="#catalog-wide-via-a-property">Catalog-wide, via a property</a></h3>
+<p>Set <code>metrics-reporter-impl</code> to a registered reporter name. Every table loaded
+from the catalog inherits it. This works for REST-catalog config too, since it is
+an ordinary catalog property.</p>
+<pre><code class="language-go">cat, err := catalog.Load(ctx, &quot;prod&quot;, iceberg.Properties{
+    &quot;metrics-reporter-impl&quot;: &quot;logging&quot;, // built-in: &quot;nop&quot; (default) or &quot;logging&quot;
+})
+</code></pre>
+<p>An unrecognized name is an error, so a typo surfaces rather than silently
+disabling metrics.</p>
+<h3 id="per-scan-override"><a class="header" href="#per-scan-override">Per-scan override</a></h3>
+<p>Override the reporter for a single scan with <code>table.WithReporter</code>; it takes
+precedence over the reporter inherited from the table.</p>
+<pre><code class="language-go">inmem := &amp;metrics.InMemoryReporter{}
+
+scan := tbl.Scan(table.WithReporter(inmem))
+// ... run the scan ...
+
+for _, report := range inmem.Reports() {
+    if sr, ok := report.(metrics.ScanReport); ok {
+        fmt.Println(sr.TableName, sr.Metrics.ResultDataFiles)
+    }
+}
+</code></pre>
+<h2 id="built-in-reporters"><a class="header" href="#built-in-reporters">Built-in reporters</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Reporter</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>metrics.NopReporter{}</code></td><td>Discards every report. The default when nothing is configured.</td></tr>
+<tr><td><code>metrics.NewLoggingReporter(logger)</code></td><td>Logs each report via an <code>slog.Logger</code> (<code>slog.Default()</code> when <code>nil</code>). Registered as <code>&quot;logging&quot;</code>.</td></tr>
+<tr><td><code>&amp;metrics.InMemoryReporter{}</code></td><td>Retains every report for inspection via <code>Reports()</code>; <code>Reset()</code> clears them. Intended for tests.</td></tr>
+<tr><td><code>metrics.Combine(reporters...)</code></td><td>Fans each report out to several reporters. A panic in one is isolated from the rest.</td></tr>
+</tbody></table>
+</div>
+<h2 id="writing-a-custom-reporter"><a class="header" href="#writing-a-custom-reporter">Writing a custom reporter</a></h2>
+<p>Implement the two-method <a href="https://pkg.go.dev/github.com/apache/iceberg-go/metrics#Reporter"><code>Reporter</code></a>
+interface and type-switch on the concrete report:</p>
+<pre><code class="language-go">type myReporter struct{}
+
+func (myReporter) Report(ctx context.Context, report metrics.MetricsReport) {
+    switch r := report.(type) {
+    case metrics.ScanReport:
+        // record r.Metrics ...
+    case metrics.CommitReport:
+        // record r.Metrics ...
+    }
+}
+
+func (myReporter) Close() error { return nil } // release any held resources
+</code></pre>
+<p>Two contract rules matter:</p>
+<ul>
+<li><strong>Never block or fail the operation.</strong> <code>Report</code> is called inline at the
+scan/commit completion point. A network-backed reporter must dispatch the send
+on a background worker, and any error must be handled internally (logged and
+swallowed), never returned to the caller.</li>
+<li><strong>Be safe for concurrent use.</strong> <code>Report</code> may be called from multiple
+goroutines.</li>
+</ul>
+<p>To make a custom reporter selectable by name from <code>metrics-reporter-impl</code>,
+register a factory for it (typically from <code>init</code>):</p>
+<pre><code class="language-go">func init() {
+    metrics.Register(&quot;my-reporter&quot;, func(props map[string]string) (metrics.Reporter, error) {
+        return myReporter{}, nil
+    })
+}
+</code></pre>
+<h2 id="reporting-to-a-rest-catalog"><a class="header" href="#reporting-to-a-rest-catalog">Reporting to a REST catalog</a></h2>
+<p>A REST catalog can also POST each report to the catalog's
+<code>.../tables/{table}/metrics</code> endpoint. This is a separate opt-in from the
+in-process reporter above and is <strong>off by default</strong>; the POST is dispatched on a
+background worker so it never stalls a scan or commit. See the
+<a href="./configuration.html#metrics-reporting">REST metrics-reporting properties</a> for the
+enablement flag and timeout.</p>
+<h2 id="opentelemetry"><a class="header" href="#opentelemetry">OpenTelemetry</a></h2>
+<blockquote>
+<p><strong>Experimental.</strong> The OpenTelemetry metric and attribute names track the
+still-unmerged Iceberg Java reporter
+(<a href="https://github.com/apache/iceberg/pull/16250">apache/iceberg#16250</a>) and may
+change to stay aligned with it.</p>
+</blockquote>
+<p>The <code>metrics/otel</code> package provides an OpenTelemetry-backed reporter. The host
+owns the OpenTelemetry SDK; the reporter only looks up a meter (the global
+<code>MeterProvider</code> by default, or one you pass with <code>WithMeter</code>).</p>
+<pre><code class="language-go">import &quot;github.com/apache/iceberg-go/metrics/otel&quot;
+
+rep, err := otel.NewReporter(
+    otel.WithMeter(meter),
+    otel.WithAttributes(otel.AttrTableName, otel.AttrOperation),
+)
+</code></pre>
+<p>It exports a curated subset of the report fields under <code>iceberg.scan.*</code> /
+<code>iceberg.commit.*</code> instrument names (e.g. <code>iceberg.scan.planning.duration</code>,
+<code>iceberg.scan.result.data_files</code>, <code>iceberg.commit.duration</code>,
+<code>iceberg.commit.data_files.added</code>).</p>
+<p><code>WithAttributes</code> bounds label cardinality by allowlist. The default set is table
+name + operation; schema id (<code>otel.AttrSchemaID</code>) is opt-in. The snapshot id is
+<strong>never</strong> attached as a metric attribute because it is unbounded — per-snapshot
+detail stays available through the full reports and the table's snapshot history.</p>
+<p>The OpenTelemetry reporter is not registered under a <code>metrics-reporter-impl</code> name
+automatically. To select it by property, register a factory for it as shown in
+<a href="#writing-a-custom-reporter">Writing a custom reporter</a>; otherwise pass the
+instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</code>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="concurrent-writes.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="feature-status.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="concurrent-writes.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="feature-status.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

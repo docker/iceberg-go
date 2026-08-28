@@ -1,0 +1,346 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Verify a release - Iceberg Golang</title>
+
+
+        <!-- Custom HTML head -->
+        <!--
+          ~ Licensed to the Apache Software Foundation (ASF) under one
+          ~ or more contributor license agreements.  See the NOTICE file
+          ~ distributed with this work for additional information
+          ~ regarding copyright ownership.  The ASF licenses this file
+          ~ to you under the Apache License, Version 2.0 (the
+          ~ "License"); you may not use this file except in compliance
+          ~ with the License.  You may obtain a copy of the License at
+          ~
+          ~   http://www.apache.org/licenses/LICENSE-2.0
+          ~
+          ~ Unless required by applicable law or agreed to in writing,
+          ~ software distributed under the License is distributed on an
+          ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+          ~ KIND, either express or implied.  See the License for the
+          ~ specific language governing permissions and limitations
+          ~ under the License.
+        -->
+          <!-- Matomo -->
+          <script>
+            var _paq = window._paq = window._paq || [];
+            /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+            _paq.push(["setDoNotTrack", true]);
+            _paq.push(["disableCookies"]);
+            _paq.push(['trackPageView']);
+            _paq.push(['enableLinkTracking']);
+            (function() {
+              var u="https://analytics.apache.org/";
+              _paq.push(['setTrackerUrl', u+'matomo.php']);
+              _paq.push(['setSiteId', '82']);
+              var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
+              g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
+            })();
+          </script>
+          <!-- End Matomo Code -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html" class="active">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Iceberg Golang</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go/edit/main/website/src/verify-release.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="verify-a-release"><a class="header" href="#verify-a-release">Verify a release</a></h1>
+<p>When a release candidate is announced on <code>dev@iceberg.apache.org</code>, anyone (committer or not) can help by verifying the artifacts. Verification is required from at least three Apache Iceberg PMC members for the vote to pass.</p>
+<p>The repository ships a script that performs the full verification end-to-end: <code>dev/release/verify_rc.sh</code>.</p>
+<h2 id="what-an-rc-announcement-contains"><a class="header" href="#what-an-rc-announcement-contains">What an RC announcement contains</a></h2>
+<p>A <code>[VOTE] iceberg-go X.Y.Z RC&lt;N&gt;</code> thread on <code>dev@iceberg.apache.org</code> will reference:</p>
+<ul>
+<li>A signed source tarball under <code>https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-go-${VERSION}-rc${RC}/</code> (<code>.tar.gz</code>, <code>.tar.gz.asc</code>, <code>.tar.gz.sha512</code>)</li>
+<li>The Apache Iceberg <code>KEYS</code> file at <code>https://downloads.apache.org/iceberg/KEYS</code></li>
+<li>A GitHub compare URL between the previous release tag and the new RC tag</li>
+</ul>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<p>The script requires:</p>
+<ul>
+<li><code>curl</code></li>
+<li><code>gpg</code></li>
+<li><code>shasum</code> or <code>sha512sum</code></li>
+<li><code>tar</code></li>
+</ul>
+<p>You do not need Go installed - if Go is not on the system, the latest Go is downloaded automatically and used only for verification.</p>
+<h2 id="import-the-apache-iceberg-keys"><a class="header" href="#import-the-apache-iceberg-keys">Import the Apache Iceberg KEYS</a></h2>
+<pre><code class="language-sh">curl https://downloads.apache.org/iceberg/KEYS -o KEYS
+gpg --import KEYS
+</code></pre>
+<h2 id="run-the-verification-script"><a class="header" href="#run-the-verification-script">Run the verification script</a></h2>
+<p>The script takes the version and RC number as positional arguments:</p>
+<pre><code class="language-sh">dev/release/verify_rc.sh ${VERSION} ${RC}
+</code></pre>
+<p>For example, to verify <code>0.6.0</code> RC1:</p>
+<pre><code class="language-sh">dev/release/verify_rc.sh 0.6.0 1
+</code></pre>
+<p>If the verification succeeds, the script prints:</p>
+<pre><code>RC looks good!
+</code></pre>
+<h2 id="optional-environment-variables"><a class="header" href="#optional-environment-variables">Optional environment variables</a></h2>
+<p><code>verify_rc.sh</code> honors these environment variables (all optional):</p>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>VERIFY_DEFAULT</code></td><td><code>1</code></td><td>Master switch propagated to <code>VERIFY_DOWNLOAD</code> and <code>VERIFY_SIGN</code> if they are unset.</td></tr>
+<tr><td><code>VERIFY_DOWNLOAD</code></td><td><code>${VERIFY_DEFAULT}</code></td><td>Re-download artifacts when <code>1</code>; reuse the local copy when <code>0</code>.</td></tr>
+<tr><td><code>VERIFY_SIGN</code></td><td><code>${VERIFY_DEFAULT}</code></td><td>Re-run signature and checksum verification when <code>1</code>.</td></tr>
+<tr><td><code>VERIFY_FORCE_USE_GO_BINARY</code></td><td><code>0</code></td><td>When <code>1</code>, ignore any system Go and use the script's auto-downloaded Go.</td></tr>
+<tr><td><code>GITHUB_TOKEN</code></td><td>unset</td><td>Optional - supplies authenticated requests when fetching the latest Go release, avoiding rate limits.</td></tr>
+</tbody></table>
+</div>
+<h2 id="manual-verification-fallback"><a class="header" href="#manual-verification-fallback">Manual verification fallback</a></h2>
+<p>If you would rather verify by hand, the underlying steps are:</p>
+<pre><code class="language-sh"># Download the artifacts
+curl -O https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-go-${VERSION}-rc${RC}/apache-iceberg-go-${VERSION}.tar.gz
+curl -O https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-go-${VERSION}-rc${RC}/apache-iceberg-go-${VERSION}.tar.gz.asc
+curl -O https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-go-${VERSION}-rc${RC}/apache-iceberg-go-${VERSION}.tar.gz.sha512
+
+# Verify the signature
+gpg --verify apache-iceberg-go-${VERSION}.tar.gz.asc apache-iceberg-go-${VERSION}.tar.gz
+
+# Verify the checksum (or sha512sum -c on systems without shasum)
+shasum -a 512 --check apache-iceberg-go-${VERSION}.tar.gz.sha512
+
+# Inspect the contents
+tar xf apache-iceberg-go-${VERSION}.tar.gz
+</code></pre>
+<p>You should reply to the <code>[VOTE]</code> thread with <code>+1</code>, <code>+0</code>, or <code>-1</code> and a one-line description of what you verified (for example, &quot;verified signatures, checksums, and <code>verify_rc.sh</code> passed on macOS arm64 with system Go 1.25.5&quot;).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="releases.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="how-to-release.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="releases.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="how-to-release.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

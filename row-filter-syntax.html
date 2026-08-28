@@ -1,0 +1,369 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Row Filter Syntax - Iceberg Golang</title>
+
+
+        <!-- Custom HTML head -->
+        <!--
+          ~ Licensed to the Apache Software Foundation (ASF) under one
+          ~ or more contributor license agreements.  See the NOTICE file
+          ~ distributed with this work for additional information
+          ~ regarding copyright ownership.  The ASF licenses this file
+          ~ to you under the Apache License, Version 2.0 (the
+          ~ "License"); you may not use this file except in compliance
+          ~ with the License.  You may obtain a copy of the License at
+          ~
+          ~   http://www.apache.org/licenses/LICENSE-2.0
+          ~
+          ~ Unless required by applicable law or agreed to in writing,
+          ~ software distributed under the License is distributed on an
+          ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+          ~ KIND, either express or implied.  See the License for the
+          ~ specific language governing permissions and limitations
+          ~ under the License.
+        -->
+          <!-- Matomo -->
+          <script>
+            var _paq = window._paq = window._paq || [];
+            /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+            _paq.push(["setDoNotTrack", true]);
+            _paq.push(["disableCookies"]);
+            _paq.push(['trackPageView']);
+            _paq.push(['enableLinkTracking']);
+            (function() {
+              var u="https://analytics.apache.org/";
+              _paq.push(['setTrackerUrl', u+'matomo.php']);
+              _paq.push(['setSiteId', '82']);
+              var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
+              g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
+            })();
+          </script>
+          <!-- End Matomo Code -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="row-filter-syntax.html" class="active">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Iceberg Golang</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-go/edit/main/website/src/row-filter-syntax.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="row-filter-syntax"><a class="header" href="#row-filter-syntax">Row Filter Syntax</a></h1>
+<p>Row filters drive predicate pushdown during scans, partition pruning, and row-level deletes. The DSL lives in the root <code>iceberg</code> package - all you need is the import:</p>
+<pre><code class="language-go">import &quot;github.com/apache/iceberg-go&quot;
+</code></pre>
+<p>A column is referenced with <code>iceberg.Reference(&quot;column_name&quot;)</code>. Predicate constructors return a <code>BooleanExpression</code> (or an <code>UnboundPredicate</code>, which satisfies <code>BooleanExpression</code>) that can be combined with the boolean combinators in the <a href="./expression-dsl.html">Expression DSL</a> and passed to APIs like <code>table.WithRowFilter(...)</code>.</p>
+<h2 id="equality"><a class="header" href="#equality">Equality</a></h2>
+<pre><code class="language-go">iceberg.EqualTo(iceberg.Reference(&quot;status&quot;), &quot;active&quot;)
+iceberg.NotEqualTo(iceberg.Reference(&quot;retries&quot;), int32(0))
+</code></pre>
+<p><code>EqualTo[T]</code> and <code>NotEqualTo[T]</code> are generic over <code>LiteralType</code> (<code>bool</code>, <code>int32</code>, <code>int64</code>, <code>float32</code>, <code>float64</code>, <code>string</code>, <code>[]byte</code>, plus a few iceberg-specific types). The value's type must be in that set - bare <code>int</code> literals are not, so use <code>int32(0)</code> / <code>int64(0)</code> explicitly. They wrap <code>LiteralPredicate(OpEQ, ...)</code> and <code>LiteralPredicate(OpNEQ, ...)</code> (<code>predicates.go:83-91</code>).</p>
+<h2 id="comparison"><a class="header" href="#comparison">Comparison</a></h2>
+<pre><code class="language-go">iceberg.LessThan(iceberg.Reference(&quot;amount&quot;), 100.0)
+iceberg.LessThanEqual(iceberg.Reference(&quot;amount&quot;), 100.0)
+iceberg.GreaterThan(iceberg.Reference(&quot;created_at&quot;), int64(1700000000))
+iceberg.GreaterThanEqual(iceberg.Reference(&quot;score&quot;), int32(50))
+</code></pre>
+<p>Operators: <code>OpLT</code>, <code>OpLTEQ</code>, <code>OpGT</code>, <code>OpGTEQ</code> (<code>exprs.go:47-50</code>). Constructors at <code>predicates.go:98-124</code>.</p>
+<h2 id="set-membership"><a class="header" href="#set-membership">Set membership</a></h2>
+<pre><code class="language-go">iceberg.IsIn(iceberg.Reference(&quot;region&quot;), &quot;us-east&quot;, &quot;us-west&quot;, &quot;eu-west&quot;)
+iceberg.NotIn(iceberg.Reference(&quot;status&quot;), &quot;deleted&quot;, &quot;archived&quot;)
+</code></pre>
+<p><code>IsIn</code> and <code>NotIn</code> are variadic. They return a <code>BooleanExpression</code> (not <code>UnboundPredicate</code>) because the result can simplify automatically:</p>
+<ul>
+<li>Zero values - reduces to <code>AlwaysFalse{}</code> (for <code>IsIn</code>) or <code>AlwaysTrue{}</code> (for <code>NotIn</code>).</li>
+<li>One value - reduces to <code>EqualTo</code> / <code>NotEqualTo</code>.</li>
+</ul>
+<p>See <code>predicates.go:55-78</code>.</p>
+<h2 id="null-checks"><a class="header" href="#null-checks">Null checks</a></h2>
+<pre><code class="language-go">iceberg.IsNull(iceberg.Reference(&quot;deleted_at&quot;))
+iceberg.NotNull(iceberg.Reference(&quot;user_id&quot;))
+</code></pre>
+<p>These wrap <code>UnaryPredicate(OpIsNull, ...)</code> and <code>UnaryPredicate(OpNotNull, ...)</code>. Both panic if the term is <code>nil</code> (<code>predicates.go:23-32</code>).</p>
+<h2 id="nan-checks-float--double-columns-only"><a class="header" href="#nan-checks-float--double-columns-only">NaN checks (float / double columns only)</a></h2>
+<pre><code class="language-go">iceberg.IsNaN(iceberg.Reference(&quot;ratio&quot;))
+iceberg.NotNaN(iceberg.Reference(&quot;ratio&quot;))
+</code></pre>
+<p>Operators <code>OpIsNan</code> and <code>OpNotNan</code>. Use these instead of <code>EqualTo(..., math.NaN())</code> - NaN is never equal to itself.</p>
+<h2 id="string-prefix"><a class="header" href="#string-prefix">String prefix</a></h2>
+<pre><code class="language-go">iceberg.StartsWith(iceberg.Reference(&quot;path&quot;), &quot;/var/log/&quot;)
+iceberg.NotStartsWith(iceberg.Reference(&quot;name&quot;), &quot;tmp_&quot;)
+</code></pre>
+<p>Operators <code>OpStartsWith</code> and <code>OpNotStartsWith</code> (<code>exprs.go:53-54</code>). The value must be a <code>string</code>.</p>
+<h2 id="constants"><a class="header" href="#constants">Constants</a></h2>
+<pre><code class="language-go">iceberg.AlwaysTrue{}
+iceberg.AlwaysFalse{}
+</code></pre>
+<p>These satisfy <code>BooleanExpression</code> and short-circuit during expression simplification. Useful as a base case when filters are built dynamically:</p>
+<pre><code class="language-go">filter := iceberg.BooleanExpression(iceberg.AlwaysTrue{})
+for _, clause := range userClauses {
+    filter = iceberg.NewAnd(filter, clause)
+}
+</code></pre>
+<h2 id="operator-reference"><a class="header" href="#operator-reference">Operator reference</a></h2>
+<p>The full operator set is the <code>Operation</code> enum at <code>exprs.go:34-62</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Constant</th><th>Convenience builder</th></tr></thead><tbody>
+<tr><td><code>&lt;</code></td><td><code>OpLT</code></td><td><code>LessThan</code></td></tr>
+<tr><td><code>&lt;=</code></td><td><code>OpLTEQ</code></td><td><code>LessThanEqual</code></td></tr>
+<tr><td><code>&gt;</code></td><td><code>OpGT</code></td><td><code>GreaterThan</code></td></tr>
+<tr><td><code>&gt;=</code></td><td><code>OpGTEQ</code></td><td><code>GreaterThanEqual</code></td></tr>
+<tr><td><code>==</code></td><td><code>OpEQ</code></td><td><code>EqualTo</code></td></tr>
+<tr><td><code>!=</code></td><td><code>OpNEQ</code></td><td><code>NotEqualTo</code></td></tr>
+<tr><td><code>IS NULL</code></td><td><code>OpIsNull</code></td><td><code>IsNull</code></td></tr>
+<tr><td><code>IS NOT NULL</code></td><td><code>OpNotNull</code></td><td><code>NotNull</code></td></tr>
+<tr><td><code>IS NaN</code></td><td><code>OpIsNan</code></td><td><code>IsNaN</code></td></tr>
+<tr><td><code>IS NOT NaN</code></td><td><code>OpNotNan</code></td><td><code>NotNaN</code></td></tr>
+<tr><td><code>IN</code></td><td><code>OpIn</code></td><td><code>IsIn</code></td></tr>
+<tr><td><code>NOT IN</code></td><td><code>OpNotIn</code></td><td><code>NotIn</code></td></tr>
+<tr><td><code>STARTS WITH</code></td><td><code>OpStartsWith</code></td><td><code>StartsWith</code></td></tr>
+<tr><td><code>NOT STARTS WITH</code></td><td><code>OpNotStartsWith</code></td><td><code>NotStartsWith</code></td></tr>
+<tr><td><code>AND</code> / <code>OR</code> / <code>NOT</code></td><td><code>OpAnd</code> / <code>OpOr</code> / <code>OpNot</code></td><td><code>NewAnd</code> / <code>NewOr</code> / <code>NewNot</code> (see <a href="./expression-dsl.html">Expression DSL</a>)</td></tr>
+</tbody></table>
+</div>
+<h2 id="putting-it-together"><a class="header" href="#putting-it-together">Putting it together</a></h2>
+<p>A typical filter passed to a scan:</p>
+<pre><code class="language-go">filter := iceberg.NewAnd(
+    iceberg.GreaterThanEqual(iceberg.Reference(&quot;event_time&quot;), int64(1700000000)),
+    iceberg.IsIn(iceberg.Reference(&quot;region&quot;), &quot;us-east&quot;, &quot;us-west&quot;),
+    iceberg.NotNull(iceberg.Reference(&quot;user_id&quot;)),
+)
+
+scan := tbl.Scan(table.WithRowFilter(filter))
+</code></pre>
+<p>For boolean combination, term details, and the lower-level escape hatches (<code>UnaryPredicate</code>, <code>LiteralPredicate</code>, <code>SetPredicate</code>), see <a href="./expression-dsl.html">Expression DSL</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="api.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="expression-dsl.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="api.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="expression-dsl.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>
