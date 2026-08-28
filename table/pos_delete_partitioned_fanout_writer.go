@@ -34,22 +34,18 @@ import (
 type positionDeletePartitionedFanoutWriter struct {
 	partitionContextByFilePath map[string]partitionContext
 	metadata                   Metadata
-	schema                     *iceberg.Schema
 	itr                        iter.Seq2[arrow.RecordBatch, error]
 	writerFactory              *writerFactory
-	concurrentDataFileWriter   *concurrentDataFileWriter
 }
 
 // newPositionDeletePartitionedFanoutWriter creates a new PartitionedFanoutWriter with the specified
-// partition specification, schema, and record iterator.
-func newPositionDeletePartitionedFanoutWriter(metadata Metadata, concurrentWriter *concurrentDataFileWriter, partitionContextByFilePath map[string]partitionContext, itr iter.Seq2[arrow.RecordBatch, error], writerFactory *writerFactory) *positionDeletePartitionedFanoutWriter {
+// metadata, partition context, and record iterator.
+func newPositionDeletePartitionedFanoutWriter(metadata Metadata, partitionContextByFilePath map[string]partitionContext, itr iter.Seq2[arrow.RecordBatch, error], writerFactory *writerFactory) *positionDeletePartitionedFanoutWriter {
 	return &positionDeletePartitionedFanoutWriter{
 		partitionContextByFilePath: partitionContextByFilePath,
 		metadata:                   metadata,
-		schema:                     iceberg.PositionalDeleteSchema,
 		itr:                        itr,
 		writerFactory:              writerFactory,
-		concurrentDataFileWriter:   concurrentWriter,
 	}
 }
 
@@ -60,19 +56,25 @@ func (p *positionDeletePartitionedFanoutWriter) Write(ctx context.Context, worke
 	inputRecordsCh := make(chan arrow.RecordBatch, workers)
 	outputDataFilesCh := make(chan iceberg.DataFile, workers)
 
-	fanoutWorkers, ctx := errgroup.WithContext(ctx)
-	startRecordFeeder(ctx, p.itr, fanoutWorkers, inputRecordsCh)
+	fanoutBaseCtx, fanoutCancel := context.WithCancel(ctx)
+	fanoutWorkers, fanoutCtx := errgroup.WithContext(fanoutBaseCtx)
+	writerCtx, writerCancel := context.WithCancel(ctx)
+	cancel := func() {
+		fanoutCancel()
+		writerCancel()
+	}
+	startRecordFeeder(fanoutCtx, p.itr, fanoutWorkers, inputRecordsCh)
 
 	for range workers {
 		fanoutWorkers.Go(func() error {
-			return p.fanout(ctx, inputRecordsCh, outputDataFilesCh)
+			return p.fanout(fanoutCtx, writerCtx, inputRecordsCh, outputDataFilesCh)
 		})
 	}
 
-	return p.yieldDataFiles(fanoutWorkers, outputDataFilesCh)
+	return p.yieldDataFiles(fanoutWorkers, inputRecordsCh, outputDataFilesCh, cancel)
 }
 
-func (p *positionDeletePartitionedFanoutWriter) fanout(ctx context.Context, inputRecordsCh <-chan arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
+func (p *positionDeletePartitionedFanoutWriter) fanout(ctx context.Context, writerCtx context.Context, inputRecordsCh <-chan arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -83,7 +85,7 @@ func (p *positionDeletePartitionedFanoutWriter) fanout(ctx context.Context, inpu
 				return nil
 			}
 
-			err := p.processBatch(ctx, record, dataFilesChannel)
+			err := p.processBatch(ctx, writerCtx, record, dataFilesChannel)
 			if err != nil {
 				return err
 			}
@@ -91,7 +93,7 @@ func (p *positionDeletePartitionedFanoutWriter) fanout(ctx context.Context, inpu
 	}
 }
 
-func (p *positionDeletePartitionedFanoutWriter) processBatch(ctx context.Context, batch arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) (err error) {
+func (p *positionDeletePartitionedFanoutWriter) processBatch(ctx context.Context, writerCtx context.Context, batch arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) (err error) {
 	defer batch.Release()
 
 	select {
@@ -116,7 +118,7 @@ func (p *positionDeletePartitionedFanoutWriter) processBatch(ctx context.Context
 	if err != nil {
 		return err
 	}
-	rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(ctx, p.concurrentDataFileWriter, partitionPath, partitionContext.partitionData, dataFilesChannel)
+	rollingDataWriter, err := p.writerFactory.getOrCreateRollingDataWriter(writerCtx, partitionPath, partitionContext.partitionData, dataFilesChannel)
 	if err != nil {
 		return err
 	}
@@ -135,11 +137,25 @@ func (p *positionDeletePartitionedFanoutWriter) partitionPath(partitionContext p
 		return "", fmt.Errorf("unexpected missing partition spec in metadata for spec id %d", partitionContext.specID)
 	}
 
-	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(p.schema))
+	// Resolve the schema at call time, not at construction. Unlike partitionedFanoutWriter
+	// (which always writes against the current spec), this writer fans out across historic
+	// specIDs from the target data files; callers must ensure those specIDs resolve against
+	// fields still present in CurrentSchema. Dropped partition source columns are assumed to
+	// be void-transformed per the Iceberg spec.
+	schema := p.metadata.CurrentSchema()
+	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(schema))
 
-	return spec.PartitionToPath(data, p.schema), nil
+	return spec.PartitionToPath(data, schema), nil
 }
 
-func (p *positionDeletePartitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, outputDataFilesCh chan iceberg.DataFile) iter.Seq2[iceberg.DataFile, error] {
-	return yieldDataFiles(p.writerFactory, fanoutWorkers, outputDataFilesCh)
+func (p *positionDeletePartitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, inputRecordsCh <-chan arrow.RecordBatch, outputDataFilesCh chan iceberg.DataFile, cancel context.CancelFunc) iter.Seq2[iceberg.DataFile, error] {
+	return yieldDataFiles(
+		p.writerFactory,
+		fanoutWorkers,
+		inputRecordsCh,
+		outputDataFilesCh,
+		p.writerFactory.closeAll,
+		p.writerFactory.abortAll,
+		cancel,
+	)
 }

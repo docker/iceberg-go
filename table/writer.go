@@ -27,10 +27,12 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/config"
 	"github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/table/internal"
+	tblutils "github.com/apache/iceberg-go/table/internal"
 	"github.com/google/uuid"
 )
 
+// WriteTask writes all its Batches into one file. The rolling writer bypasses
+// it, naming files via dataFileName directly.
 type WriteTask struct {
 	Uuid        uuid.UUID
 	ID          int
@@ -38,14 +40,20 @@ type WriteTask struct {
 	FileCount   int // FileCount is a sequential counter for files written by this task.
 	Schema      *iceberg.Schema
 	Batches     []arrow.RecordBatch
+	// SortOrderID claims Batches are globally sorted by that order; writeFile
+	// records it unverified. Must stay zero for position deletes.
 	SortOrderID int
 }
 
 func (w WriteTask) GenerateDataFileName(extension string) string {
-	// Mimics the behavior in the Java API:
-	// https://github.com/apache/iceberg/blob/03ed4ba9af4e47d32bdb22b7e3d033eb2a4b2c83/core/src/main/java/org/apache/iceberg/io/OutputFileFactory.java#L93
-	// Format: {partitionId:05d}-{taskId}-{operationId}-{fileCount:05d}.{extension}
-	return fmt.Sprintf("%05d-%d-%s-%05d.%s", w.PartitionID, w.ID, w.Uuid, w.FileCount, extension)
+	return dataFileName(w.Uuid, w.ID, w.PartitionID, w.FileCount, extension)
+}
+
+// dataFileName builds a data file name, mirroring the Java API:
+// https://github.com/apache/iceberg/blob/03ed4ba9af4e47d32bdb22b7e3d033eb2a4b2c83/core/src/main/java/org/apache/iceberg/io/OutputFileFactory.java#L93
+// Format: {partitionId:05d}-{taskId}-{operationId}-{fileCount:05d}.{extension}
+func dataFileName(writeUUID uuid.UUID, taskID, partitionID, fileCount int, extension string) string {
+	return fmt.Sprintf("%05d-%d-%s-%05d.%s", partitionID, taskID, writeUUID, fileCount, extension)
 }
 
 type defaultDataFileWriter struct {
@@ -53,16 +61,28 @@ type defaultDataFileWriter struct {
 	fs               io.WriteFileIO
 	fileSchema       *iceberg.Schema
 	fileFormat       iceberg.FileFormat
-	format           internal.FileFormat
+	format           tblutils.FileFormat
 	props            iceberg.Properties
 	content          iceberg.ManifestEntryContent
-	meta             *MetadataBuilder
 	equalityFieldIDs []int
+	invariants       dataWriterInvariants
+}
+
+// dataWriterInvariants contains the write configuration shared by every task
+// handled by a defaultDataFileWriter.
+type dataWriterInvariants struct {
+	statsCols     map[int]tblutils.StatisticsCollector
+	writeProps    any
+	rowGroupBytes int64
+	spec          iceberg.PartitionSpec
+	extension     string
+	arrowSchema   *arrow.Schema
+	schemaOpts    SchemaOptions
 }
 
 type dataFileWriterOption func(writer *defaultDataFileWriter)
 
-func withFormat(format internal.FileFormat) dataFileWriterOption {
+func withFormat(format tblutils.FileFormat) dataFileWriterOption {
 	return func(writer *defaultDataFileWriter) {
 		writer.format = format
 	}
@@ -97,19 +117,63 @@ func newDataFileWriter(rootLocation string, fs io.WriteFileIO, meta *MetadataBui
 	if err != nil {
 		return nil, err
 	}
+	if fileFormat == iceberg.ParquetFile {
+		if err := tblutils.ValidateParquetWriteProperties(props); err != nil {
+			return nil, err
+		}
+	}
 
 	w := defaultDataFileWriter{
 		loc:        locProvider,
 		fs:         fs,
 		fileSchema: meta.CurrentSchema(),
 		fileFormat: fileFormat,
-		format:     internal.GetFileFormat(fileFormat),
+		format:     tblutils.GetFileFormat(fileFormat),
 		content:    iceberg.EntryContentData,
 		props:      props,
-		meta:       meta,
 	}
 	for _, apply := range opts {
 		apply(&w)
+	}
+
+	statsCols, err := computeStatsPlan(w.fileSchema, meta.props)
+	if err != nil {
+		return nil, err
+	}
+
+	currentSpec, err := meta.CurrentSpec()
+	if err != nil {
+		return nil, err
+	}
+
+	var rowGroupBytes int64
+	if w.fileFormat == iceberg.ParquetFile {
+		rowGroupBytes, err = tblutils.ParquetRowGroupTargetSizeBytes(w.props)
+		if err != nil {
+			return nil, err
+		}
+	}
+	arrowSchema, err := SchemaToArrowSchemaWithOptions(w.fileSchema, ArrowSchemaOptions{
+		IncludeFieldIDs: true,
+		TableProperties: meta.props,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	w.invariants = dataWriterInvariants{
+		statsCols:     statsCols,
+		writeProps:    w.format.GetWriteProperties(w.props),
+		rowGroupBytes: rowGroupBytes,
+		spec:          *currentSpec,
+		extension:     strings.ToLower(string(w.fileFormat)),
+		arrowSchema:   arrowSchema,
+		schemaOpts: SchemaOptions{
+			DowncastTimestamp: true,
+			IncludeFieldIDs:   true,
+			UseWriteDefault:   true,
+			TableProperties:   meta.props,
+		},
 	}
 
 	return &w, nil
@@ -122,10 +186,16 @@ func (w *defaultDataFileWriter) writeFile(ctx context.Context, partitionValues m
 		}
 	}()
 
+	// Reject here on the caller's goroutine, not deep in the writer's Close().
+	if task.SortOrderID != UnsortedSortOrderID && w.content == iceberg.EntryContentPosDeletes {
+		return nil, fmt.Errorf("position delete file claims sort order id %d; the spec requires a null sort order id for position deletes",
+			task.SortOrderID)
+	}
+
 	batches := make([]arrow.RecordBatch, len(task.Batches))
 	for i, b := range task.Batches {
-		rec, err := ToRequestedSchema(ctx, w.fileSchema,
-			task.Schema, b, SchemaOptions{IncludeFieldIDs: true, UseWriteDefault: true})
+		rec, err := toRequestedSchema(ctx, w.fileSchema,
+			task.Schema, b, w.invariants.schemaOpts, w.invariants.arrowSchema)
 		if err != nil {
 			return nil, err
 		}
@@ -133,26 +203,17 @@ func (w *defaultDataFileWriter) writeFile(ctx context.Context, partitionValues m
 		defer rec.Release()
 	}
 
-	statsCols, err := computeStatsPlan(w.fileSchema, w.meta.props)
-	if err != nil {
-		return nil, err
-	}
-
 	filePath := w.loc.NewDataLocation(
-		task.GenerateDataFileName(strings.ToLower(string(w.fileFormat))))
+		task.GenerateDataFileName(w.invariants.extension))
 
-	currentSpec, err := w.meta.CurrentSpec()
-	if err != nil {
-		return nil, err
-	}
-
-	return w.format.WriteDataFile(ctx, w.fs, partitionValues, internal.WriteFileInfo{
+	return w.format.WriteDataFile(ctx, w.fs, partitionValues, tblutils.WriteFileInfo{
 		FileSchema:       w.fileSchema,
 		Content:          w.content,
 		FileName:         filePath,
-		StatsCols:        statsCols,
-		WriteProps:       w.format.GetWriteProperties(w.props),
-		Spec:             *currentSpec,
+		StatsCols:        w.invariants.statsCols,
+		WriteProps:       w.invariants.writeProps,
+		RowGroupBytes:    w.invariants.rowGroupBytes,
+		Spec:             w.invariants.spec,
 		EqualityFieldIDs: w.equalityFieldIDs,
 		SortOrderID:      task.SortOrderID,
 	}, batches)
@@ -231,7 +292,7 @@ func (w *concurrentDataFileWriter) writeFiles(ctx context.Context, rootLocation 
 		}
 	}
 
-	return internal.MapExec(ctx, config.EnvConfig.MaxWorkers, tasks, func(t WriteTask) (iceberg.DataFile, error) {
+	return tblutils.MapExec(ctx, config.EnvConfig.MaxWorkers, tasks, func(t WriteTask) (iceberg.DataFile, error) {
 		return fw.writeFile(ctx, partitionValues, t)
 	})
 }

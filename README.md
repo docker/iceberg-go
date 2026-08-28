@@ -54,7 +54,7 @@ Install the linter first
 
 ```shell
 make lint-install
-# or: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.8.0
+# or: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 ```
 
 ### Integration tests
@@ -73,7 +73,7 @@ make lint-install
    export AWS_S3_ENDPOINT=http://$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minio):9000
    export AWS_REGION=us-east-1
    export SPARK_CONTAINER_ID=$(docker ps -qf 'name=spark-iceberg')
-   export DOCKER_API_VER=$(docker version -f '{{.Server.APIVersion}}')
+   export DOCKER_API_VERSION=$(docker version -f '{{.Server.APIVersion}}')
    ```
 
 3. Run the integration tests:
@@ -82,7 +82,19 @@ make lint-install
    make integration-test
    ```
 
-   Or run a single suite: `make integration-scanner`, `make integration-io`, `make integration-rest`, `make integration-spark`.
+   Or run a single suite: `make integration-scanner`, `make integration-io`, `make integration-rest`, `make integration-rest-scan-planning`, `make integration-spark`, `make integration-hive`, `make integration-hadoop`.
+
+#### Running against Spark 4.0
+
+To validate against Spark 4.0 (used by v3 feature tests), substitute the setup step:
+
+```shell
+make integration-setup-spark4
+```
+
+The exported env vars and `make integration-test` invocation are identical to the Spark 3.5 flow above.
+
+Tests requiring Spark 4 (currently the variant and unknown-type tests) automatically skip on the Spark 3.5 setup.
 
 ## Feature Support / Roadmap
 
@@ -129,9 +141,10 @@ make lint-install
 | Drop Namespace              |  X   |  X   |   X    |  X   |   X    |
 | Update Namespace Properties |  X   |  X   |   X    |  X   |        |
 | Create View                 |  X   |  X   |        |  X   |        |
-| Load View                   |      |  X   |        |  X   |        |
+| Load View                   |  X   |  X   |        |  X   |        |
 | List View                   |  X   |  X   |        |  X   |        |
 | Drop View                   |  X   |  X   |        |  X   |        |
+| Rename View                 |  X   |      |        |      |        |
 | Check View Exists           |  X   |  X   |        |  X   |        |
 
 ### Read/Write Data Support
@@ -147,13 +160,13 @@ the table, the following tracks the current write support:
 |:---------------------|:---------:|
 | Append Stream        |     X     |
 | Append Data Files    |     X     |
-| Rewrite Files        |           |
-| Rewrite manifests    |           |
+| Rewrite Files        |     X     |
+| Rewrite manifests    |     X     |
 | Overwrite Files      |     X     |
 | Copy-On-Write Delete |     X     |
 | Write Pos Delete     |     X     |
-| Write Eq Delete      |           |
-| Row Delta            |           |
+| Write Eq Delete      |     X     |
+| Row Delta            |     X     |
 
 
 ### CLI Usage

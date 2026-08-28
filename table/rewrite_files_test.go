@@ -1,0 +1,1080 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table_test
+
+// Black-box coverage for the [table.RewriteFiles] snapshot-operation
+// builder, including the supporting [table.ExecuteCompactionGroup]
+// worker function and the [table.CollectSafePositionDeletes]
+// predicate. Tests cover the in-process path (one transaction stages
+// and commits) and the distributed-coordinator path (workers produce
+// [table.CompactionGroupResult]s, a leader builds a single
+// [table.RewriteFiles] from them and commits).
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// concurrentTestCatalog enforces Requirement.Validate against its
+// current metadata on every CommitTable, so a leader transaction
+// whose AssertRefSnapshotID points at a stale snapshot fails its
+// first attempt and triggers refresh-and-replay. attempts counts
+// CommitTable invocations so tests can prove the retry boundary.
+type concurrentTestCatalog struct {
+	metadata table.Metadata
+	location string
+	fsF      table.FSysF
+	attempts atomic.Int32
+}
+
+func (c *concurrentTestCatalog) LoadTable(_ context.Context, ident table.Identifier) (*table.Table, error) {
+	return table.New(ident, c.metadata, c.location, c.fsF, c), nil
+}
+
+func (c *concurrentTestCatalog) CommitTable(_ context.Context, _ table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	c.attempts.Add(1)
+	for _, req := range reqs {
+		if err := req.Validate(c.metadata); err != nil {
+			return nil, "", fmt.Errorf("%w: %w", table.ErrCommitFailed, err)
+		}
+	}
+	meta, err := table.UpdateTableMetadata(c.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+	c.metadata = meta
+
+	// Returning the seed location is enough to keep subsequent
+	// NewTransaction calls from adding AssertCreate; the value is not
+	// re-read by the table machinery between commits in this stub.
+	return meta, c.location, nil
+}
+
+func newConcurrentRewriteTestTable(t *testing.T) (*table.Table, *concurrentTestCatalog) {
+	return newConcurrentRewriteTestTableVersion(t, 2)
+}
+
+func newConcurrentRewriteTestTableVersion(t *testing.T, version int) (*table.Table, *concurrentTestCatalog) {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
+		iceberg.Properties{
+			table.PropertyFormatVersion:        strconv.Itoa(version),
+			table.CommitNumRetriesKey:          "2",
+			table.CommitMinRetryWaitMsKey:      "1",
+			table.CommitMaxRetryWaitMsKey:      "2",
+			table.CommitTotalRetryTimeoutMsKey: "1000",
+		})
+	require.NoError(t, err)
+
+	metaLoc := location + "/metadata/v1.metadata.json"
+	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	cat := &concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF}
+
+	return table.New(table.Identifier{"db", "concurrent_rewrite"}, meta, metaLoc, fsF, cat), cat
+}
+
+func newPosDeleteFile(t *testing.T, path string) iceberg.DataFile {
+	t.Helper()
+
+	b, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		path, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+
+	return b.Build()
+}
+
+func newEqDeleteFile(t *testing.T, path string) iceberg.DataFile {
+	t.Helper()
+
+	b, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentEqDeletes,
+		path, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+	b = b.EqualityFieldIDs([]int{1})
+
+	return b.Build()
+}
+
+func newDataFile(t *testing.T, path string) iceberg.DataFile {
+	t.Helper()
+
+	b, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentData,
+		path, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+
+	return b.Build()
+}
+
+func TestCollectSafePositionDeletes_FiltersAndDedupes(t *testing.T) {
+	posA := newPosDeleteFile(t, "pos-a.parquet")
+	posB := newPosDeleteFile(t, "pos-b.parquet")
+	eq := newEqDeleteFile(t, "eq.parquet")
+
+	tasks := []table.FileScanTask{
+		{DeleteFiles: []iceberg.DataFile{posA, posB}, EqualityDeleteFiles: []iceberg.DataFile{eq}},
+		{DeleteFiles: []iceberg.DataFile{posA}}, // duplicate of posA
+	}
+
+	got := table.CollectSafePositionDeletes(tasks)
+	require.Len(t, got, 2, "duplicate pos-deletes must be deduped, eq-deletes must be filtered out")
+
+	paths := []string{got[0].FilePath(), got[1].FilePath()}
+	assert.ElementsMatch(t, []string{"pos-a.parquet", "pos-b.parquet"}, paths)
+}
+
+func TestCollectSafePositionDeletes_EmptyTasks(t *testing.T) {
+	assert.Empty(t, table.CollectSafePositionDeletes(nil))
+	assert.Empty(t, table.CollectSafePositionDeletes([]table.FileScanTask{{}}))
+}
+
+func TestExecuteCompactionGroup_EmptyGroup(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	got, err := table.ExecuteCompactionGroup(t.Context(), tbl,
+		table.CompactionTaskGroup{PartitionKey: "p"})
+	require.NoError(t, err)
+	assert.Equal(t, "p", got.PartitionKey)
+	assert.Empty(t, got.OldDataFiles)
+	assert.Empty(t, got.NewDataFiles)
+	assert.Empty(t, got.SafePosDeletes)
+}
+
+func TestRewriteFiles_EmptyCommit_Errors(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	tx := tbl.NewTransaction()
+
+	err := tx.NewRewrite(nil).Commit(t.Context())
+	require.Error(t, err, "an empty rewrite has nothing to stage and must reject")
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "at least one file change")
+}
+
+func TestRewriteFiles_RejectsNegativeDataSequenceNumber(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	rewrite := tbl.NewTransaction().NewRewrite(nil).DataSequenceNumber(-1)
+
+	err := rewrite.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "invalid rewrite data sequence number")
+}
+
+func TestRewriteFiles_RejectsDataSequenceNumberAboveSnapshot(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	oldData := newDataFile(t, tbl.Location()+"/data/old-data.parquet")
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddDataFiles(t.Context(), []iceberg.DataFile{oldData}, nil))
+	tbl, err := tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	snapshot := tbl.CurrentSnapshot()
+	require.NotNil(t, snapshot)
+	nextSnapshotSequence := snapshot.SequenceNumber + 1
+	replacement := newDataFile(t, tbl.Location()+"/data/replacement-data.parquet")
+	tx = tbl.NewTransaction()
+	rewrite := tx.NewRewrite(nil).
+		DeleteFile(oldData).
+		AddDataFile(replacement).
+		DataSequenceNumber(nextSnapshotSequence + 1)
+	err = rewrite.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "cannot be greater than new snapshot sequence number")
+}
+
+func TestRewriteFiles_AddDataFile_RejectsNonDataFile(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	tx := tbl.NewTransaction()
+
+	posDel := newPosDeleteFile(t, "spurious-pos-del.parquet")
+
+	err := tx.NewRewrite(nil).AddDataFile(posDel).Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "AddDataFile only supports data files",
+		"adding a delete file via AddDataFile must be reported at commit time")
+	assert.Contains(t, err.Error(), "spurious-pos-del.parquet",
+		"error must name the offending file path")
+}
+
+func TestRewriteFiles_AddFile_PreservesFirstError(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	tx := tbl.NewTransaction()
+
+	err := tx.NewRewrite(nil).
+		AddDataFile(newPosDeleteFile(t, "first-error.parquet")).
+		AddFile(nil).
+		Commit(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AddDataFile only supports data files")
+	assert.NotContains(t, err.Error(), "AddFile got nil")
+}
+
+func TestRewriteFiles_RejectsAddOnlyDeleteFile(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	deleteFile := newPosDeleteFile(t, tbl.Location()+"/data/pos-delete.parquet")
+	tx := tbl.NewTransaction()
+	rewrite := tx.NewRewrite(nil).AddDeleteFile(deleteFile)
+	err := rewrite.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "requires replacing at least one existing delete file")
+}
+
+func TestRewriteFiles_Commit_SingleShot(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 2 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/seed-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "seed"}]`, i+1))
+		seedTx := tbl.NewTransaction()
+		require.NoError(t, seedTx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = seedTx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+
+	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Groups)
+
+	groups := toTaskGroups(plan.Groups)
+
+	results := make([]table.CompactionGroupResult, 0, len(groups))
+	for _, g := range groups {
+		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		require.NoError(t, err)
+		results = append(results, gr)
+	}
+
+	tx := tbl.NewTransaction()
+	rewrite := tx.NewRewrite(nil)
+	for _, gr := range results {
+		rewrite.ApplyResult(gr)
+	}
+	require.NoError(t, rewrite.Commit(t.Context()))
+
+	err = rewrite.Commit(t.Context())
+	require.Error(t, err, "double commit must reject so validators are not re-appended")
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "already called")
+}
+
+func TestRewriteFiles_PreservesIndependentPositionDeleteSequences(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	dataPath := tbl.Location() + "/data/independent-seq-data.parquet"
+	writeParquetFile(t, dataPath, arrowSc,
+		`[{"id": 1, "data": "a"}, {"id": 2, "data": "b"}]`)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	oldDeletes := make([]iceberg.DataFile, 0, 2)
+	oldSequences := make([]int64, 0, 2)
+	for i := range 2 {
+		path := tbl.Location() + fmt.Sprintf("/data/independent-old-%d.parquet", i)
+		writeParquetFile(t, path, table.PositionalDeleteArrowSchema,
+			fmt.Sprintf(`[{"file_path": %q, "pos": %d}]`, dataPath, i))
+		builder := newPosDeleteFile(t, path)
+		tx = tbl.NewTransaction()
+		require.NoError(t, tx.NewRowDelta(nil).AddDeletes(builder).Commit(t.Context()))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+		oldDeletes = append(oldDeletes, builder)
+		oldSequences = append(oldSequences, deleteFileSequence(t, tbl, path))
+	}
+	require.NotEqual(t, oldSequences[0], oldSequences[1])
+
+	newDeletes := make([]iceberg.DataFile, 0, 2)
+	for i := range 2 {
+		path := tbl.Location() + fmt.Sprintf("/data/independent-new-%d.parquet", i)
+		writeParquetFile(t, path, table.PositionalDeleteArrowSchema,
+			fmt.Sprintf(`[{"file_path": %q, "pos": %d}]`, dataPath, i))
+		newDeletes = append(newDeletes, newPosDeleteFile(t, path))
+	}
+
+	tx = tbl.NewTransaction()
+	rewrite := tx.NewRewrite(nil)
+	for i := range oldDeletes {
+		rewrite.DeleteFile(oldDeletes[i]).AddDeleteFileWithDataSequenceNumber(newDeletes[i], oldSequences[i])
+	}
+	require.NoError(t, rewrite.Commit(t.Context()))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	for i, df := range newDeletes {
+		assert.Equal(t, oldSequences[i], deleteFileSequence(t, tbl, df.FilePath()))
+	}
+	assert.Empty(t, scanIDs(t, tbl),
+		"each replacement must retain the applicability of its corresponding old position delete")
+}
+
+// TestRewriteFiles_Commit_SingleShot_AfterFailure pins down the
+// stricter contract: a builder is dead even when the first Commit
+// failed before reaching ReplaceFiles. Without this guard, an
+// empty-rewrite or stranger-file failure would leave the builder
+// reusable, and a retry would slip through and append the conflict
+// validator a second time.
+func TestRewriteFiles_Commit_SingleShot_AfterFailure(t *testing.T) {
+	t.Run("empty rewrite", func(t *testing.T) {
+		tbl := newRewriteTestTable(t)
+		tx := tbl.NewTransaction()
+
+		rewrite := tx.NewRewrite(nil)
+
+		err := rewrite.Commit(t.Context())
+		require.Error(t, err, "first Commit on an empty builder must fail")
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "at least one file change")
+
+		err = rewrite.Commit(t.Context())
+		require.Error(t, err, "second Commit must reject even though the first never staged anything")
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "already called")
+	})
+
+	t.Run("ReplaceFiles failure", func(t *testing.T) {
+		tbl := newRewriteTestTable(t)
+		tx := tbl.NewTransaction()
+
+		stranger := newDataFile(t, tbl.Location()+"/data/stranger.parquet")
+		replacement := newDataFile(t, tbl.Location()+"/data/replacement.parquet")
+
+		rewrite := tx.NewRewrite(nil).
+			DeleteFile(stranger).
+			AddDataFile(replacement)
+
+		err := rewrite.Commit(t.Context())
+		require.Error(t, err, "ReplaceFiles must reject a stranger data file")
+
+		err = rewrite.Commit(t.Context())
+		require.Error(t, err, "second Commit must reject so a retry can't re-stage ReplaceFiles or re-append the validator")
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "already called")
+	})
+}
+
+func TestRewriteFiles_DeleteFile_RoutesByContentType(t *testing.T) {
+	// Validates routing into the right slice via observable behavior:
+	// the data-slice and delete-file-slice membership checks in
+	// ReplaceFiles produce distinct error messages, so a mis-routed
+	// file would surface the wrong error class.
+	//
+	//   Builder A — DeleteFile(strangerData): if routed correctly, the
+	//   transaction has an empty deleteFilesToRemove slice and falls
+	//   through to ReplaceDataFilesWithDataFiles, which rejects with
+	//   "cannot delete files that do not belong to the table". A
+	//   mis-route into deleteFilesToRemove would error with "cannot
+	//   remove delete files that do not belong to the table" instead.
+	//
+	//   Builder B — DeleteFile(strangerPosDel) only: if routed
+	//   correctly, ReplaceFiles' main path rejects with "cannot remove
+	//   delete files that do not belong to the table". A mis-route
+	//   into dataFilesToDelete would surface "cannot delete files
+	//   that do not belong to the table" instead. (No AddDataFile
+	//   here: adds-without-data-deletes is rejected pre-flight by
+	//   Commit, so it would mask the routing error.)
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	dataPath := tbl.Location() + "/data/seed.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "seed"}]`)
+	seedTx := tbl.NewTransaction()
+	require.NoError(t, seedTx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = seedTx.Commit(t.Context())
+	require.NoError(t, err)
+
+	strangerData := newDataFile(t, tbl.Location()+"/data/stranger.parquet")
+	strangerPosDel := newPosDeleteFile(t, tbl.Location()+"/data/stranger-pos-del.parquet")
+	replacement := newDataFile(t, tbl.Location()+"/data/replacement.parquet")
+
+	dataSliceMiss := "cannot delete files that do not belong to the table"
+	deleteFileSliceMiss := "cannot remove delete files that do not belong to the table"
+
+	dataTx := tbl.NewTransaction()
+	err = dataTx.NewRewrite(nil).
+		DeleteFile(strangerData).
+		AddDataFile(replacement).
+		Commit(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), dataSliceMiss,
+		"DeleteFile(data) must route into dataFilesToDelete; mis-routed it would surface the delete-file-slice error")
+	assert.NotContains(t, err.Error(), deleteFileSliceMiss)
+
+	delTx := tbl.NewTransaction()
+	err = delTx.NewRewrite(nil).
+		DeleteFile(strangerPosDel).
+		Commit(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), deleteFileSliceMiss,
+		"DeleteFile(pos-delete) must route into deleteFilesToRemove; mis-routed it would surface the data-slice error")
+	assert.NotContains(t, err.Error(), dataSliceMiss)
+}
+
+// TestAddFiles_ReAddsPathDeletedByRewrite pins the duplicate check's
+// tombstone handling: a rewrite that removes a data file leaves a
+// DELETED manifest entry for its path on the branch head. That entry
+// records a removal — the path is no longer referenced by the table —
+// so a subsequent AddFiles for the same path must not report a false
+// "already referenced" conflict.
+func TestAddFiles_ReAddsPathDeletedByRewrite(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	dataPath := tbl.Location() + "/data/seed.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "seed"}]`)
+	seedTx := tbl.NewTransaction()
+	require.NoError(t, seedTx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = seedTx.Commit(t.Context())
+	require.NoError(t, err)
+
+	// A rewrite removes the file, leaving a DELETED tombstone on the head.
+	// The physical parquet file stays on disk (Iceberg deletes are
+	// metadata-only), so it can be legitimately re-added.
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	rewriteTx := tbl.NewTransaction()
+	require.NoError(t, rewriteTx.NewRewrite(nil).DeleteFile(tasks[0].File).Commit(t.Context()))
+	tbl, err = rewriteTx.Commit(t.Context())
+	require.NoError(t, err)
+
+	readdTx := tbl.NewTransaction()
+	require.NoError(t, readdTx.AddFiles(t.Context(), []string{dataPath}, nil, false),
+		"a path whose only head entry is a DELETED tombstone is not referenced by the table")
+	tbl, err = readdTx.Commit(t.Context())
+	require.NoError(t, err)
+
+	tasks, err = tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, dataPath, tasks[0].File.FilePath())
+}
+
+// TestRewriteFiles_RejectsAddsWithoutDataDeletes proves that staging
+// new data files with no data files to delete is rejected up front —
+// otherwise the chain would slip through ReplaceFiles →
+// ReplaceDataFilesWithDataFiles → AddDataFiles (an OpAppend producer)
+// and silently tag the snapshot append instead of replace, with no
+// rewrite validator registered.
+func TestRewriteFiles_RejectsAddsWithoutDataDeletes(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	tx := tbl.NewTransaction()
+
+	add := newDataFile(t, tbl.Location()+"/data/lonely-add.parquet")
+
+	err := tx.NewRewrite(nil).AddDataFile(add).Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "must delete at least one data file when adding")
+}
+
+func TestRewriteFiles_RejectsNilDataFile(t *testing.T) {
+	t.Run("DeleteFile", func(t *testing.T) {
+		tbl := newRewriteTestTable(t)
+		tx := tbl.NewTransaction()
+
+		err := tx.NewRewrite(nil).DeleteFile(nil).Commit(t.Context())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "DeleteFile got nil data file")
+	})
+
+	t.Run("AddDataFile", func(t *testing.T) {
+		tbl := newRewriteTestTable(t)
+		tx := tbl.NewTransaction()
+
+		err := tx.NewRewrite(nil).AddDataFile(nil).Commit(t.Context())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "AddDataFile got nil data file")
+	})
+}
+
+// TestRewriteFiles_DistributedEquivalence proves the worker+coordinator
+// pipeline lands at the same end state as the bundled in-process
+// [Transaction.RewriteDataFiles]: workers run [table.ExecuteCompactionGroup]
+// per group (here inline; in distributed compaction this happens on
+// remote peers and the results travel over the wire), then a single
+// leader transaction stages [table.RewriteFiles.Apply] +
+// [table.RewriteFiles.Commit] for one atomic snapshot.
+func TestRewriteFiles_DistributedEquivalence(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 4 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 4)
+
+	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Groups)
+
+	groups := toTaskGroups(plan.Groups)
+
+	results := make([]table.CompactionGroupResult, 0, len(groups))
+	for _, g := range groups {
+		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		require.NoError(t, err)
+		require.NotEmpty(t, gr.NewDataFiles)
+		results = append(results, gr)
+	}
+
+	leaderTxn := tbl.NewTransaction()
+	rewrite := leaderTxn.NewRewrite(nil)
+	for _, gr := range results {
+		rewrite.ApplyResult(gr)
+	}
+	require.NoError(t, rewrite.Commit(t.Context()))
+
+	committed, err := leaderTxn.Commit(t.Context())
+	require.NoError(t, err)
+
+	assertRowCount(t, committed, 4)
+
+	snap := committed.CurrentSnapshot()
+	require.NotNil(t, snap)
+	assert.Equal(t, table.OpReplace, snap.Summary.Operation,
+		"rewrite snapshot must be tagged replace, not overwrite")
+
+	// Lock the cross-client summary contract under OpReplace. PyIceberg
+	// (and other readers) parse these keys; the OpOverwrite → OpReplace
+	// flip must not silently drop any of them.
+	props := snap.Summary.Properties
+	require.NotNil(t, props)
+	assert.Equal(t, "1", props["added-data-files"])
+	assert.Equal(t, "4", props["deleted-data-files"])
+	assert.Equal(t, "4", props["added-records"])
+	assert.Equal(t, "4", props["deleted-records"])
+	assert.Equal(t, "1", props["total-data-files"])
+	assert.Equal(t, "4", props["total-records"])
+	assert.NotEmpty(t, props["added-files-size"], "byte counter must be populated")
+	assert.NotEmpty(t, props["removed-files-size"], "byte counter must be populated")
+	assert.NotEmpty(t, props["total-files-size"], "byte counter must be populated")
+
+	postTasks, err := committed.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, postTasks, 1, "leader-side commit must produce one consolidated file")
+}
+
+// TestRewriteFiles_DropsSafePositionDeletes drives the pipeline with a
+// position-delete present at plan time and asserts the pos-delete is
+// expunged in the rewrite snapshot.
+func TestRewriteFiles_DropsSafePositionDeletes(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 3 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc, fmt.Sprintf(
+			`[{"id": %d, "data": "a"}, {"id": %d, "data": "b"}]`, i*2+1, i*2+2))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	firstDataPath := tbl.Location() + "/data/file-0.parquet"
+	posDelPath := tbl.Location() + "/data/pos-del-001.parquet"
+	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema,
+		fmt.Sprintf(`[{"file_path": "%s", "pos": 0}]`, firstDataPath))
+
+	posDelBuilder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		posDelPath, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+
+	tx := tbl.NewTransaction()
+	rd := tx.NewRowDelta(nil)
+	rd.AddDeletes(posDelBuilder.Build())
+	require.NoError(t, rd.Commit(t.Context()))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+	assertRowCount(t, tbl, 5)
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+
+	cfg := defaultTestCompactionCfg
+	cfg.DeleteFileThreshold = 1
+	plan, err := cfg.PlanCompaction(tasks)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Groups)
+
+	groups := toTaskGroups(plan.Groups)
+
+	results := make([]table.CompactionGroupResult, 0, len(groups))
+	totalSafe := 0
+	for _, g := range groups {
+		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		require.NoError(t, err)
+		results = append(results, gr)
+		totalSafe += len(gr.SafePosDeletes)
+	}
+	require.Equal(t, 1, totalSafe, "the staged pos-delete must be reported safe by exactly one group")
+
+	leaderTxn := tbl.NewTransaction()
+	rewrite := leaderTxn.NewRewrite(nil)
+	for _, gr := range results {
+		rewrite.ApplyResult(gr)
+	}
+	require.NoError(t, rewrite.Commit(t.Context()))
+
+	committed, err := leaderTxn.Commit(t.Context())
+	require.NoError(t, err)
+
+	assertRowCount(t, committed, 5)
+
+	// Pos-delete removal must show up in the OpReplace summary —
+	// `removed-position-delete-files` (count of files) and
+	// `removed-position-deletes` (count of rows) are the keys other
+	// clients read.
+	snap := committed.CurrentSnapshot()
+	require.NotNil(t, snap)
+	props := snap.Summary.Properties
+	require.NotNil(t, props)
+	assert.Equal(t, "1", props["removed-position-delete-files"])
+	assert.Equal(t, "1", props["removed-position-deletes"])
+
+	postTasks, err := committed.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	for _, task := range postTasks {
+		assert.Empty(t, task.DeleteFiles,
+			"safe pos-delete must be expunged in the rewrite snapshot")
+	}
+}
+
+// TestRewriteFiles_RejectsConcurrentEqDelete is the negative path: a
+// leader stages a rewrite, a concurrent peer commits an equality-delete
+// during the rewrite window, and the leader's [table.Transaction.Commit]
+// must fail with [table.ErrConflictingDeleteFiles] — proving the
+// rewrite-specific conflict validator that [table.RewriteFiles.Commit]
+// registers internally fires under refresh-and-replay.
+//
+// First Commit attempt fails on the stale AssertRefSnapshotID (the
+// catalog has advanced past the leader's base). The retry refreshes,
+// builds a fresh conflictContext walking S0 → S1, and the rewrite
+// validator's conservative rule rejects any concurrent equality-delete
+// during a rewrite — terminal exit before any further CommitTable
+// call.
+//
+// Equality deletes are used here rather than positional deletes because
+// the v2 manifest schema does not carry a pos-delete's referenced data
+// file path; the validator's pos-delete branch is only effective on v3
+// tables. The eq-delete branch is the conservative rule for v2.
+func TestRewriteFiles_RejectsConcurrentEqDelete(t *testing.T) {
+	tbl, cat := newConcurrentRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 3 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+
+	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Groups)
+
+	groups := toTaskGroups(plan.Groups)
+
+	results := make([]table.CompactionGroupResult, 0, len(groups))
+	for _, g := range groups {
+		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		require.NoError(t, err)
+		require.NotEmpty(t, gr.OldDataFiles)
+		results = append(results, gr)
+	}
+
+	leaderTxn := tbl.NewTransaction()
+	rewrite := leaderTxn.NewRewrite(nil)
+	for _, gr := range results {
+		rewrite.ApplyResult(gr)
+	}
+	require.NoError(t, rewrite.Commit(t.Context()),
+		"staging the rewrite must succeed; the conflict surfaces at Commit time")
+
+	eqDelPath := tbl.Location() + "/data/concurrent-eq-del.parquet"
+	eqDelBuilder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentEqDeletes,
+		eqDelPath, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+	eqDelBuilder = eqDelBuilder.EqualityFieldIDs([]int{1})
+
+	peerTxn := tbl.NewTransaction()
+	rd := peerTxn.NewRowDelta(nil)
+	rd.AddDeletes(eqDelBuilder.Build())
+	require.NoError(t, rd.Commit(t.Context()))
+	_, err = peerTxn.Commit(t.Context())
+	require.NoError(t, err, "peer commit advances the catalog so the leader's first attempt fails")
+
+	beforeLeader := cat.attempts.Load()
+	_, err = leaderTxn.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrConflictingDeleteFiles,
+		"refresh-and-replay must detect the concurrent equality-delete during a rewrite")
+	// The expected delta is exactly 1 CommitTable invocation, the
+	// first attempt that fails on the stale AssertRefSnapshotID. The
+	// retry refreshes the conflictContext, the rewrite validator
+	// rejects the concurrent eq-delete, and the leader exits before
+	// re-issuing CommitTable. A delta of 0 means the validator fired
+	// pre-flight; a delta of ≥2 means the retry reached the catalog.
+	assert.Equal(t, int32(1), cat.attempts.Load()-beforeLeader,
+		"only the stale-assertion attempt landed; the retry never reached CommitTable")
+}
+
+// TestRewriteFiles_RejectsConcurrentDeleteForAddedDVTarget covers a pure
+// delete-file rewrite. The rewrite does not replace a data file, but it adds
+// a deletion vector for one, so the target still needs rewrite conflict
+// validation. A concurrent DV for the same target must not be allowed to
+// commit alongside it.
+func TestRewriteFiles_RejectsConcurrentDeleteForAddedDVTarget(t *testing.T) {
+	tbl, cat := newConcurrentRewriteTestTableVersion(t, 2)
+
+	dataPath := tbl.Location() + "/data/dv-target.parquet"
+	dataFile := newDataFile(t, dataPath)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddDataFiles(t.Context(), []iceberg.DataFile{dataFile}, nil))
+	tbl, err := tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	oldDelete := newPosDeleteFile(t, tbl.Location()+"/data/old-pos-delete.parquet")
+	tx = tbl.NewTransaction()
+	require.NoError(t, tx.NewRowDelta(nil).AddDeletes(oldDelete).Commit(t.Context()))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+	oldDeleteSequence := fileDataSequence(t, tbl, oldDelete.FilePath())
+
+	tx = tbl.NewTransaction()
+	require.NoError(t, tx.UpgradeFormatVersion(3))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	firstOffset, secondOffset, length := int64(8), int64(24), int64(16)
+	leaderDV := newRewriteDeletionVector(t, tbl.Location()+"/data/leader.puffin", dataPath, &firstOffset, &length)
+	leaderTxn := tbl.NewTransaction()
+	rewrite := leaderTxn.NewRewrite(nil).
+		DeleteFile(oldDelete).
+		AddDeleteFileWithDataSequenceNumber(leaderDV, oldDeleteSequence)
+	require.NoError(t, rewrite.Commit(t.Context()),
+		"the conflict must be checked when the transaction commits")
+
+	peerDV := newRewriteDeletionVector(t, tbl.Location()+"/data/peer.puffin", dataPath, &secondOffset, &length)
+	peerTxn := tbl.NewTransaction()
+	require.NoError(t, peerTxn.NewRowDelta(nil).AddDeletes(peerDV).Commit(t.Context()))
+	_, err = peerTxn.Commit(t.Context())
+	require.NoError(t, err, "the peer commit advances the catalog")
+
+	beforeLeader := cat.attempts.Load()
+	_, err = leaderTxn.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrCommitFailed,
+		"a concurrent delete for an added DV target must be rejected before replay")
+	assert.Equal(t, int32(1), cat.attempts.Load()-beforeLeader,
+		"the retry must stop in conflict validation before a second catalog commit")
+}
+
+// TestRewriteFiles_RejectsConcurrentPartitionScopedPosDelete covers the
+// gap fixed by validateNoNewDeletesForRewrittenFiles' partition
+// fallback: a concurrent pos-delete with neither ReferencedDataFile nor
+// resolvable file_path bounds set (the shape a v2 MoR writer commonly
+// produces) must still be caught by matching the delete's
+// (specID, partition) against the rewritten files, rather than passing
+// validation and silently losing the delete. Before the fix, this
+// pos-delete had no path to check and the rewrite-specific validator
+// let it through unconditionally.
+func TestRewriteFiles_RejectsConcurrentPartitionScopedPosDelete(t *testing.T) {
+	tbl, cat := newConcurrentRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 3 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+
+	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Groups)
+
+	groups := toTaskGroups(plan.Groups)
+
+	results := make([]table.CompactionGroupResult, 0, len(groups))
+	for _, g := range groups {
+		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		require.NoError(t, err)
+		require.NotEmpty(t, gr.OldDataFiles)
+		results = append(results, gr)
+	}
+
+	leaderTxn := tbl.NewTransaction()
+	rewrite := leaderTxn.NewRewrite(nil)
+	for _, gr := range results {
+		rewrite.ApplyResult(gr)
+	}
+	require.NoError(t, rewrite.Commit(t.Context()),
+		"staging the rewrite must succeed; the conflict surfaces at Commit time")
+
+	// A pos-delete with no ReferencedDataFile and no bounds: unresolvable
+	// to a single path, so the validator must fall back to matching this
+	// delete's (specID, partition) — the table is unpartitioned, so any
+	// rewritten file of the same spec conflicts.
+	posDelPath := tbl.Location() + "/data/concurrent-partition-scoped-pos-del.parquet"
+	posDelBuilder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		posDelPath, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+
+	peerTxn := tbl.NewTransaction()
+	rd := peerTxn.NewRowDelta(nil)
+	rd.AddDeletes(posDelBuilder.Build())
+	require.NoError(t, rd.Commit(t.Context()))
+	_, err = peerTxn.Commit(t.Context())
+	require.NoError(t, err, "peer commit advances the catalog so the leader's first attempt fails")
+
+	beforeLeader := cat.attempts.Load()
+	_, err = leaderTxn.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrConflictingDeleteFiles,
+		"refresh-and-replay must detect the concurrent partition-scoped pos-delete during a rewrite")
+	assert.Equal(t, int32(1), cat.attempts.Load()-beforeLeader,
+		"only the stale-assertion attempt landed; the retry never reached CommitTable")
+}
+
+func newConcurrentPartitionedRewriteTestTable(t *testing.T, schema *iceberg.Schema, spec *iceberg.PartitionSpec) (*table.Table, *concurrentTestCatalog) {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+	meta, err := table.NewMetadata(schema, spec, table.UnsortedSortOrder, location,
+		iceberg.Properties{
+			table.PropertyFormatVersion:        "2",
+			table.CommitNumRetriesKey:          "2",
+			table.CommitMinRetryWaitMsKey:      "1",
+			table.CommitMaxRetryWaitMsKey:      "2",
+			table.CommitTotalRetryTimeoutMsKey: "1000",
+		})
+	require.NoError(t, err)
+
+	metaLoc := location + "/metadata/v1.metadata.json"
+	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	cat := &concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF}
+
+	return table.New(table.Identifier{"db", "concurrent_partitioned_rewrite"}, meta, metaLoc, fsF, cat), cat
+}
+
+// runConcurrentPartitionScopedPosDeleteRewrite drives the shared
+// partitioned scenario: append rowsJSON (spanning two partitions via
+// the real fanout writer), rewrite the data file whose Avro-decoded
+// partition value equals rewritePartValue, then have a concurrent peer
+// commit a partition-scoped pos-delete (no ReferencedDataFile, no
+// bounds) carrying deletePartValue in its tuple. Both sides of the
+// validator's partition matching therefore come from real Avro
+// manifest decode. Returns the leader's Commit error.
+func runConcurrentPartitionScopedPosDeleteRewrite(
+	t *testing.T,
+	schema *iceberg.Schema,
+	spec *iceberg.PartitionSpec,
+	rowsJSON string,
+	rewritePartValue any,
+	deletePartValue any,
+) error {
+	t.Helper()
+
+	tbl, _ := newConcurrentPartitionedRewriteTestTable(t, schema, spec)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSc, []string{rowsJSON})
+	require.NoError(t, err)
+	defer data.Release()
+
+	tbl, err = tbl.Append(t.Context(), array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+
+	currentSpec := tbl.Metadata().PartitionSpec()
+	require.Equal(t, 1, currentSpec.NumFields(), "scenario assumes a single partition field")
+	var partFieldID int
+	for _, pf := range currentSpec.Fields() {
+		partFieldID = pf.FieldID
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 2, "the fanout writer must have split the append into one file per partition")
+
+	var rewriteFile iceberg.DataFile
+	for _, task := range tasks {
+		got := task.File.Partition()[partFieldID]
+		require.IsTypef(t, rewritePartValue, got,
+			"Avro-decoded partition value representation drifted from the expected one")
+		if got == rewritePartValue {
+			rewriteFile = task.File
+		}
+	}
+	require.NotNilf(t, rewriteFile,
+		"no data file decoded with partition value %#v", rewritePartValue)
+
+	leaderTxn := tbl.NewTransaction()
+	require.NoError(t, leaderTxn.NewRewrite(nil).DeleteFile(rewriteFile).Commit(t.Context()),
+		"staging the rewrite must succeed; the conflict surfaces at Commit time")
+
+	posDelPath := tbl.Location() + "/data/concurrent-partition-scoped-pos-del.parquet"
+	posDelBuilder, err := iceberg.NewDataFileBuilder(
+		currentSpec, iceberg.EntryContentPosDeletes,
+		posDelPath, iceberg.ParquetFile,
+		map[int]any{partFieldID: deletePartValue}, nil, nil, 1, 128)
+	require.NoError(t, err)
+
+	peerTxn := tbl.NewTransaction()
+	rd := peerTxn.NewRowDelta(nil)
+	rd.AddDeletes(posDelBuilder.Build())
+	require.NoError(t, rd.Commit(t.Context()))
+	_, err = peerTxn.Commit(t.Context())
+	require.NoError(t, err, "peer commit advances the catalog so the leader's first attempt fails")
+
+	_, err = leaderTxn.Commit(t.Context())
+
+	return err
+}
+
+// TestRewriteFiles_PartitionScopedPosDelete_IdentityIntPartition proves
+// the partition fallback on a genuinely partitioned table where both
+// the rewritten file's tuple and the concurrent delete's tuple flow
+// through real Avro manifest encode/decode: a same-partition
+// partition-scoped pos-delete must conflict, a different-partition one
+// must not (no false positive).
+func TestRewriteFiles_PartitionScopedPosDelete_IdentityIntPartition(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "part", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Name: "part", Transform: iceberg.IdentityTransform{},
+	})
+	rowsJSON := `[{"id":1,"part":1},{"id":2,"part":1},{"id":3,"part":2},{"id":4,"part":2}]`
+
+	t.Run("same partition conflicts", func(t *testing.T) {
+		err := runConcurrentPartitionScopedPosDeleteRewrite(t, schema, &spec, rowsJSON, int64(1), int64(1))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrConflictingDeleteFiles)
+	})
+
+	t.Run("different partition does not conflict", func(t *testing.T) {
+		err := runConcurrentPartitionScopedPosDeleteRewrite(t, schema, &spec, rowsJSON, int64(1), int64(2))
+		require.NoError(t, err,
+			"a partition-scoped pos-delete in a different partition must not be rejected")
+	})
+}
+
+// TestRewriteFiles_PartitionScopedPosDelete_IdentityDatePartition is
+// the representation-drift canary for the validator's partition
+// matching: date partition values pass through the Avro date logical
+// type (encoded as int32, decoded via time.Time into iceberg.Date), so
+// if either side ever decoded into a different Go representation for
+// the same logical day, the same-partition case would silently stop
+// conflicting.
+func TestRewriteFiles_PartitionScopedPosDelete_IdentityDatePartition(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "dt", Type: iceberg.PrimitiveTypes.Date, Required: true},
+	)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Name: "dt", Transform: iceberg.IdentityTransform{},
+	})
+	rowsJSON := `[{"id":1,"dt":"2024-03-01"},{"id":2,"dt":"2024-03-01"},` +
+		`{"id":3,"dt":"2024-03-02"},{"id":4,"dt":"2024-03-02"}]`
+	dayA := iceberg.Date(time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	dayB := dayA + 1
+
+	t.Run("same partition conflicts", func(t *testing.T) {
+		err := runConcurrentPartitionScopedPosDeleteRewrite(t, schema, &spec, rowsJSON, dayA, dayA)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrConflictingDeleteFiles)
+	})
+
+	t.Run("different partition does not conflict", func(t *testing.T) {
+		err := runConcurrentPartitionScopedPosDeleteRewrite(t, schema, &spec, rowsJSON, dayA, dayB)
+		require.NoError(t, err,
+			"a partition-scoped pos-delete on a different day must not be rejected")
+	})
+}

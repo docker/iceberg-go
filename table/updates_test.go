@@ -18,15 +18,123 @@
 package table
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func testFSF(io iceio.IO) FSysF {
+	return func(context.Context) (iceio.IO, error) { return io, nil }
+}
+
+// trackingCallsIO wraps trackingIO to count Open and Remove calls per path.
+type trackingCallsIO struct {
+	*trackingIO
+	openCount   map[string]int
+	removeCount map[string]int
+}
+
+func newTrackingCallsIO() *trackingCallsIO {
+	return &trackingCallsIO{
+		trackingIO:  newTrackingIO(),
+		openCount:   make(map[string]int),
+		removeCount: make(map[string]int),
+	}
+}
+
+func (c *trackingCallsIO) Open(name string) (iceio.File, error) {
+	c.openCount[name]++
+
+	return c.trackingIO.Open(name)
+}
+
+func (c *trackingCallsIO) Remove(name string) error {
+	c.removeCount[name]++
+
+	return c.trackingIO.Remove(name)
+}
+
+// writeManifest writes a v2 data manifest with a single ADDED
+// entry pointing at dataPath into tio.files at manifestPath, and returns a
+// ManifestFile descriptor with seqNum pre-assigned so the same descriptor
+// can be referenced from multiple manifest lists.
+func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, manifestPath, dataPath string) iceberg.ManifestFile {
+	t.Helper()
+
+	dataSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+	spec := iceberg.NewPartitionSpec()
+
+	df, err := iceberg.NewDataFileBuilder(
+		spec, iceberg.EntryContentData, dataPath, iceberg.ParquetFile,
+		nil, nil, nil, 1, 1024,
+	)
+	require.NoError(t, err)
+
+	entry := iceberg.NewManifestEntryBuilder(iceberg.EntryStatusADDED, &snapshotID, df.Build()).
+		SequenceNum(seqNum).
+		Build()
+
+	var buf bytes.Buffer
+	_, err = iceberg.WriteManifest(manifestPath, &buf, 2, spec, dataSchema, snapshotID, []iceberg.ManifestEntry{entry})
+	require.NoError(t, err)
+	require.NoError(t, tio.WriteFile(manifestPath, buf.Bytes()))
+
+	return iceberg.NewManifestFile(2, manifestPath, int64(buf.Len()), 0, snapshotID).
+		SequenceNum(seqNum, seqNum).
+		AddedFiles(1).
+		AddedRows(1).
+		Build()
+}
+
+// writeManifestList writes a v2 manifest list referencing the
+// given manifests into tio.files at listPath.
+func writeManifestList(t *testing.T, tio *trackingIO, snapshotID int64, listPath string, manifests []iceberg.ManifestFile) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	seqNum := int64(1)
+	require.NoError(t, iceberg.WriteManifestList(2, &buf, snapshotID, nil, &seqNum, 0, manifests))
+	require.NoError(t, tio.WriteFile(listPath, buf.Bytes()))
+}
+
+// metaJSONOpts configures the metadata document built by buildMetaJSON.
+type metaJSONOpts struct {
+	snapshots           string
+	statistics          string
+	partitionStatistics string
+}
+
+// buildMetaJSON returns the minimal v2 metadata document that ParseMetadataString will accept
+func buildMetaJSON(o metaJSONOpts) string {
+	return fmt.Sprintf(`{
+	  "format-version": 2,
+	  "table-uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+	  "location": "s3://bucket/table",
+	  "last-sequence-number": 0,
+	  "last-updated-ms": 1000,
+	  "last-column-id": 1,
+	  "current-schema-id": 0,
+	  "schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
+	  "default-spec-id": 0,
+	  "partition-specs": [{"spec-id":0,"fields":[]}],
+	  "last-partition-id": 0,
+	  "default-sort-order-id": 0,
+	  "sort-orders": [{"order-id":0,"fields":[]}],
+	  "snapshots": [%s],
+	  "statistics": [%s],
+	  "partition-statistics": [%s]
+	}`, o.snapshots, o.statistics, o.partitionStatistics)
+}
 
 func TestRemoveSnapshotsPostCommitSkipped(t *testing.T) {
 	update := NewRemoveSnapshotsUpdate([]int64{1, 2, 3}, false)
@@ -37,61 +145,72 @@ func TestRemoveSnapshotsPostCommitSkipped(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestRemoveSnapshotsPostCommitSkippedWhenGCDisabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		gcValue string
+	}{
+		{name: "false", gcValue: "false"},
+		{name: "one", gcValue: "1"},
+		{name: "garbage", gcValue: "garbage"},
+		{name: "false with trailing space", gcValue: "false "},
+		{name: "true with trailing space", gcValue: "true "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preMeta := buildMetaJSON(metaJSONOpts{
+				snapshots:  `{"snapshot-id":1,"timestamp-ms":1000}`,
+				statistics: `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}`,
+			})
+			postMeta := buildMetaJSON(metaJSONOpts{})
+
+			pre, err := ParseMetadataString(preMeta)
+			require.NoError(t, err)
+			post, err := ParseMetadataString(postMeta)
+			require.NoError(t, err)
+
+			postBuilder, err := MetadataBuilderFromBase(post, "")
+			require.NoError(t, err)
+			require.NoError(t, postBuilder.SetProperties(iceberg.Properties{GCEnabledKey: tt.gcValue}))
+			post, err = postBuilder.Build()
+			require.NoError(t, err)
+
+			tio := newTrackingCallsIO()
+			tio.files["s3://bucket/stats/snap1.puffin"] = []byte("puffin")
+			fsF := testFSF(tio)
+			preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
+			postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+
+			update := NewRemoveSnapshotsUpdate([]int64{1}, true)
+			require.NoError(t, update.PostCommit(context.Background(), preTable, postTable))
+			require.Contains(t, tio.files, "s3://bucket/stats/snap1.puffin")
+			require.Zero(t, tio.removeCount["s3://bucket/stats/snap1.puffin"])
+		})
+	}
+}
+
 func TestRemoveSnapshotsPostCommitDeletesStatisticsFiles(t *testing.T) {
 	// preTable has snapshot 1 with associated statistics and partition statistics files.
 	// postTable has no snapshots and no statistics (snapshot 1 has been expired).
 	// PostCommit must delete the statistics paths that belonged to the expired snapshot.
-	const preMeta = `{
-	  "format-version": 2,
-	  "table-uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-	  "location": "s3://bucket/table",
-	  "last-sequence-number": 1,
-	  "last-updated-ms": 1000,
-	  "last-column-id": 1,
-	  "current-schema-id": 0,
-	  "schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
-	  "default-spec-id": 0,
-	  "partition-specs": [{"spec-id":0,"fields":[]}],
-	  "last-partition-id": 0,
-	  "default-sort-order-id": 0,
-	  "sort-orders": [{"order-id":0,"fields":[]}],
-	  "current-snapshot-id": 1,
-	  "snapshots": [{"snapshot-id":1,"timestamp-ms":1000,"sequence-number":1,"schema-id":0}],
-	  "snapshot-log": [],
-	  "metadata-log": [],
-	  "statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}],
-	  "partition-statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50}]
-	}`
-	const postMeta = `{
-	  "format-version": 2,
-	  "table-uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-	  "location": "s3://bucket/table",
-	  "last-sequence-number": 1,
-	  "last-updated-ms": 2000,
-	  "last-column-id": 1,
-	  "current-schema-id": 0,
-	  "schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
-	  "default-spec-id": 0,
-	  "partition-specs": [{"spec-id":0,"fields":[]}],
-	  "last-partition-id": 0,
-	  "default-sort-order-id": 0,
-	  "sort-orders": [{"order-id":0,"fields":[]}],
-	  "snapshot-log": [],
-	  "metadata-log": []
-	}`
+	preMeta := buildMetaJSON(metaJSONOpts{
+		snapshots:           `{"snapshot-id":1,"timestamp-ms":1000}`,
+		statistics:          `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}`,
+		partitionStatistics: `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50}`,
+	})
+	postMeta := buildMetaJSON(metaJSONOpts{})
 
 	pre, err := ParseMetadataString(preMeta)
 	require.NoError(t, err)
 	post, err := ParseMetadataString(postMeta)
 	require.NoError(t, err)
 
-	// Pass *trackingIO to createTestTransaction — Go converts it to iceio.IO implicitly,
 	tio := newTrackingIO()
 	tio.files["s3://bucket/stats/snap1.puffin"] = []byte("puffin")
 	tio.files["s3://bucket/stats/snap1-part.puffin"] = []byte("puffin")
 
-	txn := createTestTransaction(t, tio, iceberg.NewPartitionSpec())
-	fsF := txn.tbl.fsF
+	fsF := testFSF(tio)
 	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
 	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
 
@@ -107,63 +226,18 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	// pre:  snapshots 1 and 2, statistics for both.
 	// post: snapshot 1 expired, snapshot 2 kept with its statistics still present.
 	// PostCommit must delete only snap1's statistics files; snap2's must survive.
-	const preMeta = `{
-	  "format-version": 2,
-	  "table-uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-	  "location": "s3://bucket/table",
-	  "last-sequence-number": 2,
-	  "last-updated-ms": 1000,
-	  "last-column-id": 1,
-	  "current-schema-id": 0,
-	  "schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
-	  "default-spec-id": 0,
-	  "partition-specs": [{"spec-id":0,"fields":[]}],
-	  "last-partition-id": 0,
-	  "default-sort-order-id": 0,
-	  "sort-orders": [{"order-id":0,"fields":[]}],
-	  "current-snapshot-id": 2,
-	  "snapshots": [
-	    {"snapshot-id":1,"timestamp-ms":1000,"sequence-number":1,"schema-id":0},
-	    {"snapshot-id":2,"timestamp-ms":2000,"sequence-number":2,"schema-id":0}
-	  ],
-	  "snapshot-log": [],
-	  "metadata-log": [],
-	  "statistics": [
-	    {"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]},
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
-	  ],
-	  "partition-statistics": [
-	    {"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50},
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}
-	  ]
-	}`
-	const postMeta = `{
-	  "format-version": 2,
-	  "table-uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-	  "location": "s3://bucket/table",
-	  "last-sequence-number": 2,
-	  "last-updated-ms": 3000,
-	  "last-column-id": 1,
-	  "current-schema-id": 0,
-	  "schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
-	  "default-spec-id": 0,
-	  "partition-specs": [{"spec-id":0,"fields":[]}],
-	  "last-partition-id": 0,
-	  "default-sort-order-id": 0,
-	  "sort-orders": [{"order-id":0,"fields":[]}],
-	  "current-snapshot-id": 2,
-	  "snapshots": [
-	    {"snapshot-id":2,"timestamp-ms":2000,"sequence-number":2,"schema-id":0}
-	  ],
-	  "snapshot-log": [],
-	  "metadata-log": [],
-	  "statistics": [
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
-	  ],
-	  "partition-statistics": [
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}
-	  ]
-	}`
+	preMeta := buildMetaJSON(metaJSONOpts{
+		snapshots: `{"snapshot-id":1,"timestamp-ms":1000},{"snapshot-id":2,"timestamp-ms":2000}`,
+		statistics: `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]},` +
+			`{"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}`,
+		partitionStatistics: `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50},` +
+			`{"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}`,
+	})
+	postMeta := buildMetaJSON(metaJSONOpts{
+		snapshots:           `{"snapshot-id":2,"timestamp-ms":2000}`,
+		statistics:          `{"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}`,
+		partitionStatistics: `{"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}`,
+	})
 
 	pre, err := ParseMetadataString(preMeta)
 	require.NoError(t, err)
@@ -176,8 +250,7 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	tio.files["s3://bucket/stats/snap2.puffin"] = []byte("puffin")
 	tio.files["s3://bucket/stats/snap2-part.puffin"] = []byte("puffin")
 
-	txn := createTestTransaction(t, tio, iceberg.NewPartitionSpec())
-	fsF := txn.tbl.fsF
+	fsF := testFSF(tio)
 	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
 	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
 
@@ -192,6 +265,117 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	// snap2's statistics must survive
 	assert.Contains(t, tio.files, "s3://bucket/stats/snap2.puffin")
 	assert.Contains(t, tio.files, "s3://bucket/stats/snap2-part.puffin")
+}
+
+func TestRemoveSnapshotsPostCommitSharedManifestRetained(t *testing.T) {
+	// Manifest M is referenced by both an expired snapshot (1) and a
+	// retained snapshot (2). PostCommit must keep M and its data file
+	// because a retained snapshot still references them; only snap1's
+	// manifest list should be deleted.
+	const (
+		dataPath      = "s3://bucket/data/file-1.parquet"
+		manifestPath  = "s3://bucket/meta/manifest-shared.avro"
+		manifestList1 = "s3://bucket/meta/snap-1.avro"
+		manifestList2 = "s3://bucket/meta/snap-2.avro"
+	)
+
+	tio := newTrackingIO()
+	mf := writeManifest(t, tio, 1, 1, manifestPath, dataPath)
+	writeManifestList(t, tio, 1, manifestList1, []iceberg.ManifestFile{mf})
+	writeManifestList(t, tio, 2, manifestList2, []iceberg.ManifestFile{mf})
+	tio.files[dataPath] = []byte("data")
+
+	preMeta := buildMetaJSON(metaJSONOpts{
+		snapshots: fmt.Sprintf(
+			`{"snapshot-id":1,"timestamp-ms":1000,"manifest-list":%q},`+
+				`{"snapshot-id":2,"timestamp-ms":2000,"manifest-list":%q}`,
+			manifestList1, manifestList2),
+	})
+	postMeta := buildMetaJSON(metaJSONOpts{
+		snapshots: fmt.Sprintf(`{"snapshot-id":2,"timestamp-ms":2000,"manifest-list":%q}`, manifestList2),
+	})
+
+	pre, err := ParseMetadataString(preMeta)
+	require.NoError(t, err)
+	post, err := ParseMetadataString(postMeta)
+	require.NoError(t, err)
+
+	fsF := testFSF(tio)
+	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
+	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+
+	update := NewRemoveSnapshotsUpdate([]int64{1}, true)
+	err = update.PostCommit(context.Background(), preTable, postTable)
+	require.NoError(t, err)
+
+	// snap1's manifest list must be deleted.
+	assert.NotContains(t, tio.files, manifestList1)
+
+	// The shared manifest, its data file, and the retained snapshot's
+	// manifest list must all survive because snap2 still references them.
+	assert.Contains(t, tio.files, manifestPath)
+	assert.Contains(t, tio.files, dataPath)
+	assert.Contains(t, tio.files, manifestList2)
+}
+
+func TestRemoveSnapshotsPostCommitSharedManifestExpiredOnce(t *testing.T) {
+	// Manifest M is referenced by two expired snapshots (1 and 2) and no
+	// retained snapshot. PostCommit must delete M and its data file, and
+	// must open M exactly once across the two expired snapshots — the
+	// dedup invariant the PR is built on. Open count on the shared
+	// manifest is the perf signal: a regression that drops the dedup
+	// would open it twice.
+	const (
+		dataPath      = "s3://bucket/data/file-1.parquet"
+		manifestPath  = "s3://bucket/meta/manifest-shared.avro"
+		manifestList1 = "s3://bucket/meta/snap-1.avro"
+		manifestList2 = "s3://bucket/meta/snap-2.avro"
+	)
+
+	tio := newTrackingCallsIO()
+	mf := writeManifest(t, tio.trackingIO, 1, 1, manifestPath, dataPath)
+	writeManifestList(t, tio.trackingIO, 1, manifestList1, []iceberg.ManifestFile{mf})
+	writeManifestList(t, tio.trackingIO, 2, manifestList2, []iceberg.ManifestFile{mf})
+	tio.files[dataPath] = []byte("data")
+
+	preMeta := buildMetaJSON(metaJSONOpts{
+		snapshots: fmt.Sprintf(
+			`{"snapshot-id":1,"timestamp-ms":1000,"manifest-list":%q},`+
+				`{"snapshot-id":2,"timestamp-ms":2000,"manifest-list":%q}`,
+			manifestList1, manifestList2),
+	})
+	postMeta := buildMetaJSON(metaJSONOpts{})
+
+	pre, err := ParseMetadataString(preMeta)
+	require.NoError(t, err)
+	post, err := ParseMetadataString(postMeta)
+	require.NoError(t, err)
+
+	fsF := testFSF(tio)
+	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
+	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+
+	update := NewRemoveSnapshotsUpdate([]int64{1, 2}, true)
+	err = update.PostCommit(context.Background(), preTable, postTable)
+	require.NoError(t, err)
+
+	// Both manifest lists, the shared manifest, and its data file must
+	// all be deleted.
+	assert.NotContains(t, tio.files, manifestList1)
+	assert.NotContains(t, tio.files, manifestList2)
+	assert.NotContains(t, tio.files, manifestPath)
+	assert.NotContains(t, tio.files, dataPath)
+
+	// The shared manifest must be opened exactly once: snap1's pass
+	// records it in visitedManifests, snap2's pass must skip it.
+	assert.Equal(t, 1, tio.openCount[manifestPath],
+		"shared manifest must be read only once across expired snapshots")
+
+	// Each file must be deleted exactly once.
+	assert.Equal(t, 1, tio.removeCount[manifestPath],
+		"shared manifest must be deleted exactly once")
+	assert.Equal(t, 1, tio.removeCount[dataPath],
+		"data file must be deleted exactly once")
 }
 
 func TestUnmarshalUpdates(t *testing.T) {
@@ -209,7 +393,7 @@ func TestUnmarshalUpdates(t *testing.T) {
 		22,
 		[]SortField{
 			{SourceIDs: []int{19}, Transform: iceberg.IdentityTransform{}, NullOrder: NullsFirst, Direction: SortASC},
-			{SourceIDs: []int{25}, Transform: iceberg.BucketTransform{NumBuckets: 4}, NullOrder: NullsFirst, Direction: SortDESC},
+			{SourceIDs: []int{25}, Transform: iceberg.BucketTransform{NumBuckets: 4}, NullOrder: NullsLast, Direction: SortDESC},
 			{SourceIDs: []int{22}, Transform: iceberg.VoidTransform{}, NullOrder: NullsFirst, Direction: SortASC},
 		},
 	)
@@ -231,10 +415,10 @@ func TestUnmarshalUpdates(t *testing.T) {
 				{"action": "set-properties", "updates": {"key1": "value1"}},
 				{"action": "remove-properties", "removals": ["key2"]},
 				{"action": "remove-schemas", "schema-ids": [1,2,3,4]},
-				{"action": "remove-partition-specs", "schema-ids": [1,2,3]},
+				{"action": "remove-partition-specs", "spec-ids": [1,2,3]},
 				{"action": "remove-snapshots", "snapshot-ids": [1,2]},
 				{"action": "remove-snapshot-ref", "ref-name": "main"},
-				{"action": "set-default-sort-order", "order-id": 1},
+				{"action": "set-default-sort-order", "sort-order-id": 1},
 				{"action": "set-default-spec", "spec-id": 1},
 				{"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 1}
 			]`),
@@ -374,31 +558,373 @@ func TestUnmarshalUpdates(t *testing.T) {
 				}
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, len(tc.expected), len(actual))
-				for idx, u := range actual {
-					switch u.Action() {
-					case "add-schema":
-						expectedAddSchema := u.(*addSchemaUpdate)
+				require.Len(t, actual, len(tc.expected))
+				for idx, expected := range tc.expected {
+					switch expected.Action() {
+					case UpdateAddSchema:
+						expectedAddSchema := expected.(*addSchemaUpdate)
 						actualAddSchema := actual[idx].(*addSchemaUpdate)
 						assert.True(t, expectedAddSchema.Schema.Equals(actualAddSchema.Schema))
-						assert.Equal(t, actualAddSchema.initial, expectedAddSchema.initial)
-					case "add-partition-spec":
-						expectedAddPartitionSpec := u.(*addPartitionSpecUpdate)
+						assert.Equal(t, expectedAddSchema.initial, actualAddSchema.initial)
+					case UpdateAddSpec:
+						expectedAddPartitionSpec := expected.(*addPartitionSpecUpdate)
 						actualAddPartitionSpec := actual[idx].(*addPartitionSpecUpdate)
-						assert.True(t, expectedAddPartitionSpec.Spec.Equals(*actualAddPartitionSpec.Spec))
-						assert.Equal(t, actualAddPartitionSpec.initial, expectedAddPartitionSpec.initial)
-					case "add-sort-order":
-						expectedAddSortOrder := u.(*addSortOrderUpdate)
+						assert.True(t, expectedAddPartitionSpec.Spec.Equals(actualAddPartitionSpec.Spec.PartitionSpec))
+						assert.Equal(t, expectedAddPartitionSpec.initial, actualAddPartitionSpec.initial)
+					case UpdateAddSortOrder:
+						expectedAddSortOrder := expected.(*addSortOrderUpdate)
 						actualAddSortOrder := actual[idx].(*addSortOrderUpdate)
-						assert.True(t, expectedAddSortOrder.SortOrder.Equals(*actualAddSortOrder.SortOrder))
-						assert.Equal(t, actualAddSortOrder.initial, expectedAddSortOrder.initial)
+						assert.True(t, expectedAddSortOrder.SortOrder.Equals(actualAddSortOrder.SortOrder.SortOrder))
+						assert.Equal(t, expectedAddSortOrder.initial, actualAddSortOrder.initial)
 					default:
-						assert.Equal(t, u, actual[idx])
+						assert.Equal(t, expected, actual[idx])
 					}
 				}
 			}
 		})
 	}
+}
+
+func TestUnmarshalAddSpecWithoutIDUsesInitialSpecID(t *testing.T) {
+	var updates Updates
+	require.NoError(t, json.Unmarshal([]byte(`[{"action":"add-spec","spec":{"fields":[]}}]`), &updates))
+	require.Len(t, updates, 1)
+	update := updates[0].(*addPartitionSpecUpdate)
+	require.NotNil(t, update.Spec)
+	assert.Equal(t, iceberg.InitialPartitionSpecID, update.Spec.ID())
+}
+
+func TestUnmarshalUpdatesAcceptsLegacyPropertyFields(t *testing.T) {
+	data := []byte(`[
+		{"action":"set-properties","updated":{"key":"legacy"}},
+		{"action":"remove-properties","removed":["key"]},
+		{"action":"set-properties","updated":{}},
+		{"action":"remove-properties","removed":[]},
+		{"action":"set-properties","updated":{"key":"legacy"},"updates":{"key":"modern"}},
+		{"action":"remove-properties","removed":["legacy"],"removals":["modern"]}
+	]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	assert.Equal(t, Updates{
+		NewSetPropertiesUpdate(iceberg.Properties{"key": "legacy"}),
+		NewRemovePropertiesUpdate([]string{"key"}),
+		NewSetPropertiesUpdate(iceberg.Properties{}),
+		NewRemovePropertiesUpdate([]string{}),
+		NewSetPropertiesUpdate(iceberg.Properties{"key": "modern"}),
+		NewRemovePropertiesUpdate([]string{"modern"}),
+	}, updates)
+
+	encoded, err := json.Marshal(updates)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{"action":"set-properties","updates":{"key":"legacy"}},
+		{"action":"remove-properties","removals":["key"]},
+		{"action":"set-properties","updates":{}},
+		{"action":"remove-properties","removals":[]},
+		{"action":"set-properties","updates":{"key":"modern"}},
+		{"action":"remove-properties","removals":["modern"]}
+	]`, string(encoded))
+}
+
+func TestUnmarshalUpdatesRejectsNullLegacyPropertyFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		data  string
+		field string
+	}{
+		{
+			name:  "set-properties legacy field",
+			data:  `{"action":"set-properties","updated":null}`,
+			field: "updates",
+		},
+		{
+			name:  "remove-properties legacy field",
+			data:  `{"action":"remove-properties","removed":null}`,
+			field: "removals",
+		},
+		{
+			name:  "set-properties canonical field takes precedence",
+			data:  `{"action":"set-properties","updated":{"key":"legacy"},"updates":null}`,
+			field: "updates",
+		},
+		{
+			name:  "remove-properties canonical field takes precedence",
+			data:  `{"action":"remove-properties","removed":["legacy"],"removals":null}`,
+			field: "removals",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updates Updates
+			err := json.Unmarshal([]byte("["+tt.data+"]"), &updates)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.field)
+		})
+	}
+}
+
+func TestUnmarshalUpdatesReplacesExistingSlice(t *testing.T) {
+	var updates Updates
+	require.NoError(t, json.Unmarshal([]byte(`[
+		{"action": "set-location", "location": "s3://bucket/old-location"}
+	]`), &updates))
+
+	require.NoError(t, json.Unmarshal([]byte(`[
+		{"action": "set-properties", "updates": {"key": "value"}}
+	]`), &updates))
+	require.Len(t, updates, 1)
+	assert.Equal(t, UpdateSetProperties, updates[0].Action())
+
+	previous := append(Updates(nil), updates...)
+	err := json.Unmarshal([]byte(`[
+		{"action": "set-location", "location": "s3://bucket/new-location"},
+		{"action": "unknown-action"}
+	]`), &updates)
+	require.Error(t, err)
+	assert.Equal(t, previous, updates)
+
+	require.NoError(t, json.Unmarshal([]byte(`[]`), &updates))
+	assert.Empty(t, updates)
+}
+
+func TestUnmarshalUpdatesRejectsMissingRequiredFields(t *testing.T) {
+	tests := []struct {
+		action string
+		field  string
+	}{
+		{UpdateAssignUUID, "uuid"},
+		{UpdateUpgradeFormatVersion, "format-version"},
+		{UpdateAddSchema, "schema"},
+		{UpdateSetCurrentSchema, "schema-id"},
+		{UpdateAddSpec, "spec"},
+		{UpdateSetDefaultSpec, "spec-id"},
+		{UpdateAddSortOrder, "sort-order"},
+		{UpdateSetDefaultSortOrder, "sort-order-id"},
+		{UpdateAddSnapshot, "snapshot"},
+		{UpdateSetSnapshotRef, "ref-name"},
+		{UpdateSetSnapshotRef, "type"},
+		{UpdateSetSnapshotRef, "snapshot-id"},
+		{UpdateRemoveSnapshots, "snapshot-ids"},
+		{UpdateRemoveSnapshotRef, "ref-name"},
+		{UpdateSetLocation, "location"},
+		{UpdateSetProperties, "updates"},
+		{UpdateRemoveProperties, "removals"},
+		{UpdateRemoveSpec, "spec-ids"},
+		{UpdateRemoveSchemas, "schema-ids"},
+		{UpdateSetStatistics, "statistics"},
+		{UpdateRemoveStatistics, "snapshot-id"},
+		{UpdateSetPartitionStatistics, "partition-statistics"},
+		{UpdateRemovePartitionStatistics, "snapshot-id"},
+		{UpdateAddEncryptionKey, "encryption-key"},
+		{UpdateRemoveEncryptionKey, "key-id"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			var updates Updates
+			data := []byte(fmt.Sprintf(`[{"action":%q}]`, tt.action))
+			if tt.action == UpdateSetSnapshotRef {
+				data = snapshotRefPayload(tt.field, false)
+			}
+			err := json.Unmarshal(data, &updates)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.field)
+		})
+	}
+}
+
+func snapshotRefPayload(omittedField string, nullField bool) []byte {
+	fields := map[string]any{
+		"action":      UpdateSetSnapshotRef,
+		"ref-name":    "main",
+		"type":        "branch",
+		"snapshot-id": int64(1),
+	}
+	if nullField {
+		fields[omittedField] = nil
+	} else {
+		delete(fields, omittedField)
+	}
+
+	data, err := json.Marshal([]map[string]any{fields})
+	if err != nil {
+		panic(err)
+	}
+
+	return data
+}
+
+func TestUnmarshalUpdatesRejectsNullRequiredPayload(t *testing.T) {
+	tests := []struct {
+		action string
+		field  string
+	}{
+		{UpdateAssignUUID, "uuid"},
+		{UpdateUpgradeFormatVersion, "format-version"},
+		{UpdateAddSchema, "schema"},
+		{UpdateSetCurrentSchema, "schema-id"},
+		{UpdateAddSpec, "spec"},
+		{UpdateSetDefaultSpec, "spec-id"},
+		{UpdateAddSortOrder, "sort-order"},
+		{UpdateSetDefaultSortOrder, "sort-order-id"},
+		{UpdateAddSnapshot, "snapshot"},
+		{UpdateSetSnapshotRef, "ref-name"},
+		{UpdateSetSnapshotRef, "type"},
+		{UpdateSetSnapshotRef, "snapshot-id"},
+		{UpdateRemoveSnapshots, "snapshot-ids"},
+		{UpdateRemoveSnapshotRef, "ref-name"},
+		{UpdateSetLocation, "location"},
+		{UpdateSetProperties, "updates"},
+		{UpdateRemoveProperties, "removals"},
+		{UpdateRemoveSpec, "spec-ids"},
+		{UpdateRemoveSchemas, "schema-ids"},
+		{UpdateSetStatistics, "statistics"},
+		{UpdateRemoveStatistics, "snapshot-id"},
+		{UpdateSetPartitionStatistics, "partition-statistics"},
+		{UpdateRemovePartitionStatistics, "snapshot-id"},
+		{UpdateAddEncryptionKey, "encryption-key"},
+		{UpdateRemoveEncryptionKey, "key-id"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.action+"/"+tt.field, func(t *testing.T) {
+			var updates Updates
+			data := []byte(fmt.Sprintf(`[{"action":%q,%q:null}]`, tt.action, tt.field))
+			if tt.action == UpdateSetSnapshotRef {
+				data = snapshotRefPayload(tt.field, true)
+			}
+			err := json.Unmarshal(data, &updates)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.field)
+		})
+	}
+}
+
+func TestUnmarshalUpdatesRejectsMissingOrNullAction(t *testing.T) {
+	for _, data := range []string{`{}`, `{"action":null}`} {
+		t.Run(data, func(t *testing.T) {
+			var updates Updates
+			err := json.Unmarshal([]byte("["+data+"]"), &updates)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			require.ErrorContains(t, err, "action")
+		})
+	}
+}
+
+func TestUnmarshalUpdatesUsesJSONActionFieldSemantics(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           string
+		expectedAction string
+		assert         func(*testing.T, Update)
+	}{
+		{
+			name:           "accepts mixed-case action key",
+			data:           `[{"Action":"set-location","location":"s3://bucket/table"}]`,
+			expectedAction: UpdateSetLocation,
+			assert: func(t *testing.T, update Update) {
+				t.Helper()
+				location, ok := update.(*setLocationUpdate)
+				require.True(t, ok)
+				assert.Equal(t, "s3://bucket/table", location.Location)
+			},
+		},
+		{
+			name:           "uses the last duplicate case-variant action key",
+			data:           `[{"action":"set-location","ACTION":"assign-uuid","location":"s3://bucket/table","uuid":"550e8400-e29b-41d4-a716-446655440000"}]`,
+			expectedAction: UpdateAssignUUID,
+			assert: func(t *testing.T, update Update) {
+				t.Helper()
+				assignUUID, ok := update.(*assignUUIDUpdate)
+				require.True(t, ok)
+				assert.Equal(t, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"), assignUUID.UUID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updates Updates
+			require.NoError(t, json.Unmarshal([]byte(tt.data), &updates))
+			require.Len(t, updates, 1)
+			assert.Equal(t, tt.expectedAction, updates[0].Action())
+			tt.assert(t, updates[0])
+		})
+	}
+
+	t.Run("rejects unknown action from duplicate case-variant key", func(t *testing.T) {
+		var updates Updates
+		err := json.Unmarshal([]byte(`[{"action":"set-location","ACTION":"unknown","location":"s3://bucket/table"}]`), &updates)
+		require.ErrorContains(t, err, "unknown update action: unknown")
+	})
+}
+
+func TestUnmarshalUpdatesPreservesDuplicateActionTypeError(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "valid final action",
+			data: `[{"action":123,"action":"set-properties","updated":{"k":"v"}}]`,
+		},
+		{
+			name: "valid final action with missing required field",
+			data: `[{"action":123,"action":"set-location"}]`,
+		},
+		{
+			name: "unknown final action",
+			data: `[{"action":123,"action":"unknown"}]`,
+		},
+		{
+			name: "null final action",
+			data: `[{"action":123,"action":null}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updates Updates
+			var typeErr *json.UnmarshalTypeError
+			err := json.Unmarshal([]byte(tt.data), &updates)
+
+			require.ErrorAs(t, err, &typeErr)
+		})
+	}
+}
+
+func TestUnmarshalUpdatesAcceptsOptionalAndEmptyValues(t *testing.T) {
+	data := []byte(`[
+		{"action":"add-schema","schema":{"type":"struct","fields":[]}},
+		{"action":"set-snapshot-ref","ref-name":"main","type":"branch","snapshot-id":1},
+		{"action":"set-properties","updates":{}},
+		{"action":"remove-properties","removals":[]},
+		{"action":"remove-schemas","schema-ids":[]},
+		{"action":"remove-partition-specs","spec-ids":[]},
+		{"action":"remove-snapshots","snapshot-ids":[]}
+	]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 7)
+	assert.Equal(t, UpdateAddSchema, updates[0].Action())
+	assert.Equal(t, UpdateSetSnapshotRef, updates[1].Action())
+}
+
+func TestUnmarshalUpdatesPreservesReceiverAfterRequiredFieldFailure(t *testing.T) {
+	var updates Updates
+	require.NoError(t, json.Unmarshal([]byte(`[
+		{"action":"set-location","location":"s3://bucket/old-location"}
+	]`), &updates))
+	previous := append(Updates(nil), updates...)
+
+	err := json.Unmarshal([]byte(`[
+		{"action":"set-location"}
+	]`), &updates)
+	require.Error(t, err)
+	assert.Equal(t, previous, updates)
 }
 
 // baseMetaJSON is a minimal valid V2 metadata document used by the Apply tests below.
@@ -430,10 +956,22 @@ func buildFromBase(t *testing.T) *MetadataBuilder {
 	return b
 }
 
+func TestAssignUUIDUpdate_ApplyRejectsNilUUID(t *testing.T) {
+	b := buildFromBase(t)
+	originalUUID := b.uuid
+
+	err := NewAssignUUIDUpdate(uuid.Nil).Apply(b)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	require.False(t, b.HasChanges())
+
+	meta, err := b.Build()
+	require.NoError(t, err)
+	require.Equal(t, originalUUID, meta.TableUUID())
+}
+
 func TestSetStatisticsUpdate_Unmarshal(t *testing.T) {
 	data := []byte(`[{
 		"action": "set-statistics",
-		"snapshot-id": 42,
 		"statistics": {
 			"snapshot-id": 42,
 			"statistics-path": "s3://bucket/stats.puffin",
@@ -449,7 +987,7 @@ func TestSetStatisticsUpdate_Unmarshal(t *testing.T) {
 
 	u, ok := updates[0].(*setStatisticsUpdate)
 	require.True(t, ok)
-	assert.Equal(t, int64(42), u.SnapshotID)
+	assert.Zero(t, u.SnapshotID)
 	assert.Equal(t, "s3://bucket/stats.puffin", u.Statistics.StatisticsPath)
 }
 
@@ -708,6 +1246,72 @@ func TestAddEncryptionKeyUpdate_Apply_RejectsV2(t *testing.T) {
 	assert.Contains(t, err.Error(), "format version 3")
 }
 
+func TestAddEncryptionKeyUpdate_Apply_RejectsMissingKeyID(t *testing.T) {
+	b := buildFromBaseV3(t)
+	key := EncryptionKey{KeyID: "", EncryptedKeyMetadata: "dGVzdA=="}
+
+	err := NewAddEncryptionKeyUpdate(key).Apply(b)
+	require.Error(t, err)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "key-id")
+}
+
+func TestAddEncryptionKeyUpdate_Apply_RejectsMissingEncryptedKeyMetadata(t *testing.T) {
+	b := buildFromBaseV3(t)
+	key := EncryptionKey{KeyID: "my-key", EncryptedKeyMetadata: ""}
+
+	err := NewAddEncryptionKeyUpdate(key).Apply(b)
+	require.Error(t, err)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "metadata")
+}
+
+func TestAddEncryptionKeyUpdate_Apply_RejectsWhitespaceOnlyEncryptedKeyMetadata(t *testing.T) {
+	b := buildFromBaseV3(t)
+	key := EncryptionKey{KeyID: "my-key", EncryptedKeyMetadata: "\n"}
+
+	err := NewAddEncryptionKeyUpdate(key).Apply(b)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "metadata must be non-empty")
+}
+
+func TestMetadataBuilderAddEncryptionKeyRejectsMissingKeyID(t *testing.T) {
+	b := buildFromBaseV3(t)
+	err := b.AddEncryptionKey(EncryptionKey{EncryptedKeyMetadata: "dGVzdA=="})
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "key-id")
+}
+
+func TestAddEncryptionKeyUpdate_Apply_RejectsInvalidEncryptedKeyMetadata(t *testing.T) {
+	b := buildFromBaseV3(t)
+	key := EncryptionKey{KeyID: "my-key", EncryptedKeyMetadata: "not-base64"}
+
+	err := NewAddEncryptionKeyUpdate(key).Apply(b)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "base64")
+}
+
+func TestAddEncryptionKeyUpdate_Apply_RejectsPaddedKeyID(t *testing.T) {
+	b := buildFromBaseV3(t)
+	key := EncryptionKey{KeyID: " my-key ", EncryptedKeyMetadata: "dGVzdA=="}
+
+	err := NewAddEncryptionKeyUpdate(key).Apply(b)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "key-id")
+}
+
+func TestAddEncryptionKeyUpdate_UnmarshalMissingFields_ApplyRejects(t *testing.T) {
+	data := []byte(`[{"action":"add-encryption-key","encryption-key":{"key-id":"my-key"}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	err := updates[0].Apply(buildFromBaseV3(t))
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "metadata")
+}
+
 func TestRemoveEncryptionKeyUpdate_Unmarshal(t *testing.T) {
 	data := []byte(`[{"action":"remove-encryption-key","key-id":"key-42"}]`)
 
@@ -739,4 +1343,119 @@ func TestRemoveEncryptionKeyUpdate_Apply_NoOp(t *testing.T) {
 	// Removing a key that doesn't exist should not error.
 	b := buildFromBase(t)
 	require.NoError(t, NewRemoveEncryptionKeyUpdate("nonexistent").Apply(b))
+}
+
+func TestAddPartitionSpecUpdate_UnmarshalVoidTombstone(t *testing.T) {
+	// A dropped partition field whose source column is gone is a void
+	// transform over source ID 0; BindToSchema carries it across, so the
+	// decoder must let it through.
+	data := []byte(`[{"action":"add-spec","spec":{"spec-id":1,"fields":[{"source-id":0,"field-id":1000,"transform":"void","name":"x_bucket"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	b := buildFromBaseV3(t)
+	require.NoError(t, updates[0].Apply(b))
+
+	meta, err := b.Build()
+	require.NoError(t, err)
+
+	spec := meta.PartitionSpecByID(1)
+	require.NotNil(t, spec)
+	require.Equal(t, 1, spec.NumFields())
+	assert.Equal(t, "x_bucket", spec.Field(0).Name)
+	assert.IsType(t, iceberg.VoidTransform{}, spec.Field(0).Transform)
+}
+
+func TestAddPartitionSpecUpdate_UnmarshalUnresolvableSourceID(t *testing.T) {
+	// A non-void source ID that the current schema cannot resolve is still
+	// rejected, but by binding rather than by decoding.
+	data := []byte(`[{"action":"add-spec","spec":{"spec-id":1,"fields":[{"source-id":0,"field-id":1000,"transform":"identity","name":"x"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	err := updates[0].Apply(buildFromBaseV3(t))
+	// Pinned to BindToSchema's wording on purpose: the assertion below only
+	// shows the decoder let the field through, not who rejected it.
+	require.ErrorContains(t, err, "cannot find source column with id: 0 in schema")
+	assert.NotContains(t, err.Error(), "must be positive")
+}
+
+func TestAddSortOrderUpdate_UnmarshalDefersBindingToApply(t *testing.T) {
+	// Decoding accepts the order either way; Apply reports both the positivity
+	// check and the schema lookup, which needs a schema only Apply knows. Source
+	// ID 0 fails the first and never reaches the second, so 999 covers the
+	// lookup: positive, and absent from baseMetaV3JSON.
+	for _, tt := range []struct {
+		name     string
+		sourceID int
+		message  string
+	}{
+		{name: "not positive", sourceID: 0, message: "source ID must be positive: 0"},
+		{name: "unresolvable", sourceID: 999, message: "sort field with source id 999 not found in schema"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fmt.Appendf(nil,
+				`[{"action":"add-sort-order","sort-order":{"order-id":1,"fields":[{"source-id":%d,"transform":"identity","direction":"asc","null-order":"nulls-first"}]}}]`,
+				tt.sourceID,
+			)
+
+			var updates Updates
+			require.NoError(t, json.Unmarshal(data, &updates))
+			require.Len(t, updates, 1)
+
+			err := updates[0].Apply(buildFromBaseV3(t))
+			require.ErrorContains(t, err, "not compatible with current schema")
+			assert.ErrorContains(t, err, tt.message)
+		})
+	}
+}
+
+func TestAddSortOrderUpdate_UnmarshalRoundTrip(t *testing.T) {
+	// The decode no longer validates source IDs, so cover the resolvable case
+	// end to end: field 1 is x in baseMetaV3JSON.
+	data := []byte(`[{"action":"add-sort-order","sort-order":{"order-id":1,"fields":[{"source-id":1,"transform":"identity","direction":"desc","null-order":"nulls-last"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	b := buildFromBaseV3(t)
+	require.NoError(t, updates[0].Apply(b))
+
+	meta, err := b.Build()
+	require.NoError(t, err)
+
+	var order SortOrder
+	var found bool
+	for _, o := range meta.SortOrders() {
+		if o.OrderID() == 1 {
+			order, found = o, true
+
+			break
+		}
+	}
+	require.True(t, found)
+	require.Equal(t, 1, order.Len())
+
+	field := order.Field(0)
+	assert.Equal(t, []int{1}, field.SourceIDs)
+	assert.Equal(t, SortDESC, field.Direction)
+	assert.Equal(t, NullsLast, field.NullOrder)
+	assert.IsType(t, iceberg.IdentityTransform{}, field.Transform)
+}
+
+func TestAddSpecAndSortOrderUpdates_ApplyRejectNilPayload(t *testing.T) {
+	t.Run("add-spec", func(t *testing.T) {
+		err := NewAddPartitionSpecUpdate(nil, true).Apply(buildFromBaseV3(t))
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	})
+
+	t.Run("add-sort-order", func(t *testing.T) {
+		err := NewAddSortOrderUpdate(nil).Apply(buildFromBaseV3(t))
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	})
 }

@@ -20,6 +20,7 @@ package iceberg
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -27,11 +28,15 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/decimal"
+	"github.com/apache/iceberg-go/internal"
+	"github.com/geoarrow/geoarrow-go"
 )
 
 var (
-	regexFromBrackets = regexp.MustCompile(`^\w+\[(\d+)\]$`)
-	decimalRegex      = regexp.MustCompile(`decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)`)
+	fixedRegex     = regexp.MustCompile(`^fixed\[(\d+)\]$`)
+	decimalRegex   = regexp.MustCompile(`^decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)$`)
+	geometryRegex  = regexp.MustCompile(`(?i)^geometry\s*(?:\(\s*([^),]+?)\s*\))?$`)
+	geographyRegex = regexp.MustCompile(`(?i)^geography\s*(?:\(\s*([^\s,)]+)\s*(?:,\s*(\w+)\s*)?\))?$`)
 )
 
 type Properties map[string]string
@@ -71,17 +76,46 @@ func (p Properties) GetInt(key string, defVal int) int {
 	return defVal
 }
 
-// PropUInt reads an unsigned-integer property by key. A missing key,
-// an unparseable value, or a negative value returns defVal — PropUInt
+// GetInt64 reads a 64-bit integer property by key. A missing key or an
+// unparseable value returns defVal. Unlike GetInt, this avoids truncating
+// large int64 sentinel values (such as math.MaxInt64) on 32-bit platforms
+// where int is only 32 bits wide.
+func (p Properties) GetInt64(key string, defVal int64) int64 {
+	if v, ok := p[key]; ok {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return defVal
+		}
+
+		return i
+	}
+
+	return defVal
+}
+
+// GetUInt64 reads an unsigned-integer property by key. A missing key,
+// an unparseable value, or a negative value returns defVal. GetUInt64
 // uses strconv.ParseUint, which rejects negatives rather than silently
 // wrapping them to a large positive number.
-func PropUInt(p Properties, key string, defVal uint) uint {
+func (p Properties) GetUInt64(key string, defVal uint64) uint64 {
 	v, ok := p[key]
 	if !ok {
 		return defVal
 	}
 	n, err := strconv.ParseUint(v, 10, 64)
 	if err != nil {
+		return defVal
+	}
+
+	return n
+}
+
+// PropUInt reads an unsigned-integer property by key, preserving the legacy
+// fallback behavior while avoiding truncation on platforms where uint is
+// narrower than uint64.
+func PropUInt(p Properties, key string, defVal uint) uint {
+	n := p.GetUInt64(key, uint64(defVal))
+	if uint64(uint(n)) != n {
 		return defVal
 	}
 
@@ -153,15 +187,24 @@ func (t *typeIFace) UnmarshalJSON(b []byte) error {
 			t.Type = BinaryType{}
 		case "unknown":
 			t.Type = UnknownType{}
+		case "variant":
+			t.Type = VariantType{}
+		case "geometry":
+			t.Type = GeometryType{}
+		case "geography":
+			t.Type = GeographyType{}
 		default:
 			switch {
 			case strings.HasPrefix(typename, "fixed"):
-				matches := regexFromBrackets.FindStringSubmatch(typename)
+				matches := fixedRegex.FindStringSubmatch(typename)
 				if len(matches) != 2 {
 					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
 				}
 
-				n, _ := strconv.Atoi(matches[1])
+				n, err := strconv.Atoi(matches[1])
+				if err != nil {
+					return fmt.Errorf("%w: invalid fixed length %q: %v", ErrInvalidTypeString, matches[1], err)
+				}
 				t.Type = FixedType{len: n}
 			case strings.HasPrefix(typename, "decimal"):
 				matches := decimalRegex.FindStringSubmatch(typename)
@@ -169,9 +212,57 @@ func (t *typeIFace) UnmarshalJSON(b []byte) error {
 					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
 				}
 
-				prec, _ := strconv.Atoi(matches[1])
-				scale, _ := strconv.Atoi(matches[2])
+				prec, err := strconv.Atoi(matches[1])
+				if err != nil {
+					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
+				}
+				scale, err := strconv.Atoi(matches[2])
+				if err != nil {
+					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
+				}
+				if err := validateDecimalPrecisionScale(prec, scale); err != nil {
+					return fmt.Errorf("%w: %w", ErrInvalidTypeString, err)
+				}
+
 				t.Type = DecimalType{precision: prec, scale: scale}
+			// note that geo type names are case insensitive but other type names are case sensitive.
+			// matches java behavior - this behavior is intentional
+			case strings.HasPrefix(strings.ToLower(typename), "geometry"):
+				matches := geometryRegex.FindStringSubmatch(typename)
+				if len(matches) != 2 {
+					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
+				}
+
+				if matches[1] != "" {
+					geom, err := GeometryTypeOf(strings.TrimSpace(matches[1]))
+					if err != nil {
+						return err
+					}
+					t.Type = geom
+				} else {
+					t.Type = GeometryType{}
+				}
+			case strings.HasPrefix(strings.ToLower(typename), "geography"):
+				matches := geographyRegex.FindStringSubmatch(typename)
+				if len(matches) != 3 {
+					return fmt.Errorf("%w: %s", ErrInvalidTypeString, typename)
+				}
+
+				crs := DefaultGeoCRS
+				if matches[1] != "" {
+					crs = strings.TrimSpace(matches[1])
+				}
+
+				algorithm := defaultGeographyAlgorithm
+				if matches[2] != "" {
+					algorithm = strings.TrimSpace(matches[2])
+				}
+
+				geog, err := GeographyTypeOf(crs, algorithm)
+				if err != nil {
+					return err
+				}
+				t.Type = geog
 			default:
 				return fmt.Errorf("%w: unrecognized field type", ErrInvalidSchema)
 			}
@@ -235,48 +326,90 @@ func (n *NestedField) Equals(other NestedField) bool {
 		n.Name == other.Name &&
 		n.Required == other.Required &&
 		n.Doc == other.Doc &&
-		n.InitialDefault == other.InitialDefault &&
-		n.WriteDefault == other.WriteDefault &&
+		reflect.DeepEqual(n.InitialDefault, other.InitialDefault) &&
+		reflect.DeepEqual(n.WriteDefault, other.WriteDefault) &&
 		n.Type.Equals(other.Type)
 }
 
 func (n NestedField) MarshalJSON() ([]byte, error) {
-	type Alias NestedField
+	var initialDefault, writeDefault *any
+	if n.InitialDefault != nil {
+		value := defaultValueToJSON(n.Type, n.InitialDefault)
+		initialDefault = &value
+	}
+	if n.WriteDefault != nil {
+		value := defaultValueToJSON(n.Type, n.WriteDefault)
+		writeDefault = &value
+	}
 
 	return json.Marshal(struct {
-		Type *typeIFace `json:"type"`
-		*Alias
-	}{Type: &typeIFace{n.Type}, Alias: (*Alias)(&n)})
+		Type           *typeIFace `json:"type"`
+		ID             int        `json:"id"`
+		Name           string     `json:"name"`
+		Required       bool       `json:"required"`
+		Doc            string     `json:"doc,omitempty"`
+		InitialDefault *any       `json:"initial-default,omitempty"`
+		WriteDefault   *any       `json:"write-default,omitempty"`
+	}{
+		Type: &typeIFace{n.Type},
+		ID:   n.ID, Name: n.Name, Required: n.Required, Doc: n.Doc,
+		InitialDefault: initialDefault, WriteDefault: writeDefault,
+	})
+}
+
+func defaultValueToJSON(typ Type, value any) any {
+	switch typ.(type) {
+	case BinaryType, FixedType:
+		switch value := value.(type) {
+		case []byte:
+			return internal.EncodeDefaultBytes(value)
+		case BinaryLiteral:
+			return internal.EncodeDefaultBytes(value)
+		case FixedLiteral:
+			return internal.EncodeDefaultBytes(value)
+		}
+	}
+
+	return value
 }
 
 func (n *NestedField) UnmarshalJSON(b []byte) error {
 	type Alias NestedField
+	var next NestedField
 	aux := struct {
-		ID   *int      `json:"id"`
-		Type typeIFace `json:"type"`
+		ID       *int      `json:"id"`
+		Required *bool     `json:"required"`
+		Type     typeIFace `json:"type"`
 		*Alias
 	}{
-		Alias: (*Alias)(n),
+		Alias: (*Alias)(&next),
 	}
 
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 
-	n.Type = aux.Type.Type
+	next.Type = aux.Type.Type
 
 	if aux.ID == nil {
 		return fmt.Errorf("%w: field is missing required 'id' key in JSON", ErrInvalidSchema)
 	}
-	n.ID = *aux.ID
+	next.ID = *aux.ID
 
-	if n.Name == "" {
+	if next.Name == "" {
 		return fmt.Errorf("%w: field is missing required 'name' key in JSON", ErrInvalidSchema)
 	}
 
-	if n.Type == nil {
-		return fmt.Errorf("%w: field %q is missing required 'type' key in JSON", ErrInvalidSchema, n.Name)
+	if next.Type == nil {
+		return fmt.Errorf("%w: field %q is missing required 'type' key in JSON", ErrInvalidSchema, next.Name)
 	}
+
+	if aux.Required == nil {
+		return fmt.Errorf("%w: field is missing required 'required' key in JSON", ErrInvalidSchema)
+	}
+	next.Required = *aux.Required
+
+	*n = next
 
 	return nil
 }
@@ -379,17 +512,27 @@ func (l *ListType) String() string { return fmt.Sprintf("list<%s>", l.Element) }
 
 func (l *ListType) UnmarshalJSON(b []byte) error {
 	aux := struct {
-		ID   int       `json:"element-id"`
+		ID   *int      `json:"element-id"`
 		Elem typeIFace `json:"element"`
-		Req  bool      `json:"element-required"`
+		Req  *bool     `json:"element-required"`
 	}{}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 
-	l.ElementID = aux.ID
+	if aux.ID == nil {
+		return fmt.Errorf("%w: field is missing required 'element-id' key in JSON", ErrInvalidSchema)
+	}
+	if aux.Elem.Type == nil {
+		return fmt.Errorf("%w: field is missing required 'element' key in JSON", ErrInvalidSchema)
+	}
+	if aux.Req == nil {
+		return fmt.Errorf("%w: field is missing required 'element-required' key in JSON", ErrInvalidSchema)
+	}
+
+	l.ElementID = *aux.ID
 	l.Element = aux.Elem.Type
-	l.ElementRequired = aux.Req
+	l.ElementRequired = *aux.Req
 
 	return nil
 }
@@ -459,9 +602,9 @@ func (m *MapType) String() string {
 
 func (m *MapType) UnmarshalJSON(b []byte) error {
 	aux := struct {
-		KeyID    int       `json:"key-id"`
+		KeyID    *int      `json:"key-id"`
 		Key      typeIFace `json:"key"`
-		ValueID  int       `json:"value-id"`
+		ValueID  *int      `json:"value-id"`
 		Value    typeIFace `json:"value"`
 		ValueReq *bool     `json:"value-required"`
 	}{}
@@ -469,18 +612,45 @@ func (m *MapType) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	m.KeyID, m.KeyType = aux.KeyID, aux.Key.Type
-	m.ValueID, m.ValueType = aux.ValueID, aux.Value.Type
+	if aux.KeyID == nil {
+		return fmt.Errorf("%w: field is missing required 'key-id' key in JSON", ErrInvalidSchema)
+	}
+	if aux.Key.Type == nil {
+		return fmt.Errorf("%w: field is missing required 'key' key in JSON", ErrInvalidSchema)
+	}
+
+	if aux.ValueID == nil {
+		return fmt.Errorf("%w: field is missing required 'value-id' key in JSON", ErrInvalidSchema)
+	}
+	if aux.Value.Type == nil {
+		return fmt.Errorf("%w: field is missing required 'value' key in JSON", ErrInvalidSchema)
+	}
 	if aux.ValueReq == nil {
-		m.ValueRequired = true
-	} else {
-		m.ValueRequired = *aux.ValueReq
+		return fmt.Errorf("%w: field is missing required 'value-required' key in JSON", ErrInvalidSchema)
+	}
+
+	m.KeyID, m.KeyType = *aux.KeyID, aux.Key.Type
+	m.ValueID, m.ValueType = *aux.ValueID, aux.Value.Type
+	m.ValueRequired = *aux.ValueReq
+
+	return nil
+}
+
+func validateFixedLength(length int) error {
+	if length < 0 {
+		return fmt.Errorf("fixed length must be non-negative, got %d", length)
 	}
 
 	return nil
 }
 
-func FixedTypeOf(n int) FixedType { return FixedType{len: n} }
+func FixedTypeOf(n int) FixedType {
+	if err := validateFixedLength(n); err != nil {
+		panic(fmt.Errorf("%w: %s", ErrInvalidArgument, err))
+	}
+
+	return FixedType{len: n}
+}
 
 type FixedType struct {
 	len int
@@ -500,7 +670,28 @@ func (f FixedType) String() string { return fmt.Sprintf("fixed[%d]", f.len) }
 func (f FixedType) primitive()     {}
 
 func DecimalTypeOf(prec, scale int) DecimalType {
+	if err := validateDecimalPrecisionScale(prec, scale); err != nil {
+		panic(fmt.Errorf("%w: %w", ErrInvalidArgument, err))
+	}
+
 	return DecimalType{precision: prec, scale: scale}
+}
+
+func validateDecimalPrecisionScale(precision, scale int) error {
+	if precision <= 0 {
+		return fmt.Errorf("invalid precision %d: must be greater than 0", precision)
+	}
+	if precision > 38 {
+		return fmt.Errorf("invalid precision %d: must be less than or equal to 38", precision)
+	}
+	if scale < 0 {
+		return fmt.Errorf("invalid scale %d: must be greater than or equal to 0", scale)
+	}
+	if scale > precision {
+		return fmt.Errorf("invalid scale %d: must be less than or equal to precision %d", scale, precision)
+	}
+
+	return nil
 }
 
 type DecimalType struct {
@@ -650,7 +841,7 @@ func (t Timestamp) ToTime() time.Time {
 func (t Timestamp) ToDate() Date {
 	const microsecondsPerDay = int64((time.Hour * 24) / time.Microsecond)
 
-	return Date(int32(floorDiv(int64(t), microsecondsPerDay)))
+	return Date(int32(internal.FloorDiv(int64(t), microsecondsPerDay)))
 }
 
 func (t Timestamp) ToNanos() TimestampNano {
@@ -664,13 +855,13 @@ func (t TimestampNano) ToTime() time.Time {
 }
 
 func (t TimestampNano) ToMicros() Timestamp {
-	return Timestamp(int64(t) / 1000)
+	return Timestamp(internal.FloorDiv(int64(t), 1000))
 }
 
 func (t TimestampNano) ToDate() Date {
 	const nanosecondsPerDay = int64(time.Hour * 24)
 
-	return Date(int32(floorDiv(int64(t), nanosecondsPerDay)))
+	return Date(int32(internal.FloorDiv(int64(t), nanosecondsPerDay)))
 }
 
 // TimestampType represents a number of microseconds since the unix epoch
@@ -777,6 +968,160 @@ func (UnknownType) primitive()     {}
 func (UnknownType) Type() string   { return "unknown" }
 func (UnknownType) String() string { return "unknown" }
 
+// VariantType represents semi-structured data stored using the Parquet Variant
+// binary encoding. Requires Iceberg format version 3+.
+type VariantType struct{}
+
+func (VariantType) Equals(other Type) bool {
+	_, ok := other.(VariantType)
+
+	return ok
+}
+
+func (VariantType) Type() string   { return "variant" }
+func (VariantType) String() string { return "variant" }
+
+// DefaultGeoCRS is the CRS of the geometry and geography types when no CRS is
+// given; a Parquet GEOMETRY or GEOGRAPHY logical type without a CRS means the
+// same value.
+const DefaultGeoCRS = "OGC:CRS84"
+
+type GeometryType struct {
+	crs string
+}
+
+func GeometryTypeOf(crs string) (GeometryType, error) {
+	if crs == "" {
+		return GeometryType{}, fmt.Errorf("%w: invalid CRS: (empty string)", ErrInvalidTypeString)
+	}
+	crs = strings.TrimSpace(crs)
+	if crs == DefaultGeoCRS {
+		return GeometryType{}, nil
+	}
+
+	return GeometryType{crs: crs}, nil
+}
+
+func (g GeometryType) CRS() string {
+	if g.crs == "" {
+		return DefaultGeoCRS
+	}
+
+	return g.crs
+}
+
+func (g GeometryType) Equals(other Type) bool {
+	rhs, ok := other.(GeometryType)
+	if !ok {
+		return false
+	}
+
+	return g.crs == rhs.crs
+}
+
+func (GeometryType) primitive() {}
+func (g GeometryType) Type() string {
+	if g.crs == "" {
+		return "geometry"
+	}
+
+	return fmt.Sprintf("geometry(%s)", g.crs)
+}
+
+func (g GeometryType) String() string {
+	return g.Type()
+}
+
+const defaultGeographyAlgorithm = string(geoarrow.EdgeSpherical)
+
+func toGeoArrowEdgeInterpolation(s string) (geoarrow.EdgeInterpolation, error) {
+	algo := geoarrow.EdgeInterpolation(strings.ToLower(strings.TrimSpace(s)))
+	switch algo {
+	case geoarrow.EdgeSpherical, geoarrow.EdgeVincenty,
+		geoarrow.EdgeThomas, geoarrow.EdgeAndoyer, geoarrow.EdgeKarney:
+		return algo, nil
+	default:
+		return "", fmt.Errorf("%w: invalid edge interpolation algorithm", ErrInvalidTypeString)
+	}
+}
+
+type GeographyType struct {
+	crs       string
+	algorithm string
+}
+
+func GeographyTypeOf(crs string, algorithm string) (GeographyType, error) {
+	if crs == "" {
+		return GeographyType{}, fmt.Errorf("%w: invalid CRS: (empty string)", ErrInvalidTypeString)
+	}
+	if algorithm == "" {
+		return GeographyType{}, fmt.Errorf("%w: invalid algorithm: (empty string)", ErrInvalidTypeString)
+	}
+	crs = strings.TrimSpace(crs)
+	normalizedCRS := crs
+	if normalizedCRS == DefaultGeoCRS {
+		normalizedCRS = ""
+	}
+
+	validatedAlg, err := toGeoArrowEdgeInterpolation(algorithm) // validate algorithm
+	if err != nil {
+		return GeographyType{}, fmt.Errorf("invalid algorithm: %w", err)
+	}
+	normalizedAlgorithm := string(validatedAlg)
+	if validatedAlg == geoarrow.EdgeInterpolation(defaultGeographyAlgorithm) {
+		normalizedAlgorithm = ""
+	}
+
+	return GeographyType{crs: normalizedCRS, algorithm: normalizedAlgorithm}, nil
+}
+
+func (g GeographyType) CRS() string {
+	if g.crs == "" {
+		return DefaultGeoCRS
+	}
+
+	return g.crs
+}
+
+func (g GeographyType) Algorithm() string {
+	if g.algorithm == "" {
+		return defaultGeographyAlgorithm
+	}
+
+	return g.algorithm
+}
+
+func (g GeographyType) Equals(other Type) bool {
+	rhs, ok := other.(GeographyType)
+	if !ok {
+		return false
+	}
+
+	return g.crs == rhs.crs && g.algorithm == rhs.algorithm
+}
+
+func (GeographyType) primitive() {}
+func (g GeographyType) Type() string {
+	hasCRS := g.crs != ""
+	hasAlgo := g.algorithm != ""
+
+	if !hasCRS && !hasAlgo {
+		return "geography"
+	}
+	if hasCRS && !hasAlgo {
+		return fmt.Sprintf("geography(%s)", g.crs)
+	}
+	if !hasCRS && hasAlgo {
+		return fmt.Sprintf("geography(%s, %s)", DefaultGeoCRS, g.algorithm)
+	}
+
+	return fmt.Sprintf("geography(%s, %s)", g.crs, g.algorithm)
+}
+
+func (g GeographyType) String() string {
+	return g.Type()
+}
+
 var PrimitiveTypes = struct {
 	Bool          PrimitiveType
 	Int32         PrimitiveType
@@ -834,11 +1179,12 @@ func PromoteType(fileType, readType Type) (Type, error) {
 		}
 	case DecimalType:
 		if rt, ok := readType.(DecimalType); ok {
-			if t.precision <= rt.precision && t.scale <= rt.scale {
+			// Only precision may widen; scale must stay the same (spec: widen precision only).
+			if t.scale == rt.scale && t.precision <= rt.precision {
 				return readType, nil
 			}
 
-			return nil, fmt.Errorf("%w: cannot reduce precision from %s to %s",
+			return nil, fmt.Errorf("%w: cannot promote %s to %s",
 				ErrResolve, fileType, readType)
 		}
 	case FixedType:

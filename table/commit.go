@@ -17,7 +17,10 @@
 
 package table
 
-import "errors"
+import (
+	"errors"
+	"slices"
+)
 
 // TableCommit holds the identifier, requirements, and updates for a single
 // table within a multi-table transaction. It is used with
@@ -38,8 +41,9 @@ type TableCommit struct {
 // this method directly — it handles extraction, commit, and lifecycle
 // management automatically.
 //
-// The method automatically includes an AssertTableUUID requirement, matching
-// the behavior of [Transaction.Commit].
+// The returned requirements are the ones [Transaction.Commit] would send,
+// so the multi-table path is fenced by the target branch's base head.
+// A transaction with no updates yields an empty payload and enforces none.
 //
 // TableCommit does not mark the transaction as committed — the caller is
 // responsible for either calling Commit (single-table) or submitting the
@@ -51,30 +55,39 @@ type TableCommit struct {
 // commit endpoint returns 204 No Content (no metadata), callers must
 // LoadTable after a successful CommitTransaction if they need updated state.
 func (t *Transaction) TableCommit() (TableCommit, error) {
+	if err := t.checkNotNil(); err != nil {
+		return TableCommit{}, err
+	}
 	t.mx.Lock()
 	defer t.mx.Unlock()
+
+	meta, err := t.txnMeta()
+	if err != nil {
+		return TableCommit{}, err
+	}
 
 	if t.committed {
 		return TableCommit{}, errors.New("transaction has already been committed")
 	}
 
-	if len(t.meta.updates) == 0 {
+	if len(meta.updates) == 0 {
 		return TableCommit{
-			Identifier:   t.tbl.identifier,
+			Identifier:   slices.Clone(t.tbl.identifier),
 			Requirements: []Requirement{},
 			Updates:      []Update{},
 		}, nil
 	}
 
-	reqs := make([]Requirement, len(t.reqs), len(t.reqs)+1)
-	copy(reqs, t.reqs)
-	reqs = append(reqs, AssertTableUUID(t.meta.uuid))
+	// Same derivation as Commit. Copying t.reqs alone leaves metadata-only transactions unfenced:
+	// their updates stage no ref requirement. The helper returns a fresh
+	// slice, so appending here cannot touch t.reqs.
+	reqs := append(transactionRequirements(t.reqs, t.branch, t.tbl.metadata), AssertTableUUID(meta.uuid))
 
-	updates := make([]Update, len(t.meta.updates))
-	copy(updates, t.meta.updates)
+	updates := make([]Update, len(meta.updates))
+	copy(updates, meta.updates)
 
 	return TableCommit{
-		Identifier:   t.tbl.identifier,
+		Identifier:   slices.Clone(t.tbl.identifier),
 		Requirements: reqs,
 		Updates:      updates,
 	}, nil

@@ -19,26 +19,33 @@ package io
 
 // Constants for S3 configuration options
 const (
-	S3Region                 = "s3.region"
-	S3SessionToken           = "s3.session-token"
-	S3SecretAccessKey        = "s3.secret-access-key"
-	S3AccessKeyID            = "s3.access-key-id"
-	S3EndpointURL            = "s3.endpoint"
-	S3ProxyURI               = "s3.proxy-uri"
+	S3Region          = "s3.region"
+	S3SessionToken    = "s3.session-token"
+	S3SecretAccessKey = "s3.secret-access-key"
+	S3AccessKeyID     = "s3.access-key-id"
+	S3EndpointURL     = "s3.endpoint"
+	S3ProxyURI        = "s3.proxy-uri"
+	// S3ConnectTimeout accepts seconds as a number, such as "60" or "60.0",
+	// or a Go duration string, such as "5s".
 	S3ConnectTimeout         = "s3.connect-timeout"
 	S3SignerURI              = "s3.signer.uri"
 	S3RemoteSigningEnabled   = "s3.remote-signing-enabled"
 	S3ForceVirtualAddressing = "s3.force-virtual-addressing"
 	S3ClientRegion           = "client.region"
+	S3CompatMode             = "s3.compat-mode"
 )
 
 // Constants for GCS configuration options
 const (
-	GCSEndpoint   = "gcs.endpoint"
-	GCSKeyPath    = "gcs.keypath"
-	GCSJSONKey    = "gcs.jsonkey"
-	GCSCredType   = "gcs.credtype"
-	GCSUseJSONAPI = "gcs.usejsonapi" // set to anything to enable
+	GCSEndpoint       = "gcs.endpoint"
+	GCSServiceHost    = "gcs.service.host"
+	GCSKeyPath        = "gcs.keypath"
+	GCSJSONKey        = "gcs.jsonkey"
+	GCSCredType       = "gcs.credtype"
+	GCSUseJSONAPI     = "gcs.usejsonapi"
+	GCSOAuthToken     = "gcs.oauth2.token"
+	GCSOAuthExpiresAt = "gcs.oauth2.token-expires-at"
+	GCSNoAuth         = "gcs.no-auth"
 )
 
 // Constants for Azure configuration options
@@ -47,8 +54,10 @@ const (
 	ADLSConnectionStringPrefix = "adls.connection-string."
 	ADLSSharedKeyAccountName   = "adls.auth.shared-key.account.name"
 	ADLSSharedKeyAccountKey    = "adls.auth.shared-key.account.key"
+	ADLSClientID               = "adls.client-id"
 	ADLSEndpoint               = "adls.endpoint"
 	ADLSProtocol               = "adls.protocol"
+	ADLSManagedIdentityEnabled = "adls.auth.managed-identity.enabled"
 
 	// Not in use yet
 	// ADLSReadBlockSize          = "adls.read.block-size-bytes"

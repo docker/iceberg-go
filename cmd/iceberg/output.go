@@ -39,6 +39,17 @@ type Output interface {
 	DescribeTable(*table.Table)
 	Files(tbl *table.Table, history bool)
 	DescribeProperties(iceberg.Properties)
+	Info(tbl *table.Table)
+	Snapshots(tbl *table.Table)
+	Refs(tbl *table.Table, filterType string)
+	PartitionStats(tbl *table.Table, snapshotID *int64, all bool)
+	SchemaWithDefaults(schema *iceberg.Schema)
+	ExpireSnapshotsResult(result ExpireSnapshotsResult)
+	CleanOrphanFilesResult(result CleanOrphanFilesResult)
+	UpgradeResult(result UpgradeResult)
+	RollbackResult(result RollbackResult)
+	RefCreated(result RefCreatedResult)
+	RefDeleted(result RefDeletedResult)
 	Text(string)
 	Schema(*iceberg.Schema)
 	Spec(iceberg.PartitionSpec)
@@ -47,6 +58,14 @@ type Output interface {
 }
 
 type textOutput struct{}
+
+func snapshotSchemaText(schemaID *int) string {
+	if schemaID == nil {
+		return "unknown"
+	}
+
+	return strconv.Itoa(*schemaID)
+}
 
 func (textOutput) Identifiers(idlist []table.Identifier) {
 	data := pterm.TableData{[]string{"IDs"}}
@@ -79,8 +98,8 @@ func (t textOutput) DescribeTable(tbl *table.Table) {
 		}
 
 		snapshotList = append(snapshotList, pterm.LeveledListItem{
-			Level: 0, Text: fmt.Sprintf("Snapshot %d, schema %d%s",
-				s.SnapshotID, *s.SchemaID, manifest),
+			Level: 0, Text: fmt.Sprintf("Snapshot %d, schema %s%s",
+				s.SnapshotID, snapshotSchemaText(s.SchemaID), manifest),
 		})
 	}
 
@@ -131,8 +150,8 @@ func (t textOutput) Files(tbl *table.Table, history bool) {
 
 		snapshotTree = append(snapshotTree, pterm.LeveledListItem{
 			Level: 0,
-			Text: fmt.Sprintf("Snapshot %d, schema %d%s",
-				snap.SnapshotID, *snap.SchemaID, manifest),
+			Text: fmt.Sprintf("Snapshot %d, schema %s%s",
+				snap.SnapshotID, snapshotSchemaText(snap.SchemaID), manifest),
 		})
 
 		afs, err := tbl.FS(context.TODO())
@@ -248,9 +267,9 @@ func (j jsonOutput) DescribeTable(tbl *table.Table) {
 	type dataType struct {
 		Metadata         table.Metadata        `json:"metadata,omitempty"`
 		MetadataLocation string                `json:"metadata-location,omitempty"`
-		SortOrder        table.SortOrder       `json:"sort-order,omitempty"`
+		SortOrder        table.SortOrder       `json:"sort-order"`
 		CurrentSnapshot  *table.Snapshot       `json:"current-snapshot,omitempty"`
-		Spec             iceberg.PartitionSpec `json:"spec,omitempty"`
+		Spec             iceberg.PartitionSpec `json:"spec"`
 		Schema           *iceberg.Schema       `json:"schema,omitempty"`
 	}
 

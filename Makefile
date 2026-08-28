@@ -15,12 +15,18 @@
 # limitations under the License.
 
 # golangci-lint version (keep in sync with CI and README)
-GOLANGCI_LINT_VERSION := v2.8.0
+GOLANGCI_LINT_VERSION := v2.12.2
 
-.PHONY: test lint lint-install integration-setup integration-test integration-scanner integration-io integration-rest integration-spark integration-hadoop integration-down integration-logs docs-gen
+.PHONY: test test-assert test-race lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-spark integration-hadoop integration-down integration-logs docs-gen
 
 test:
 	go test -v ./...
+
+test-assert:
+	go test -tags=assert -v -run='^(TestInspectFilesTablesEarlyRelease|TestInspectDataFilesEmitsEmptyBatchWhenAllEntriesAreDeleted|TestInspectDataFilesEmptyTableEarlyRelease|TestInspectPositionDeletesEarlyRelease)$$' ./table
+
+test-race:
+	go test -race -v ./...
 
 docs-gen:
 	go run ./website/gen
@@ -36,6 +42,12 @@ integration-setup:
 	docker compose -f internal/recipe/docker-compose.yml up -d --wait
 	docker compose -f internal/recipe/docker-compose.yml exec -T spark-iceberg ipython ./provision.py
 
+integration-setup-spark4:
+	mkdir -p /tmp/iceberg-hadoop-warehouse
+	SPARK_IMAGE=pyiceberg-spark4 SPARK_DOCKERFILE=Dockerfile.spark4 docker compose -f internal/recipe/docker-compose.yml build spark-iceberg
+	SPARK_IMAGE=pyiceberg-spark4 SPARK_DOCKERFILE=Dockerfile.spark4 docker compose -f internal/recipe/docker-compose.yml up -d --wait
+	docker compose -f internal/recipe/docker-compose.yml exec -T spark-iceberg ipython ./provision.py
+
 integration-down:
 	docker compose -f internal/recipe/docker-compose.yml down -v
 
@@ -48,7 +60,9 @@ integration-env:
 	@echo "export SPARK_CONTAINER_ID=$$(docker ps -qf 'name=spark-iceberg')"
 	@echo "export DOCKER_API_VERSION=$$(docker version -f '{{.Server.APIVersion}}')"
 
-integration-test: integration-scanner integration-io integration-rest integration-spark integration-hive integration-hadoop
+# Keep the isolated Java scan-planning suite in umbrella CI so its wire
+# compatibility coverage runs alongside the other integration tests.
+integration-test: integration-scanner integration-io integration-rest integration-rest-scan-planning integration-spark integration-hive integration-hadoop
 
 integration-scanner:
 	go test -tags=integration -v -run="^TestScanner" ./table
@@ -57,7 +71,10 @@ integration-io:
 	go test -tags=integration -v ./io/...
 
 integration-rest:
-	go test -tags=integration -v -run="^TestRestIntegration$$" ./catalog/rest
+	go test -tags=integration -v -run="^(TestRestIntegration|TestRestCatalogConformance)$$" ./catalog/rest
+
+integration-rest-scan-planning:
+	RUN_INTEGRATION_TESTS=1 go test -tags=integration -v -run="^TestRestIntegration/TestScanPlanningJava" ./catalog/rest
 
 integration-spark:
 	go test -tags=integration -v -run="^TestSparkIntegration" ./table

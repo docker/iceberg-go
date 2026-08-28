@@ -16,9 +16,11 @@
 # under the License.
 services:
   spark-iceberg:
-    image: pyiceberg-spark
+    image: ${SPARK_IMAGE:-pyiceberg-spark}
     container_name: spark-iceberg
-    build: .
+    build:
+      context: .
+      dockerfile: ${SPARK_DOCKERFILE:-Dockerfile}
     networks:
       iceberg_net:
     depends_on:
@@ -38,7 +40,7 @@ services:
       - 10000:10000
       - 10001:10001
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      test: ["CMD-SHELL", "ls $$SPARK_HOME/jars/iceberg-spark-runtime*.jar > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -57,6 +59,30 @@ services:
       - CATALOG_WAREHOUSE=s3://warehouse/
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
       - CATALOG_S3_ENDPOINT=http://minio:9000
+  rest-scan-planning:
+    # 1.10.1 predates the fixture's scan-planning implementation. Pin the
+    # multi-platform image built from apache/iceberg@b0df3ca so the Java wire
+    # compatibility tests are reproducible.
+    # TODO(#1880): Replace the digest with a stable release tag once a
+    # scan-planning-capable fixture tag is published.
+    # The image declares a /v1/config healthcheck that compose up --wait uses.
+    image: apache/iceberg-rest-fixture:latest@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d
+    container_name: iceberg-rest-scan-planning
+    networks:
+      iceberg_net:
+    ports:
+      - 8182:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_INCLUDE__CREDENTIALS=true
+      # Use a non-S3 credential so vending can be asserted without changing the
+      # static MinIO credentials used by the fixture's backing FileIO.
+      - CATALOG_GCS_OAUTH2_TOKEN=scan-planning-integration-token
   minio:
     image: minio/minio
     container_name: minio
@@ -115,6 +141,11 @@ services:
       - CATALOG_MANAGEMENT=dynamic
     ports:
       - 8088:8080
+    healthcheck:
+      # Trino can take ~30s to finish booting in GitHub Actions; without a
+      # startup grace period, docker compose up --wait can mark it unhealthy
+      # just before the server reaches READY.
+      start_period: 45s
 
   fake-gcs-server:
     image: fsouza/fake-gcs-server

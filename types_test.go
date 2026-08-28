@@ -19,6 +19,7 @@ package iceberg_test
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -45,8 +46,11 @@ func TestTypesBasic(t *testing.T) {
 		{"uuid", iceberg.PrimitiveTypes.UUID},
 		{"binary", iceberg.PrimitiveTypes.Binary},
 		{"unknown", iceberg.PrimitiveTypes.Unknown},
+		{"variant", iceberg.VariantType{}},
+		{"fixed[0]", iceberg.FixedTypeOf(0)},
 		{"fixed[5]", iceberg.FixedTypeOf(5)},
 		{"decimal(9, 4)", iceberg.DecimalTypeOf(9, 4)},
+		{"decimal(5, 5)", iceberg.DecimalTypeOf(5, 5)},
 	}
 
 	for _, tt := range tests {
@@ -75,6 +79,57 @@ func TestFixedType(t *testing.T) {
 	assert.Equal(t, "fixed[5]", typ.String())
 	assert.True(t, typ.Equals(iceberg.FixedTypeOf(5)))
 	assert.False(t, typ.Equals(iceberg.FixedTypeOf(6)))
+	assert.Equal(t, "fixed[0]", iceberg.FixedTypeOf(0).String())
+
+	t.Run("FixedTypeOf validates length", func(t *testing.T) {
+		assertFixedTypeOfPanicsWithInvalidArgument(t, -1)
+	})
+}
+
+func TestFixedTypeInvalidParse(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "malformed suffix",
+			data: `{"id": 1, "name": "f", "type": "fixed[0]junk", "required": true}`,
+		},
+		{
+			name: "malformed prefix",
+			data: `{"id": 1, "name": "f", "type": "fixedfoo[16]", "required": true}`,
+		},
+		{
+			name: "malformed short prefix",
+			data: `{"id": 1, "name": "f", "type": "fixedx[5]", "required": true}`,
+		},
+		{
+			name: "overflow",
+			data: `{"id": 1, "name": "f", "type": "fixed[99999999999999999999]", "required": true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var n iceberg.NestedField
+			err := json.Unmarshal([]byte(tt.data), &n)
+			assert.ErrorIs(t, err, iceberg.ErrInvalidTypeString)
+		})
+	}
+}
+
+func assertFixedTypeOfPanicsWithInvalidArgument(t *testing.T, length int) {
+	t.Helper()
+
+	defer func() {
+		r := recover()
+		require.NotNil(t, r)
+		err, ok := r.(error)
+		require.True(t, ok)
+		assert.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	}()
+
+	iceberg.FixedTypeOf(length)
 }
 
 func TestDecimalType(t *testing.T) {
@@ -84,6 +139,58 @@ func TestDecimalType(t *testing.T) {
 	assert.Equal(t, "decimal(9, 2)", typ.String())
 	assert.True(t, typ.Equals(iceberg.DecimalTypeOf(9, 2)))
 	assert.False(t, typ.Equals(iceberg.DecimalTypeOf(9, 3)))
+
+	t.Run("DecimalTypeOf validates precision and scale", func(t *testing.T) {
+		assert.PanicsWithError(t, "invalid argument: invalid precision 0: must be greater than 0", func() {
+			iceberg.DecimalTypeOf(0, 2)
+		})
+		assert.PanicsWithError(t, "invalid argument: invalid precision 39: must be less than or equal to 38", func() {
+			iceberg.DecimalTypeOf(39, 0)
+		})
+		assert.Equal(t, "decimal(10, 10)", iceberg.DecimalTypeOf(10, 10).String())
+		assert.PanicsWithError(t, "invalid argument: invalid scale -1: must be greater than or equal to 0", func() {
+			iceberg.DecimalTypeOf(10, -1)
+		})
+		assert.PanicsWithError(t, "invalid argument: invalid scale 6: must be less than or equal to precision 5", func() {
+			iceberg.DecimalTypeOf(5, 6)
+		})
+	})
+}
+
+func TestDecimalTypeInvalidParse(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "trailing chars",
+			data: `{"id": 1, "name": "d", "type": "decimal(10,2)junk", "required": true}`,
+		},
+		{
+			name: "precision zero",
+			data: `{"id": 1, "name": "d", "type": "decimal(0,2)", "required": true}`,
+		},
+		{
+			name: "negative scale syntax",
+			data: `{"id": 1, "name": "d", "type": "decimal(10,-1)", "required": true}`,
+		},
+		{
+			name: "precision too large",
+			data: `{"id": 1, "name": "d", "type": "decimal(39,2)", "required": true}`,
+		},
+		{
+			name: "scale greater than precision",
+			data: `{"id": 1, "name": "d", "type": "decimal(5,6)", "required": true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var n iceberg.NestedField
+			err := json.Unmarshal([]byte(tt.data), &n)
+			assert.ErrorIs(t, err, iceberg.ErrInvalidTypeString)
+		})
+	}
 }
 
 func TestStructType(t *testing.T) {
@@ -143,6 +250,14 @@ func TestListType(t *testing.T) {
 	assert.True(t, typ.Equals(&actual))
 }
 
+func TestListTypeUnmarshalRequiresElement(t *testing.T) {
+	var typ iceberg.ListType
+	err := json.Unmarshal([]byte(`{"element-id": 1, "element-required": false}`), &typ)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'element' key")
+}
+
 func TestMapType(t *testing.T) {
 	typ := &iceberg.MapType{
 		KeyID:         1,
@@ -173,6 +288,22 @@ func TestMapType(t *testing.T) {
 	assert.True(t, typ.Equals(&actual))
 }
 
+func TestMapTypeUnmarshalRequiresKey(t *testing.T) {
+	var typ iceberg.MapType
+	err := json.Unmarshal([]byte(`{"key-id": 1, "value-id": 2, "value": "string"}`), &typ)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'key' key")
+}
+
+func TestMapTypeUnmarshalRequiresValue(t *testing.T) {
+	var typ iceberg.MapType
+	err := json.Unmarshal([]byte(`{"key-id": 1, "key": "string", "value-id": 2}`), &typ)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'value' key")
+}
+
 var NonParameterizedTypes = []iceberg.Type{
 	iceberg.PrimitiveTypes.Bool,
 	iceberg.PrimitiveTypes.Int32,
@@ -189,6 +320,7 @@ var NonParameterizedTypes = []iceberg.Type{
 	iceberg.PrimitiveTypes.Binary,
 	iceberg.PrimitiveTypes.UUID,
 	iceberg.PrimitiveTypes.Unknown,
+	iceberg.VariantType{},
 }
 
 func TestNonParameterizedTypeEquality(t *testing.T) {
@@ -223,8 +355,9 @@ func TestTypeStrings(t *testing.T) {
 		{iceberg.PrimitiveTypes.UUID, "uuid"},
 		{iceberg.PrimitiveTypes.Binary, "binary"},
 		{iceberg.PrimitiveTypes.Unknown, "unknown"},
+		{iceberg.VariantType{}, "variant"},
 		{iceberg.FixedTypeOf(22), "fixed[22]"},
-		{iceberg.DecimalTypeOf(19, 25), "decimal(19, 25)"},
+		{iceberg.DecimalTypeOf(19, 18), "decimal(19, 18)"},
 		{&iceberg.StructType{
 			FieldList: []iceberg.NestedField{
 				{ID: 1, Name: "required_field", Type: iceberg.PrimitiveTypes.String, Required: true, Doc: "this is a doc"},
@@ -261,7 +394,8 @@ func TestUnknownTypeInNestedStructs(t *testing.T) {
 		ValueRequired: false,
 	}
 
-	schema := iceberg.NewSchema(1,
+	schema := iceberg.NewSchema(
+		1,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.Int64Type{}, Required: true},
 		iceberg.NestedField{ID: 2, Name: "top", Type: iceberg.UnknownType{}, Required: false},
 		iceberg.NestedField{ID: 3, Name: "arr", Type: listType, Required: false},
@@ -394,6 +528,99 @@ func TestUnknownTypeEquality(t *testing.T) {
 	assert.Equal(t, "unknown", unknown2.String())
 }
 
+func TestVariantTypeEquality(t *testing.T) {
+	v1 := iceberg.VariantType{}
+	v2 := iceberg.VariantType{}
+
+	assert.True(t, v1.Equals(v2))
+	assert.True(t, v2.Equals(v1))
+	assert.False(t, v1.Equals(iceberg.BinaryType{}))
+	assert.False(t, v1.Equals(iceberg.UnknownType{}))
+}
+
+func TestVariantTypeJSONRoundTrip(t *testing.T) {
+	field := iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}, Required: false}
+	data, err := json.Marshal(field)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"type":"variant"`)
+
+	var out iceberg.NestedField
+	require.NoError(t, json.Unmarshal(data, &out))
+	assert.True(t, out.Type.Equals(iceberg.VariantType{}))
+}
+
+func TestVariantInSchema(t *testing.T) {
+	sc := iceberg.NewSchema(
+		0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}, Required: false},
+	)
+	data, err := json.Marshal(sc)
+	require.NoError(t, err)
+
+	var out iceberg.Schema
+	require.NoError(t, json.Unmarshal(data, &out))
+	assert.True(t, out.Field(1).Type.Equals(iceberg.VariantType{}))
+}
+
+func TestVariantInNestedTypes(t *testing.T) {
+	sc := iceberg.NewSchema(
+		0,
+		iceberg.NestedField{ID: 1, Name: "events", Type: &iceberg.ListType{
+			ElementID:       2,
+			Element:         iceberg.VariantType{},
+			ElementRequired: false,
+		}},
+		iceberg.NestedField{ID: 3, Name: "metadata", Type: &iceberg.MapType{
+			KeyID:         4,
+			KeyType:       iceberg.PrimitiveTypes.String,
+			ValueID:       5,
+			ValueType:     iceberg.VariantType{},
+			ValueRequired: false,
+		}},
+	)
+
+	data, err := json.Marshal(sc)
+	require.NoError(t, err)
+
+	var out iceberg.Schema
+	require.NoError(t, json.Unmarshal(data, &out))
+
+	listField := out.Field(0)
+	listType, ok := listField.Type.(*iceberg.ListType)
+	require.True(t, ok)
+	assert.True(t, listType.Element.Equals(iceberg.VariantType{}))
+
+	mapField := out.Field(1)
+	mapType, ok := mapField.Type.(*iceberg.MapType)
+	require.True(t, ok)
+	assert.True(t, mapType.ValueType.Equals(iceberg.VariantType{}))
+}
+
+func TestVariantInStructField(t *testing.T) {
+	sc := iceberg.NewSchema(
+		0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "nested", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "name", Type: iceberg.PrimitiveTypes.String},
+				{ID: 4, Name: "payload", Type: iceberg.VariantType{}},
+			},
+		}},
+	)
+
+	data, err := json.Marshal(sc)
+	require.NoError(t, err)
+
+	var out iceberg.Schema
+	require.NoError(t, json.Unmarshal(data, &out))
+
+	nested, ok := out.Field(1).Type.(*iceberg.StructType)
+	require.True(t, ok)
+	assert.True(t, nested.FieldList[0].Type.Equals(iceberg.PrimitiveTypes.String))
+	assert.True(t, nested.FieldList[1].Type.Equals(iceberg.VariantType{}))
+}
+
 func TestNestedFieldUnmarshalMissingID(t *testing.T) {
 	// "id" key is absent — json.Unmarshal should error instead of silently leaving the ID zero
 	data := []byte(`{"name":"col","type":"string","required":false}`)
@@ -422,6 +649,50 @@ func TestNestedFieldUnmarshalMissingName(t *testing.T) {
 	err := json.Unmarshal(data, &f)
 	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
 	assert.ErrorContains(t, err, "missing required 'name'")
+}
+
+func TestNestedFieldUnmarshalMissingRequired(t *testing.T) {
+	data := []byte(`{"id":1,"name":"col","type":"string"}`)
+
+	var f iceberg.NestedField
+	err := json.Unmarshal(data, &f)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'required'")
+}
+
+func TestNestedFieldUnmarshalMissingRequiredPreservesState(t *testing.T) {
+	field := iceberg.NestedField{
+		ID:             7,
+		Name:           "old",
+		Type:           iceberg.PrimitiveTypes.Int32,
+		Required:       true,
+		Doc:            "old doc",
+		InitialDefault: "old initial default",
+		WriteDefault:   "old write default",
+	}
+	original := field
+
+	err := json.Unmarshal([]byte(`{"id":1,"name":"new","type":"string"}`), &field)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.Equal(t, original, field)
+}
+
+func TestListTypeUnmarshalMissingElementRequired(t *testing.T) {
+	data := []byte(`{"type":"list","element-id":1,"element":"string"}`)
+
+	var list iceberg.ListType
+	err := json.Unmarshal(data, &list)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'element-required'")
+}
+
+func TestMapTypeUnmarshalMissingValueRequired(t *testing.T) {
+	data := []byte(`{"type":"map","key-id":1,"key":"string","value-id":2,"value":"string"}`)
+
+	var m iceberg.MapType
+	err := json.Unmarshal(data, &m)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "missing required 'value-required'")
 }
 
 func TestNestedFieldUnmarshalZeroIDIsValid(t *testing.T) {
@@ -456,6 +727,48 @@ func TestNestedFieldUnmarshalWrongTypeKey(t *testing.T) {
 	assert.ErrorContains(t, err, "missing required 'type'")
 }
 
+func TestNestedFieldMarshalBinaryDefaultsAsHex(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    iceberg.NestedField
+		expected string
+	}{
+		{
+			name: "binary",
+			field: iceberg.NestedField{
+				ID: 1, Name: "data", Type: iceberg.PrimitiveTypes.Binary,
+				InitialDefault: []byte{0, 1, 2, 0xff},
+				WriteDefault:   iceberg.BinaryLiteral{0xde, 0xad},
+			},
+			expected: `{"id":1,"name":"data","required":false,"initial-default":"000102ff","write-default":"dead","type":"binary"}`,
+		},
+		{
+			name: "fixed",
+			field: iceberg.NestedField{
+				ID: 2, Name: "fixed", Type: iceberg.FixedTypeOf(3),
+				InitialDefault: iceberg.FixedLiteral{1, 2, 3},
+			},
+			expected: `{"id":2,"name":"fixed","required":false,"initial-default":"010203","type":"fixed[3]"}`,
+		},
+		{
+			name: "empty binary",
+			field: iceberg.NestedField{
+				ID: 3, Name: "empty", Type: iceberg.PrimitiveTypes.Binary,
+				InitialDefault: []byte{},
+			},
+			expected: `{"id":3,"name":"empty","required":false,"initial-default":"","type":"binary"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := json.Marshal(tt.field)
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.expected, string(actual))
+		})
+	}
+}
+
 func TestTypeIFaceMarshalJSONNilType(t *testing.T) {
 	// A NestedField with a nil Type must not panic during JSON marshalling.
 	// Prior to this fix, typeIFace.MarshalJSON called t.Type.Type() on a nil
@@ -471,6 +784,7 @@ func TestPropUInt(t *testing.T) {
 		"n":       "42",
 		"neg":     "-7",
 		"garbage": "not-a-number",
+		"maxuint": "18446744073709551615",
 	}
 
 	assert.Equal(t, uint(42), iceberg.PropUInt(props, "n", 0))
@@ -478,4 +792,353 @@ func TestPropUInt(t *testing.T) {
 		"negative string must fall back, not wrap to a huge positive")
 	assert.Equal(t, uint(77), iceberg.PropUInt(props, "garbage", 77), "falls back on parse error")
 	assert.Equal(t, uint(5), iceberg.PropUInt(props, "missing", 5), "falls back on missing key")
+	assert.Equal(t, uint64(math.MaxUint64), props.GetUInt64("maxuint", 0),
+		"GetUInt64 must preserve the full uint64 range")
+}
+
+func TestGetInt64(t *testing.T) {
+	props := iceberg.Properties{
+		"n":        "42",
+		"maxint64": "9223372036854775807",
+		"neg":      "-7",
+		"garbage":  "not-a-number",
+	}
+
+	assert.Equal(t, int64(42), props.GetInt64("n", 0))
+	assert.Equal(t, int64(math.MaxInt64), props.GetInt64("maxint64", 0),
+		"must preserve full int64 MaxInt64 value")
+	assert.Equal(t, int64(-7), props.GetInt64("neg", 0))
+	assert.Equal(t, int64(99), props.GetInt64("garbage", 99), "falls back on parse error")
+	assert.Equal(t, int64(5), props.GetInt64("missing", 5), "falls back on missing key")
+
+	// Verify the default itself survives round-trip without truncation on 32-bit.
+	def := int64(math.MaxInt64)
+	assert.Equal(t, def, props.GetInt64("missing", def),
+		"default int64(math.MaxInt64) must not be truncated")
+}
+
+func TestGeometryType(t *testing.T) {
+	t.Run("default CRS", func(t *testing.T) {
+		geom := iceberg.GeometryType{}
+		assert.Equal(t, "OGC:CRS84", geom.CRS())
+		assert.Equal(t, "geometry", geom.String())
+		assert.True(t, geom.Equals(iceberg.GeometryType{}))
+	})
+
+	t.Run("default CRS explicit", func(t *testing.T) {
+		geom, err := iceberg.GeometryTypeOf("OGC:CRS84")
+		require.NoError(t, err)
+		assert.True(t, geom.Equals(iceberg.GeometryType{}))
+	})
+
+	t.Run("custom CRS", func(t *testing.T) {
+		geom, err := iceberg.GeometryTypeOf("srid:3857")
+		require.NoError(t, err)
+		assert.Equal(t, "srid:3857", geom.CRS())
+		assert.Equal(t, "geometry(srid:3857)", geom.String())
+	})
+
+	t.Run("CRS normalization", func(t *testing.T) {
+		geom1, err := iceberg.GeometryTypeOf("OGC:CRS84")
+		require.NoError(t, err)
+		geom2 := iceberg.GeometryType{}
+		assert.True(t, geom1.Equals(geom2))
+		assert.Equal(t, "geometry", geom1.String())
+	})
+
+	t.Run("empty CRS error", func(t *testing.T) {
+		_, err := iceberg.GeometryTypeOf("")
+		assert.ErrorContains(t, err, "invalid CRS: (empty string)")
+	})
+
+	t.Run("whitespace default CRS", func(t *testing.T) {
+		geom, err := iceberg.GeometryTypeOf("    OGC:CRS84    ")
+		assert.NoError(t, err)
+		assert.Equal(t, "OGC:CRS84", geom.CRS())
+		assert.Equal(t, "geometry", geom.String())
+	})
+
+	t.Run("whitespace custom CRS", func(t *testing.T) {
+		geom, err := iceberg.GeometryTypeOf("    srid:3857    ")
+		assert.NoError(t, err)
+		assert.Equal(t, "srid:3857", geom.CRS())
+		assert.Equal(t, "geometry(srid:3857)", geom.String())
+	})
+
+	t.Run("JSON parsing - default", func(t *testing.T) {
+		data := `{"id": 1, "name": "location", "type": "geometry", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geom, ok := n.Type.(iceberg.GeometryType)
+		require.True(t, ok)
+		assert.Equal(t, "OGC:CRS84", geom.CRS())
+
+		out, err := json.Marshal(n)
+		require.NoError(t, err)
+		assert.JSONEq(t, data, string(out))
+	})
+
+	t.Run("JSON parsing - custom CRS", func(t *testing.T) {
+		data := `{"id": 1, "name": "location", "type": "geometry(srid:4326)", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geom, ok := n.Type.(iceberg.GeometryType)
+		require.True(t, ok)
+		assert.Equal(t, "srid:4326", geom.CRS())
+
+		out, err := json.Marshal(n)
+		require.NoError(t, err)
+		assert.JSONEq(t, data, string(out))
+	})
+
+	t.Run("JSON parsing - case insensitive", func(t *testing.T) {
+		data := `{"id": 1, "name": "location", "type": "Geometry(SRID:4326)", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geom, ok := n.Type.(iceberg.GeometryType)
+		require.True(t, ok)
+		assert.Equal(t, "SRID:4326", geom.CRS())
+	})
+
+	t.Run("JSON parsing - whitespace tolerance", func(t *testing.T) {
+		data := `{"id": 1, "name": "location", "type": "geometry( srid:4326 )", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geom, ok := n.Type.(iceberg.GeometryType)
+		require.True(t, ok)
+		assert.Equal(t, "srid:4326", geom.CRS())
+	})
+
+	t.Run("rejects extra argument", func(t *testing.T) {
+		data := `{"id": 1, "name": "loc", "type": "geometry(srid:4326, extra)", "required": false}`
+		var n iceberg.NestedField
+		err := json.Unmarshal([]byte(data), &n)
+		assert.ErrorIs(t, err, iceberg.ErrInvalidTypeString)
+	})
+}
+
+func TestGeographyType(t *testing.T) {
+	t.Run("default CRS and algorithm", func(t *testing.T) {
+		geog := iceberg.GeographyType{}
+		assert.Equal(t, "OGC:CRS84", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+		assert.Equal(t, "geography", geog.String())
+		assert.True(t, geog.Equals(iceberg.GeographyType{}))
+	})
+
+	t.Run("custom CRS only", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("srid:4269", "spherical")
+		require.NoError(t, err)
+		assert.Equal(t, "srid:4269", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+		assert.Equal(t, "geography(srid:4269)", geog.String())
+	})
+
+	t.Run("default CRS and algorithm explicit", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("OGC:CRS84", "spherical")
+		require.NoError(t, err)
+		assert.True(t, geog.Equals(iceberg.GeographyType{}))
+	})
+
+	t.Run("default CRS with algorithm", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("OGC:CRS84", "karney")
+		require.NoError(t, err)
+		assert.Equal(t, "OGC:CRS84", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+		assert.Equal(t, "geography(OGC:CRS84, karney)", geog.String())
+	})
+
+	t.Run("custom CRS with algorithm", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("srid:4269", "karney")
+		require.NoError(t, err)
+		assert.Equal(t, "srid:4269", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+		assert.Equal(t, "geography(srid:4269, karney)", geog.String())
+	})
+
+	t.Run("empty CRS error", func(t *testing.T) {
+		_, err := iceberg.GeographyTypeOf("", "")
+		assert.ErrorContains(t, err, "invalid CRS: (empty string)")
+	})
+
+	t.Run("whitespace default algorithm", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("OGC:CRS84", "    spherical    ")
+		assert.NoError(t, err)
+		assert.Equal(t, "OGC:CRS84", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+		assert.Equal(t, "geography", geog.String())
+	})
+
+	t.Run("whitespace default CRS and default algorithm", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("    OGC:CRS84    ", "    spherical    ")
+		assert.NoError(t, err)
+		assert.Equal(t, "OGC:CRS84", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+		assert.Equal(t, "geography", geog.String())
+	})
+
+	t.Run("whitespace custom CRS and custom algorithm", func(t *testing.T) {
+		geog, err := iceberg.GeographyTypeOf("    srid:3857    ", "    karney    ")
+		assert.NoError(t, err)
+		assert.Equal(t, "srid:3857", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+		assert.Equal(t, "geography(srid:3857, karney)", geog.String())
+	})
+
+	t.Run("JSON parsing - default", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geog, ok := n.Type.(iceberg.GeographyType)
+		require.True(t, ok)
+		assert.Equal(t, "OGC:CRS84", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+
+		out, err := json.Marshal(n)
+		require.NoError(t, err)
+		assert.JSONEq(t, data, string(out))
+	})
+
+	t.Run("JSON parsing - custom CRS", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography(srid:4269)", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geog, ok := n.Type.(iceberg.GeographyType)
+		require.True(t, ok)
+		assert.Equal(t, "srid:4269", geog.CRS())
+		assert.Equal(t, "spherical", geog.Algorithm())
+
+		out, err := json.Marshal(n)
+		require.NoError(t, err)
+		assert.JSONEq(t, data, string(out))
+	})
+
+	t.Run("JSON parsing - custom CRS with algorithm", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography(srid:4269, karney)", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geog, ok := n.Type.(iceberg.GeographyType)
+		require.True(t, ok)
+		assert.Equal(t, "srid:4269", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+
+		out, err := json.Marshal(n)
+		require.NoError(t, err)
+		assert.JSONEq(t, data, string(out))
+	})
+
+	t.Run("JSON parsing - case insensitive", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "Geography(SRID:4269, KARNEY)", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geog, ok := n.Type.(iceberg.GeographyType)
+		require.True(t, ok)
+		assert.Equal(t, "SRID:4269", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+	})
+
+	t.Run("JSON parsing - whitespace tolerance", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography( srid:4269 , karney )", "required": false}`
+		var n iceberg.NestedField
+		require.NoError(t, json.Unmarshal([]byte(data), &n))
+		geog, ok := n.Type.(iceberg.GeographyType)
+		require.True(t, ok)
+		assert.Equal(t, "srid:4269", geog.CRS())
+		assert.Equal(t, "karney", geog.Algorithm())
+	})
+
+	t.Run("JSON parsing - invalid algorithm", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography(srid:4269, invalid)", "required": false}`
+		var n iceberg.NestedField
+		err := json.Unmarshal([]byte(data), &n)
+		assert.ErrorContains(t, err, "invalid edge interpolation algorithm")
+	})
+
+	t.Run("rejects missing comma between CRS and algorithm", func(t *testing.T) {
+		data := `{"id": 1, "name": "area", "type": "geography(srid:4269 karney)", "required": false}`
+		var n iceberg.NestedField
+		err := json.Unmarshal([]byte(data), &n)
+		assert.ErrorIs(t, err, iceberg.ErrInvalidTypeString)
+	})
+}
+
+func TestNestedFieldEqualsWithNonComparableDefaults(t *testing.T) {
+	nonComparableDefault := map[string]any{
+		"meta": []any{"a", "b"},
+		"cfg":  map[string]any{"enabled": true},
+	}
+
+	left := iceberg.NestedField{
+		ID:             1,
+		Name:           "payload",
+		Type:           iceberg.PrimitiveTypes.String,
+		Required:       true,
+		InitialDefault: nonComparableDefault,
+		WriteDefault:   []string{"a", "b"},
+	}
+	right := iceberg.NestedField{
+		ID:       1,
+		Name:     "payload",
+		Type:     iceberg.PrimitiveTypes.String,
+		Required: true,
+		InitialDefault: map[string]any{
+			"meta": []any{"a", "b"},
+			"cfg":  map[string]any{"enabled": true},
+		},
+		WriteDefault: []string{"a", "b"},
+	}
+
+	assert.NotPanics(t, func() {
+		assert.True(t, left.Equals(right))
+	})
+
+	right.WriteDefault = []string{"b", "a"}
+	assert.False(t, left.Equals(right))
+	assert.False(t, left.Equals(iceberg.NestedField{
+		ID:       1,
+		Name:     "payload",
+		Type:     iceberg.PrimitiveTypes.String,
+		Required: true,
+	}))
+}
+
+func TestPromoteType(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileType iceberg.Type
+		readType iceberg.Type
+		want     iceberg.Type
+		wantErr  bool
+	}{
+		{"int to long", iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.Int64, false},
+		{"float to double", iceberg.PrimitiveTypes.Float32, iceberg.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Float64, false},
+		{"string to binary", iceberg.PrimitiveTypes.String, iceberg.PrimitiveTypes.Binary, iceberg.PrimitiveTypes.Binary, false},
+		{"binary to string", iceberg.PrimitiveTypes.Binary, iceberg.PrimitiveTypes.String, iceberg.PrimitiveTypes.String, false},
+		{"fixed[16] to uuid", iceberg.FixedTypeOf(16), iceberg.PrimitiveTypes.UUID, iceberg.PrimitiveTypes.UUID, false},
+		{"unknown to any", iceberg.PrimitiveTypes.Unknown, iceberg.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.Int64, false},
+
+		// Decimal: precision may widen, scale must stay the same.
+		{"decimal widen precision", iceberg.DecimalTypeOf(9, 2), iceberg.DecimalTypeOf(18, 2), iceberg.DecimalTypeOf(18, 2), false},
+		{"decimal same", iceberg.DecimalTypeOf(9, 2), iceberg.DecimalTypeOf(9, 2), iceberg.DecimalTypeOf(9, 2), false},
+		{"decimal narrow precision", iceberg.DecimalTypeOf(18, 2), iceberg.DecimalTypeOf(9, 2), nil, true},
+		{"decimal increase scale", iceberg.DecimalTypeOf(9, 2), iceberg.DecimalTypeOf(18, 4), nil, true},
+		{"decimal decrease scale", iceberg.DecimalTypeOf(9, 4), iceberg.DecimalTypeOf(18, 2), nil, true},
+
+		{"disallowed int to string", iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.String, nil, true},
+		{"disallowed fixed[8] to uuid", iceberg.FixedTypeOf(8), iceberg.PrimitiveTypes.UUID, nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := iceberg.PromoteType(tt.fileType, tt.readType)
+			if tt.wantErr {
+				require.ErrorIs(t, err, iceberg.ErrResolve)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Truef(t, tt.want.Equals(got), "expected: %s\ngot: %s", tt.want, got)
+		})
+	}
 }

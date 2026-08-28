@@ -27,7 +27,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/internal"
-	iceio "github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
 )
 
@@ -35,10 +34,12 @@ import (
 type WriteRecordOption func(*writeRecordConfig)
 
 type writeRecordConfig struct {
-	targetFileSize  int64
-	writeUUID       *uuid.UUID
-	maxWriteWorkers int
-	clustered       bool
+	targetFileSize     int64
+	writeUUID          *uuid.UUID
+	maxWriteWorkers    int
+	clustered          bool
+	fileSchema         *iceberg.Schema
+	preserveRowLineage bool
 }
 
 // WithTargetFileSize overrides the table's default target file size.
@@ -94,6 +95,24 @@ func WithClusteredWrite() WriteRecordOption {
 	}
 }
 
+// WithPreserveRowLineage sets the output file schema to include the v3 row-
+// lineage metadata columns (_row_id, _last_updated_sequence_number) so that
+// row identity is preserved through rewrites and compactions. The input
+// records must already carry _row_id (e.g. from a scan that projected the
+// lineage columns).
+//
+// [WriteRecords] validates this option against the table state and the input
+// Arrow schema: it errors when applied to a v1/v2 table or when the input
+// records don't include the _row_id column. The schema parameter is the
+// projected Iceberg schema (typically [iceberg.SchemaWithRowLineage]) and is
+// used to write the output Parquet's field IDs.
+func WithPreserveRowLineage(schema *iceberg.Schema) WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		c.fileSchema = schema
+		c.preserveRowLineage = true
+	}
+}
+
 // WriteRecords writes Arrow record batches to Parquet data files for the given
 // table, returning an iterator of the resulting DataFile objects.
 //
@@ -102,7 +121,8 @@ func WithClusteredWrite() WriteRecordOption {
 // field ID (or by name via the table's name mapping if field IDs are absent).
 // The Arrow schema may be a subset of the table schema (projection), but every
 // field present must have a type that is promotable to the corresponding table
-// field type.
+// field type. When the table uses microsecond timestamps, Arrow nanosecond
+// timestamps are also accepted and are downcast during the write path.
 //
 // WriteRecords releases each RecordBatch it consumes. If the caller needs a
 // batch to remain valid after it has been yielded, it must call Retain before
@@ -112,11 +132,6 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	records iter.Seq2[arrow.RecordBatch, error],
 	opts ...WriteRecordOption,
 ) iter.Seq2[iceberg.DataFile, error] {
-	if err := checkArrowSchemaCompat(tbl.Schema(), schema, false); err != nil {
-		return internal.SingleErrorIter[iceberg.DataFile](
-			fmt.Errorf("arrow schema is not compatible with the table schema: %w", err))
-	}
-
 	cfg := writeRecordConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -127,14 +142,44 @@ func WriteRecords(ctx context.Context, tbl *Table,
 			errors.New("WithClusteredWrite and WithMaxWriteWorkers are incompatible: the clustered write path is single-threaded"))
 	}
 
+	if cfg.preserveRowLineage {
+		if v := tbl.metadata.Version(); v < 3 {
+			return internal.SingleErrorIter[iceberg.DataFile](
+				fmt.Errorf("WithPreserveRowLineage requires a v3+ table, got v%d", v))
+		}
+		if len(schema.FieldIndices(iceberg.RowIDColumnName)) == 0 {
+			return internal.SingleErrorIter[iceberg.DataFile](
+				fmt.Errorf("WithPreserveRowLineage requires input records to include the %q column", iceberg.RowIDColumnName))
+		}
+	}
+
+	// Validate the input arrow schema against the projected schema. When
+	// row lineage is being preserved, the projected schema includes the
+	// reserved metadata columns; using tbl.Schema() instead would reject
+	// the lineage columns since they're not declared in the user schema.
+	checkSchema := tbl.Schema()
+	if cfg.fileSchema != nil {
+		checkSchema = cfg.fileSchema
+	}
+	err := checkArrowSchemaCompatWithProperties(checkSchema, schema, false, tbl.Metadata().Properties())
+	if err != nil {
+		if downcastErr := checkArrowSchemaCompatWithProperties(checkSchema, schema, true, tbl.Metadata().Properties()); downcastErr == nil {
+			err = nil
+		}
+	}
+	if err != nil {
+		return internal.SingleErrorIter[iceberg.DataFile](
+			fmt.Errorf("arrow schema is not compatible with the table schema: %w", err))
+	}
+
 	fs, err := tbl.fsF(ctx)
 	if err != nil {
 		return internal.SingleErrorIter[iceberg.DataFile](err)
 	}
 
-	writeFS, ok := fs.(iceio.WriteFileIO)
-	if !ok {
-		return internal.SingleErrorIter[iceberg.DataFile](fmt.Errorf("%w: filesystem does not support writing", iceberg.ErrNotImplemented))
+	writeFS, err := requireWriteFileIO(fs)
+	if err != nil {
+		return internal.SingleErrorIter[iceberg.DataFile](err)
 	}
 
 	meta, err := MetadataBuilderFromBase(tbl.metadata, tbl.metadataLocation)
@@ -172,6 +217,10 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		writeUUID:       cfg.writeUUID,
 		maxWriteWorkers: cfg.maxWriteWorkers,
 		clustered:       cfg.clustered,
+	}
+
+	if cfg.fileSchema != nil {
+		args.factoryOpts = append(args.factoryOpts, withFactoryFileSchema(cfg.fileSchema))
 	}
 
 	return recordsToDataFiles(ctx, tbl.Location(), meta, args)

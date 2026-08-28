@@ -18,6 +18,7 @@
 package iceberg
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -27,6 +28,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/apache/iceberg-go/internal"
 )
 
 // Schema is an Iceberg table schema, represented as a struct with
@@ -179,7 +184,13 @@ func (s *Schema) FlatFields() (iter.Seq[NestedField], error) {
 		return nil, err
 	}
 
-	return maps.Values(fields), nil
+	return func(yield func(NestedField) bool) {
+		for field := range maps.Values(fields) {
+			if !yield(cloneField(field)) {
+				return
+			}
+		}
+	}, nil
 }
 
 func (s *Schema) lazyIDToField() (map[int]NestedField, error) {
@@ -257,10 +268,16 @@ func (s *Schema) Type() string { return "struct" }
 
 // AsStruct returns a Struct with the same fields as the schema which can
 // then be used as a Type.
-func (s *Schema) AsStruct() StructType    { return StructType{FieldList: s.fields} }
+func (s *Schema) AsStruct() StructType { return StructType{FieldList: cloneFields(s.fields)} }
+
+// asStructRef returns a read-only view over the schema field slice for
+// internal callers that only traverse fields and must avoid clone-on-read
+// overhead on hot paths.
+func (s *Schema) asStructRef() StructType { return StructType{FieldList: s.fields} }
+
 func (s *Schema) NumFields() int          { return len(s.fields) }
-func (s *Schema) Field(i int) NestedField { return s.fields[i] }
-func (s *Schema) Fields() []NestedField   { return slices.Clone(s.fields) }
+func (s *Schema) Field(i int) NestedField { return cloneField(s.fields[i]) }
+func (s *Schema) Fields() []NestedField   { return cloneFields(s.fields) }
 func (s *Schema) FieldIDs() []int {
 	idx, _ := s.lazyNameToID()
 
@@ -269,21 +286,50 @@ func (s *Schema) FieldIDs() []int {
 
 func (s *Schema) UnmarshalJSON(b []byte) error {
 	type Alias Schema
+	var decoded Schema
 	aux := struct {
-		Fields []NestedField `json:"fields"`
+		Type   *string         `json:"type"`
+		Fields json.RawMessage `json:"fields"`
 		*Alias
-	}{Alias: (*Alias)(s)}
+	}{Alias: (*Alias)(&decoded)}
 
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
-
-	s.init()
-
-	s.fields = aux.Fields
-	if s.IdentifierFieldIDs == nil {
-		s.IdentifierFieldIDs = []int{}
+	if aux.Type == nil {
+		return fmt.Errorf("%w: schema type is required", ErrInvalidSchema)
 	}
+	if *aux.Type != "struct" {
+		return fmt.Errorf("%w: schema type must be struct, got %q", ErrInvalidSchema, *aux.Type)
+	}
+	fieldsJSON := bytes.TrimSpace(aux.Fields)
+	if len(fieldsJSON) == 0 || bytes.Equal(fieldsJSON, []byte("null")) {
+		return fmt.Errorf("%w: schema fields are required", ErrInvalidSchema)
+	}
+
+	var fields []NestedField
+	if err := json.Unmarshal(fieldsJSON, &fields); err != nil {
+		return fmt.Errorf("%w: invalid schema fields: %w", ErrInvalidSchema, err)
+	}
+
+	if err := checkDuplicateFieldIDs(nil, fields); err != nil {
+		return err
+	}
+
+	decoded.fields = fields
+	if decoded.IdentifierFieldIDs == nil {
+		decoded.IdentifierFieldIDs = []int{}
+	}
+
+	s.ID = decoded.ID
+	s.IdentifierFieldIDs = decoded.IdentifierFieldIDs
+	s.fields = decoded.fields
+	s.idToName.Store(nil)
+	s.idToField.Store(nil)
+	s.nameToID.Store(nil)
+	s.nameToIDLower.Store(nil)
+	s.idToAccessor.Store(nil)
+	s.init()
 
 	return nil
 }
@@ -292,6 +338,10 @@ func (s *Schema) MarshalJSON() ([]byte, error) {
 	ids := s.IdentifierFieldIDs
 	if ids == nil {
 		ids = []int{}
+	}
+	fields := s.fields
+	if fields == nil {
+		fields = []NestedField{}
 	}
 
 	type Alias Schema
@@ -303,7 +353,58 @@ func (s *Schema) MarshalJSON() ([]byte, error) {
 		Type   string        `json:"type"`
 		Fields []NestedField `json:"fields"`
 		*Alias
-	}{Type: "struct", Fields: s.fields, Alias: &aliasCopy})
+	}{Type: "struct", Fields: fields, Alias: &aliasCopy})
+}
+
+func cloneFields(fields []NestedField) []NestedField {
+	if len(fields) == 0 {
+		return nil
+	}
+
+	cloned := make([]NestedField, len(fields))
+	for i, field := range fields {
+		cloned[i] = cloneField(field)
+	}
+
+	return cloned
+}
+
+func cloneField(field NestedField) NestedField {
+	return NestedField{
+		ID:             field.ID,
+		Name:           field.Name,
+		Type:           cloneType(field.Type),
+		Required:       field.Required,
+		Doc:            field.Doc,
+		InitialDefault: CloneDefaultValue(field.InitialDefault),
+		WriteDefault:   CloneDefaultValue(field.WriteDefault),
+	}
+}
+
+func cloneType(t Type) Type {
+	if t == nil {
+		return nil
+	}
+
+	switch typed := t.(type) {
+	case *StructType:
+		return &StructType{FieldList: cloneFields(typed.FieldList)}
+	case *ListType:
+		cloned := *typed
+		cloned.Element = cloneType(typed.Element)
+
+		return &cloned
+	case *MapType:
+		cloned := *typed
+		cloned.KeyType = cloneType(typed.KeyType)
+		cloned.ValueType = cloneType(typed.ValueType)
+
+		return &cloned
+	default:
+		// Leaf and parameterized non-container types are immutable value objects,
+		// so sharing them between clones is safe.
+		return t
+	}
 }
 
 // FindColumnName returns the name of the column identified by the
@@ -355,6 +456,19 @@ func (s *Schema) FindFieldByNameCaseInsensitive(name string) (NestedField, bool)
 // FindFieldByID is like [*Schema.FindColumnName], but returns the whole
 // field rather than just the field name.
 func (s *Schema) FindFieldByID(id int) (NestedField, bool) {
+	f, ok := s.FindFieldByIDRef(id, internal.SchemaRef{})
+	if ok {
+		f = cloneField(f)
+	}
+
+	return f, ok
+}
+
+// FindFieldByIDRef returns a schema-owned field without cloning it. The returned
+// field is a value copy, but its Type and everything reachable from that Type
+// are shared with the schema and must be treated as read-only. This method is
+// limited to internal callers that need to avoid clone-on-read overhead.
+func (s *Schema) FindFieldByIDRef(id int, _ internal.SchemaRef) (NestedField, bool) {
 	idx, _ := s.lazyIDToField()
 	f, ok := idx[id]
 
@@ -513,6 +627,7 @@ type SchemaVisitor[T any] interface {
 	List(list ListType, elemResult T) T
 	Map(mapType MapType, keyResult, valueResult T) T
 	Primitive(p PrimitiveType) T
+	Variant(v VariantType) T
 }
 
 type BeforeFieldVisitor interface {
@@ -567,6 +682,9 @@ type SchemaVisitorPerPrimitiveType[T any] interface {
 	VisitBinary() T
 	VisitUUID() T
 	VisitUnknown() T
+	VisitVariant() T
+	VisitGeometry(GeometryType) T
+	VisitGeography(GeographyType) T
 }
 
 // Visit accepts a visitor and performs a post-order traversal of the given schema.
@@ -588,7 +706,7 @@ func Visit[T any](sc *Schema, visitor SchemaVisitor[T]) (res T, err error) {
 		}
 	}()
 
-	return visitor.Schema(sc, visitStruct(sc.AsStruct(), visitor)), nil
+	return visitor.Schema(sc, visitStruct(sc.asStructRef(), visitor)), nil
 }
 
 func visitStruct[T any](obj StructType, visitor SchemaVisitor[T]) T {
@@ -676,6 +794,12 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 		return visitList(*typ, visitor)
 	case *MapType:
 		return visitMap(*typ, visitor)
+	case VariantType:
+		if perPrimitive, ok := visitor.(SchemaVisitorPerPrimitiveType[T]); ok {
+			return perPrimitive.VisitVariant()
+		}
+
+		return visitor.Variant(typ)
 	default: // primitive
 		if perPrimitive, ok := visitor.(SchemaVisitorPerPrimitiveType[T]); ok {
 			switch t := typ.(type) {
@@ -713,6 +837,10 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 				return perPrimitive.VisitFixed(t)
 			case UnknownType:
 				return perPrimitive.VisitUnknown()
+			case GeographyType:
+				return perPrimitive.VisitGeography(t)
+			case GeometryType:
+				return perPrimitive.VisitGeometry(t)
 			}
 		}
 
@@ -727,6 +855,7 @@ type PreOrderSchemaVisitor[T any] interface {
 	List(ListType, func() T) T
 	Map(MapType, func() T, func() T) T
 	Primitive(PrimitiveType) T
+	Variant(VariantType) T
 }
 
 func PreOrderVisit[T any](sc *Schema, visitor PreOrderSchemaVisitor[T]) (res T, err error) {
@@ -748,7 +877,7 @@ func PreOrderVisit[T any](sc *Schema, visitor PreOrderSchemaVisitor[T]) (res T, 
 	}()
 
 	return visitor.Schema(sc, func() T {
-		return visitStructPreOrder(sc.AsStruct(), visitor)
+		return visitStructPreOrder(sc.asStructRef(), visitor)
 	}), nil
 }
 
@@ -787,6 +916,8 @@ func visitFieldPreOrder[T any](f NestedField, visitor PreOrderSchemaVisitor[T]) 
 		fn = func() T { return visitListPreOrder(*typ, visitor) }
 	case *MapType:
 		fn = func() T { return visitMapPreOrder(*typ, visitor) }
+	case VariantType:
+		fn = func() T { return visitor.Variant(typ) }
 	default:
 		fn = func() T { return visitor.Primitive(typ.(PrimitiveType)) }
 	}
@@ -832,6 +963,10 @@ func (i *indexByID) Map(mapType MapType, _, _ map[int]NestedField) map[int]Neste
 }
 
 func (i *indexByID) Primitive(PrimitiveType) map[int]NestedField {
+	return i.index
+}
+
+func (i *indexByID) Variant(VariantType) map[int]NestedField {
 	return i.index
 }
 
@@ -900,6 +1035,7 @@ func (i *indexByName) ByName() map[string]int {
 }
 
 func (i *indexByName) Primitive(PrimitiveType) map[string]int { return i.index }
+func (i *indexByName) Variant(VariantType) map[string]int     { return i.index }
 func (i *indexByName) addField(name string, fieldID int) {
 	fullName := name
 	if len(i.fieldNames) > 0 {
@@ -1020,11 +1156,13 @@ func (p *pruneColVisitor) Struct(st StructType, fieldResults []Type) Type {
 			sameType = false
 			// type has changed, create a new field with the projected type
 			selected = append(selected, NestedField{
-				ID:       field.ID,
-				Name:     field.Name,
-				Type:     t,
-				Doc:      field.Doc,
-				Required: field.Required,
+				ID:             field.ID,
+				Name:           field.Name,
+				Type:           t,
+				Doc:            field.Doc,
+				Required:       field.Required,
+				InitialDefault: field.InitialDefault,
+				WriteDefault:   field.WriteDefault,
 			})
 		}
 	}
@@ -1057,6 +1195,10 @@ func (p *pruneColVisitor) Field(field NestedField, fieldResult Type) Type {
 
 	if _, ok := field.Type.(*StructType); ok {
 		return p.projectSelectedStruct(fieldResult)
+	}
+
+	if _, ok := field.Type.(VariantType); ok {
+		return field.Type
 	}
 
 	typ, ok := field.Type.(PrimitiveType)
@@ -1131,6 +1273,7 @@ func (p *pruneColVisitor) Map(mapType MapType, keyResult, valueResult Type) Type
 }
 
 func (p *pruneColVisitor) Primitive(_ PrimitiveType) Type { return nil }
+func (p *pruneColVisitor) Variant(_ VariantType) Type     { return nil }
 
 func (*pruneColVisitor) projectSelectedStruct(projected Type) *StructType {
 	if projected == nil {
@@ -1192,6 +1335,7 @@ func (findLastFieldID) Map(field MapType, keyResult, valueResult int) int {
 }
 
 func (findLastFieldID) Primitive(PrimitiveType) int { return 0 }
+func (findLastFieldID) Variant(VariantType) int     { return 0 }
 
 // IndexParents generates an index of field IDs to their parent field
 // IDs. Root fields are not indexed
@@ -1256,6 +1400,10 @@ func (i *indexParents) Primitive(PrimitiveType) map[int]int {
 	return i.idToParent
 }
 
+func (i *indexParents) Variant(VariantType) map[int]int {
+	return i.idToParent
+}
+
 type buildPosAccessors struct{}
 
 func (buildPosAccessors) Schema(_ *Schema, structResult map[int]accessor) map[int]accessor {
@@ -1267,7 +1415,6 @@ func (buildPosAccessors) Struct(st StructType, fieldResults []map[int]accessor) 
 	for pos, f := range st.FieldList {
 		if innerMap := fieldResults[pos]; len(innerMap) != 0 {
 			for inner, acc := range innerMap {
-				acc := acc
 				result[inner] = accessor{pos: pos, inner: &acc}
 			}
 		} else {
@@ -1291,6 +1438,10 @@ func (buildPosAccessors) Map(_ MapType, _, _ map[int]accessor) map[int]accessor 
 }
 
 func (buildPosAccessors) Primitive(PrimitiveType) map[int]accessor {
+	return map[int]accessor{}
+}
+
+func (buildPosAccessors) Variant(VariantType) map[int]accessor {
 	return map[int]accessor{}
 }
 
@@ -1318,11 +1469,13 @@ func (s *setFreshIDs) Struct(st StructType, fieldResults []func() Type) Type {
 	newFields := make([]NestedField, len(st.FieldList))
 	for idx, f := range st.FieldList {
 		newFields[idx] = NestedField{
-			ID:       s.getAndInc(f.ID),
-			Name:     f.Name,
-			Type:     fieldResults[idx](),
-			Doc:      f.Doc,
-			Required: f.Required,
+			ID:             s.getAndInc(f.ID),
+			Name:           f.Name,
+			Type:           fieldResults[idx](),
+			Doc:            f.Doc,
+			Required:       f.Required,
+			InitialDefault: f.InitialDefault,
+			WriteDefault:   f.WriteDefault,
 		}
 	}
 
@@ -1358,6 +1511,10 @@ func (s *setFreshIDs) Map(mapType MapType, keyResult, valueResult func() Type) T
 
 func (s *setFreshIDs) Primitive(p PrimitiveType) Type {
 	return p
+}
+
+func (s *setFreshIDs) Variant(v VariantType) Type {
+	return v
 }
 
 // AssignFreshSchemaIDs creates a new schema with fresh field IDs for all of the
@@ -1397,6 +1554,7 @@ type SchemaWithPartnerVisitor[T, P any] interface {
 	List(l ListType, listPartner P, elemResult T) T
 	Map(m MapType, mapPartner P, keyResult, valResult T) T
 	Primitive(p PrimitiveType, primitivePartner P) T
+	Variant(v VariantType, variantPartner P) T
 }
 
 type PartnerAccessor[P any] interface {
@@ -1433,7 +1591,7 @@ func VisitSchemaWithPartner[T, P any](sc *Schema, partner P, visitor SchemaWithP
 
 	structPartner := accessor.SchemaPartner(partner)
 
-	return visitor.Schema(sc, partner, visitStructWithPartner(sc.AsStruct(), structPartner, visitor, accessor)), nil
+	return visitor.Schema(sc, partner, visitStructWithPartner(sc.asStructRef(), structPartner, visitor, accessor)), nil
 }
 
 func visitStructWithPartner[T, P any](st StructType, partner P, visitor SchemaWithPartnerVisitor[T, P], accessor PartnerAccessor[P]) T {
@@ -1534,6 +1692,8 @@ func visitTypeWithPartner[T, P any](t Type, fieldPartner P, visitor SchemaWithPa
 		return visitStructWithPartner(*t, fieldPartner, visitor, accessor)
 	case *MapType:
 		return visitMapWithPartner(*t, fieldPartner, visitor, accessor)
+	case VariantType:
+		return visitor.Variant(t, fieldPartner)
 	default:
 		return visitor.Primitive(t.(PrimitiveType), fieldPartner)
 	}
@@ -1552,12 +1712,16 @@ func validAvroName(n string) bool {
 		return false
 	}
 
-	if !unicode.IsLetter(rune(n[0])) && n[0] != '_' {
-		return false
-	}
+	for i, r := range n {
+		if i == 0 {
+			if !isAvroNameStart(r) {
+				return false
+			}
 
-	for _, r := range n[1:] {
-		if !unicode.In(r, unicode.Number, unicode.Letter) && r != '_' {
+			continue
+		}
+
+		if !isAvroNamePart(r) {
 			return false
 		}
 	}
@@ -1565,7 +1729,23 @@ func validAvroName(n string) bool {
 	return true
 }
 
+const maxBMPRune rune = 0xFFFF
+
+func isAvroNameStart(r rune) bool {
+	return r <= maxBMPRune && (r == '_' || unicode.IsLetter(r))
+}
+
+func isAvroNamePart(r rune) bool {
+	return r <= maxBMPRune && (isAvroNameStart(r) || unicode.IsDigit(r))
+}
+
 func sanitize(r rune) string {
+	if r > maxBMPRune {
+		high, low := utf16.EncodeRune(r)
+
+		return fmt.Sprintf("_x%X_x%X", high, low)
+	}
+
 	if unicode.IsDigit(r) {
 		return "_" + string(r)
 	}
@@ -1579,17 +1759,15 @@ func sanitizeName(n string) string {
 	}
 
 	var b strings.Builder
-	b.Grow(len(n))
+	b.Grow(len(n) * 3)
 
-	first := n[0]
-	if !unicode.IsLetter(rune(first)) && first != '_' {
-		b.WriteString(sanitize(rune(first)))
-	} else {
-		b.WriteByte(first)
-	}
+	for i, r := range n {
+		valid := isAvroNamePart(r)
+		if i == 0 {
+			valid = isAvroNameStart(r)
+		}
 
-	for _, r := range n[1:] {
-		if !unicode.In(r, unicode.Number, unicode.Letter) && r != '_' {
+		if !valid {
 			b.WriteString(sanitize(r))
 		} else {
 			b.WriteRune(r)
@@ -1599,6 +1777,14 @@ func sanitizeName(n string) string {
 	return b.String()
 }
 
+// SanitizeColumnNames returns a copy of sc whose field names are compatible
+// with Java Iceberg's Avro name sanitization. Characters outside the BMP are
+// escaped as UTF-16 surrogate pairs, and only Unicode decimal digits are
+// treated as digits; other numeric categories are escaped.
+//
+// Empty or invalid UTF-8 field names and names that collide after sanitization
+// return an error wrapping ErrInvalidSchema. Collision errors are reported here
+// before a downstream Avro schema builder encounters the duplicate field name.
 func SanitizeColumnNames(sc *Schema) (*Schema, error) {
 	result, err := Visit(sc, sanitizeColumnNameVisitor{})
 	if err != nil {
@@ -1621,6 +1807,9 @@ func (sanitizeColumnNameVisitor) Field(field NestedField, fieldResult NestedFiel
 	if field.Name == "" {
 		panic(fmt.Errorf("%w: field name cannot be empty", ErrInvalidSchema))
 	}
+	if !utf8.ValidString(field.Name) {
+		panic(fmt.Errorf("%w: field %d name is not valid UTF-8", ErrInvalidSchema, field.ID))
+	}
 
 	field.Name = makeCompatibleName(field.Name)
 
@@ -1628,6 +1817,16 @@ func (sanitizeColumnNameVisitor) Field(field NestedField, fieldResult NestedFiel
 }
 
 func (sanitizeColumnNameVisitor) Struct(_ StructType, fieldResults []NestedField) NestedField {
+	seen := make(map[string]int, len(fieldResults))
+	for _, field := range fieldResults {
+		if previousID, ok := seen[field.Name]; ok {
+			panic(fmt.Errorf(
+				"%w: fields %d and %d produce duplicate sanitized name %q",
+				ErrInvalidSchema, previousID, field.ID, field.Name))
+		}
+		seen[field.Name] = field.ID
+	}
+
 	return NestedField{Type: &StructType{FieldList: fieldResults}}
 }
 
@@ -1646,4 +1845,8 @@ func (sanitizeColumnNameVisitor) Map(mapType MapType, keyResult, valueResult Nes
 
 func (sanitizeColumnNameVisitor) Primitive(p PrimitiveType) NestedField {
 	return NestedField{Type: p}
+}
+
+func (sanitizeColumnNameVisitor) Variant(v VariantType) NestedField {
+	return NestedField{Type: v}
 }

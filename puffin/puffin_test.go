@@ -19,14 +19,25 @@ package puffin_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"math"
 	"os"
 	"path"
+	"strconv"
 	"testing"
 
 	"github.com/apache/iceberg-go/puffin"
+	"github.com/pierrec/lz4/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+)
+
+const (
+	puffinFooterTrailerSize       = 3 * puffin.MagicSize
+	compressedFooterLZ4FrameStart = 2 * puffin.MagicSize
+	compressedFooterLZ4FLGOffset  = compressedFooterLZ4FrameStart + puffin.MagicSize
+	compressedFooterLZ4BDOffset   = compressedFooterLZ4FLGOffset + 1
 )
 
 // --- Test Helpers ---
@@ -36,6 +47,41 @@ func newWriter() (*puffin.Writer, *bytes.Buffer) {
 	w, _ := puffin.NewWriter(buf)
 
 	return w, buf
+}
+
+type partialFailWriter struct {
+	bytes.Buffer
+	failCall int
+	calls    int
+	err      error
+}
+
+type countingReaderAtSeeker struct {
+	*bytes.Reader
+	reads []readCall
+}
+
+type readCall struct {
+	offset int64
+	length int
+}
+
+func (r *countingReaderAtSeeker) ReadAt(p []byte, offset int64) (int, error) {
+	r.reads = append(r.reads, readCall{offset: offset, length: len(p)})
+
+	return r.Reader.ReadAt(p, offset)
+}
+
+func (w *partialFailWriter) Write(data []byte) (int, error) {
+	w.calls++
+	if w.calls == w.failCall {
+		partial := len(data) / 2
+		_, _ = w.Buffer.Write(data[:partial])
+
+		return partial, w.err
+	}
+
+	return w.Buffer.Write(data)
 }
 
 func newReader(t *testing.T, buf *bytes.Buffer) *puffin.Reader {
@@ -52,6 +98,67 @@ func defaultBlobInput() puffin.BlobMetadataInput {
 	}
 }
 
+func TestWriterRejectsOperationsAfterPartialWriteFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		failCall       int
+		failsDuringAdd bool
+	}{
+		// NewWriter writes first, AddBlob writes second, and Finish writes calls 3-5.
+		{name: "blob", failCall: 2, failsDuringAdd: true},
+		{name: "footer magic", failCall: 3},
+		{name: "footer payload", failCall: 4},
+		{name: "footer trailer", failCall: 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeErr := errors.New("injected partial write")
+			output := &partialFailWriter{failCall: tt.failCall, err: writeErr}
+			writer, err := puffin.NewWriter(output)
+			require.NoError(t, err)
+
+			_, err = writer.AddBlob(defaultBlobInput(), []byte("first blob payload"))
+			if tt.failsDuringAdd {
+				require.ErrorIs(t, err, writeErr)
+			} else {
+				require.NoError(t, err)
+				require.ErrorIs(t, writer.Finish(), writeErr)
+			}
+
+			callsAfterFailure := output.calls
+			bytesAfterFailure := output.Len()
+
+			_, err = writer.AddBlob(defaultBlobInput(), []byte("second blob payload"))
+			assert.ErrorIs(t, err, writeErr)
+			assert.ErrorIs(t, writer.Finish(), writeErr)
+			assert.ErrorIs(t, writer.AddProperties(map[string]string{"key": "value"}), writeErr)
+			assert.ErrorIs(t, writer.ClearProperties(), writeErr)
+			assert.ErrorIs(t, writer.SetCreatedBy("test"), writeErr)
+			assert.Equal(t, callsAfterFailure, output.calls)
+			assert.Equal(t, bytesAfterFailure, output.Len())
+		})
+	}
+}
+
+func TestWriterRejectsOperationsAfterShortWrite(t *testing.T) {
+	output := &partialFailWriter{failCall: 2}
+	writer, err := puffin.NewWriter(output)
+	require.NoError(t, err)
+
+	_, err = writer.AddBlob(defaultBlobInput(), []byte("first blob payload"))
+	require.ErrorContains(t, err, "short write")
+
+	callsAfterFailure := output.calls
+	_, err = writer.AddBlob(defaultBlobInput(), []byte("second blob payload"))
+	assert.ErrorContains(t, err, "short write")
+	assert.ErrorContains(t, writer.Finish(), "short write")
+	assert.ErrorContains(t, writer.AddProperties(map[string]string{"key": "value"}), "short write")
+	assert.ErrorContains(t, writer.ClearProperties(), "short write")
+	assert.ErrorContains(t, writer.SetCreatedBy("test"), "short write")
+	assert.Equal(t, callsAfterFailure, output.calls)
+}
+
 func validFile() []byte {
 	w, buf := newWriter()
 	w.Finish()
@@ -65,6 +172,65 @@ func validFileWithBlob() []byte {
 	w.Finish()
 
 	return buf.Bytes()
+}
+
+func fileWithFooterPayload(payload []byte) []byte {
+	data := append([]byte("PFA1PFA1"), payload...)
+	trailer := make([]byte, puffinFooterTrailerSize)
+	binary.LittleEndian.PutUint32(trailer[:4], uint32(len(payload)))
+	copy(trailer[8:], "PFA1")
+
+	return append(data, trailer...)
+}
+
+func fileWithCompressedFooterPayload(t *testing.T, payload []byte) []byte {
+	return fileWithCompressedFooterPayloadWithOptions(t, payload, lz4.SizeOption(uint64(len(payload))))
+}
+
+func fileWithCompressedFooterPayloadWithSize(t *testing.T, payload []byte, size uint64) []byte {
+	return fileWithCompressedFooterPayloadWithOptions(t, payload, lz4.SizeOption(size))
+}
+
+func fileWithCompressedFooterPayloadNoSize(t *testing.T, payload []byte) []byte {
+	return fileWithCompressedFooterPayloadWithOptions(t, payload)
+}
+
+func compressedLZ4Frame(t *testing.T, payload []byte, options ...lz4.Option) []byte {
+	t.Helper()
+
+	var compressed bytes.Buffer
+	writer := lz4.NewWriter(&compressed)
+	require.NoError(t, writer.Apply(options...))
+	_, err := writer.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	return compressed.Bytes()
+}
+
+func fileWithCompressedFooterPayloadWithOptions(t *testing.T, payload []byte, options ...lz4.Option) []byte {
+	compressed := compressedLZ4Frame(t, payload, options...)
+	data := append([]byte("PFA1PFA1"), compressed...)
+	trailer := make([]byte, puffinFooterTrailerSize)
+	binary.LittleEndian.PutUint32(trailer[:4], uint32(len(compressed)))
+	binary.LittleEndian.PutUint32(trailer[4:8], puffin.FooterFlagCompressed)
+	copy(trailer[8:], "PFA1")
+
+	return append(data, trailer...)
+}
+
+func fileWithCompressedFooterFrames(frames ...[]byte) []byte {
+	compressed := make([]byte, 0)
+	for _, frame := range frames {
+		compressed = append(compressed, frame...)
+	}
+	data := append([]byte("PFA1PFA1"), compressed...)
+	trailer := make([]byte, puffinFooterTrailerSize)
+	binary.LittleEndian.PutUint32(trailer[:4], uint32(len(compressed)))
+	binary.LittleEndian.PutUint32(trailer[4:8], puffin.FooterFlagCompressed)
+	copy(trailer[8:], "PFA1")
+
+	return append(data, trailer...)
 }
 
 // --- Tests ---
@@ -92,7 +258,7 @@ func TestRoundTrip(t *testing.T) {
 		SnapshotID:     -1,
 		SequenceNumber: -1,
 		Fields:         []int32{},
-		Properties:     map[string]string{"referenced-data-file": "data/file.parquet"},
+		Properties:     map[string]string{"referenced-data-file": "data/file.parquet", "cardinality": "0"},
 	}, blob2Data)
 	require.NoError(t, err)
 	require.NoError(t, w.Finish())
@@ -132,6 +298,65 @@ func TestRoundTrip(t *testing.T) {
 	assert.Len(t, allBlobs, 2)
 	assert.Equal(t, blob1Data, allBlobs[0].Data)
 	assert.Equal(t, blob2Data, allBlobs[1].Data)
+}
+
+func TestAddBlobCopiesMetadataInputs(t *testing.T) {
+	w, buf := newWriter()
+	fields := []int32{1, 2}
+	properties := map[string]string{"ndv": "10"}
+
+	meta, err := w.AddBlob(puffin.BlobMetadataInput{
+		Type:       puffin.BlobTypeDataSketchesTheta,
+		Fields:     fields,
+		Properties: properties,
+	}, []byte("sketch"))
+	require.NoError(t, err)
+
+	fields[0] = 99
+	properties["ndv"] = "20"
+	meta.Fields[1] = 88
+	meta.Properties["ndv"] = "30"
+	require.NoError(t, w.Finish())
+
+	blobs := newReader(t, buf).Blobs()
+	require.Len(t, blobs, 1)
+	assert.Equal(t, []int32{1, 2}, blobs[0].Fields)
+	assert.Equal(t, map[string]string{"ndv": "10"}, blobs[0].Properties)
+}
+
+func TestReaderReturnsMetadataCopies(t *testing.T) {
+	w, buf := newWriter()
+	require.NoError(t, w.AddProperties(map[string]string{"file": "original"}))
+	_, err := w.AddBlob(puffin.BlobMetadataInput{
+		Type:       puffin.BlobTypeDataSketchesTheta,
+		Fields:     []int32{1},
+		Properties: map[string]string{"blob": "original"},
+	}, []byte("sketch"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finish())
+
+	r := newReader(t, buf)
+	blobs := r.Blobs()
+	blobs[0].Type = puffin.BlobTypeDeletionVector
+	blobs[0].Fields[0] = 2
+	blobs[0].Properties["blob"] = "changed"
+	r.Properties()["file"] = "changed"
+
+	blob, err := r.ReadBlob(0)
+	require.NoError(t, err)
+	blob.Metadata.Fields[0] = 3
+	blob.Metadata.Properties["blob"] = "changed again"
+
+	all, err := r.ReadAllBlobs()
+	require.NoError(t, err)
+	all[0].Metadata.Fields[0] = 4
+	all[0].Metadata.Properties["blob"] = "changed again"
+
+	actual := r.Blobs()[0]
+	assert.Equal(t, puffin.BlobTypeDataSketchesTheta, actual.Type)
+	assert.Equal(t, []int32{1}, actual.Fields)
+	assert.Equal(t, "original", actual.Properties["blob"])
+	assert.Equal(t, "original", r.Properties()["file"])
 }
 
 // TestEmptyFile verifies that a puffin file with no blobs is valid.
@@ -180,6 +405,42 @@ func TestLargeFooter(t *testing.T) {
 
 	r := newReader(t, buf)
 	assert.Len(t, r.Blobs(), numBlobs)
+}
+
+func TestReaderReusesPrefetchedFooterPayload(t *testing.T) {
+	w, buf := newWriter()
+	require.NoError(t, w.Finish())
+
+	reader := &countingReaderAtSeeker{Reader: bytes.NewReader(buf.Bytes())}
+	_, err := puffin.NewReader(reader)
+	require.NoError(t, err)
+
+	require.Len(t, reader.reads, 2)
+}
+
+func TestReaderReadsLargeFooterPayloadFromUnderlyingReader(t *testing.T) {
+	w, buf := newWriter()
+	for i := range 200 {
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type:       puffin.BlobTypeDataSketchesTheta,
+			SnapshotID: int64(i),
+			Fields:     []int32{1, 2, 3, 4, 5},
+			Properties: map[string]string{"key": "value-to-increase-footer-size"},
+		}, []byte("blob"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finish())
+
+	reader := &countingReaderAtSeeker{Reader: bytes.NewReader(buf.Bytes())}
+	_, err := puffin.NewReader(reader)
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, len(reader.reads), 4)
+
+	footerMagicRead := reader.reads[2]
+	payloadRead := reader.reads[3]
+	require.Equal(t, puffin.MagicSize, footerMagicRead.length)
+	require.Equal(t, footerMagicRead.offset+int64(puffin.MagicSize), payloadRead.offset)
 }
 
 // TestWriterValidation verifies that Writer rejects invalid input.
@@ -237,6 +498,98 @@ func TestWriterValidation(t *testing.T) {
 		}, []byte("x"))
 		assert.ErrorContains(t, err, "sequence-number")
 	})
+
+	// deletion vector missing cardinality property: spec requires both
+	// cardinality and referenced-data-file; the table/dv reader does not
+	// enforce them, so we keep Go-emitted files always conformant here.
+	t.Run("deletion vector missing cardinality property", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"referenced-data-file": "data/x.parquet"},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "cardinality")
+	})
+
+	// deletion vector empty-string cardinality: caller explicitly set the
+	// key to ""; treated identically to "absent" since "" isn't a valid
+	// cardinality value either.
+	t.Run("deletion vector empty cardinality value", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"cardinality": "", "referenced-data-file": "data/x.parquet"},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "cardinality")
+	})
+
+	// deletion vector non-numeric cardinality: caller passed gibberish.
+	// Caught at write time via ParseUint so the reader doesn't surface
+	// it later as a cryptic parse error.
+	t.Run("deletion vector non-numeric cardinality", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"cardinality": "not-a-number", "referenced-data-file": "data/x.parquet"},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "not a valid non-negative integer")
+	})
+
+	// deletion vector negative cardinality: -1 aliases dv.DeserializeDV's
+	// skip-validation sentinel, so accepting it on the write side would
+	// let writers silently disable the read-side check. ParseUint catches
+	// this via the same invalid-syntax error path as non-numeric input —
+	// one validation, both cases.
+	t.Run("deletion vector negative cardinality", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"cardinality": "-1", "referenced-data-file": "data/x.parquet"},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "not a valid non-negative integer")
+	})
+
+	t.Run("deletion vector maximum cardinality", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{
+				"cardinality": strconv.FormatInt(math.MaxInt64, 10), "referenced-data-file": "data/x.parquet",
+			},
+		}, []byte("x"))
+		require.NoError(t, err)
+	})
+
+	t.Run("deletion vector cardinality above signed range", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{
+				"cardinality": "9223372036854775808", "referenced-data-file": "data/x.parquet",
+			},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "not a valid non-negative integer")
+	})
+
+	// deletion vector missing referenced-data-file property: spec-mandated.
+	t.Run("deletion vector missing referenced-data-file property", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"cardinality": "0"},
+		}, []byte("x"))
+		assert.ErrorContains(t, err, "referenced-data-file")
+	})
+
+	// deletion vector with all required properties succeeds.
+	t.Run("deletion vector with all required properties", func(t *testing.T) {
+		w, _ := newWriter()
+		_, err := w.AddBlob(puffin.BlobMetadataInput{
+			Type: puffin.BlobTypeDeletionVector, SnapshotID: -1, SequenceNumber: -1, Fields: []int32{},
+			Properties: map[string]string{"cardinality": "0", "referenced-data-file": "data/x.parquet"},
+		}, []byte("x"))
+		require.NoError(t, err)
+	})
 }
 
 // TestSetCreatedBy verifies the SetCreatedBy method.
@@ -270,12 +623,18 @@ func TestSetCreatedBy(t *testing.T) {
 func TestClearProperties(t *testing.T) {
 	w, buf := newWriter()
 	w.AddProperties(map[string]string{"key": "value"})
-	w.ClearProperties()
+	require.NoError(t, w.ClearProperties())
 	w.Finish()
 
 	r := newReader(t, buf)
 	_, exists := r.Properties()["key"]
 	assert.False(t, exists)
+
+	t.Run("after finish rejected", func(t *testing.T) {
+		w, _ := newWriter()
+		require.NoError(t, w.Finish())
+		assert.ErrorContains(t, w.ClearProperties(), "finalized")
+	})
 }
 
 // TestAddPropertiesAfterFinish verifies AddProperties rejects calls after finish.
@@ -338,6 +697,229 @@ func TestReaderInvalidFile(t *testing.T) {
 	t.Run("nil reader", func(t *testing.T) {
 		_, err := puffin.NewReader(nil)
 		assert.ErrorContains(t, err, "nil")
+	})
+}
+
+func TestReaderRejectsNegativeFooterPayloadSize(t *testing.T) {
+	data := validFile()
+	trailerOffset := len(data) - puffinFooterTrailerSize
+	binary.LittleEndian.PutUint32(data[trailerOffset:trailerOffset+puffin.MagicSize], ^uint32(0))
+
+	_, err := puffin.NewReader(bytes.NewReader(data))
+	require.ErrorContains(t, err, "invalid footer payload size -1")
+}
+
+func TestReaderRejectsTrailingFooterData(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload string
+		wantErr string
+	}{
+		{name: "single object", payload: `{"blobs":[]}`},
+		{name: "trailing whitespace", payload: "{\"blobs\":[]} \n\t"},
+		{name: "second JSON value", payload: `{"blobs":[]}{"blobs":[]}`, wantErr: "unexpected content after footer JSON"},
+		{name: "second scalar value", payload: `{"blobs":[]}42`, wantErr: "unexpected content after footer JSON"},
+		{name: "trailing garbage", payload: `{"blobs":[]}garbage`, wantErr: "unexpected content after footer JSON"},
+		{name: "trailing closing delimiter", payload: `{"blobs":[]} ]`, wantErr: "unexpected content after footer JSON"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := puffin.NewReader(bytes.NewReader(fileWithFooterPayload([]byte(test.payload))))
+			if test.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestReaderReadsLZ4CompressedFooter(t *testing.T) {
+	data := fileWithCompressedFooterPayload(t, []byte(`{"blobs":[],"properties":{"source":"lz4"}}`))
+
+	r, err := puffin.NewReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Equal(t, "lz4", r.Properties()["source"])
+	assert.Empty(t, r.Blobs())
+}
+
+func TestReaderReadsExternalLZ4CompressedFooter(t *testing.T) {
+	data := readFixture(t, "compressed-footer-lz4-cli.puffin")
+
+	r, err := puffin.NewReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Equal(t, "lz4-cli", r.Properties()["source"])
+	assert.Empty(t, r.Blobs())
+}
+
+func TestReaderReadsLZ4CompressedFooterWithBlockChecksums(t *testing.T) {
+	payload := []byte(`{"blobs":[]}`)
+	data := fileWithCompressedFooterPayloadWithOptions(
+		t,
+		payload,
+		lz4.SizeOption(uint64(len(payload))),
+		lz4.BlockChecksumOption(true),
+	)
+
+	_, err := puffin.NewReader(bytes.NewReader(data))
+	require.NoError(t, err)
+}
+
+func TestReaderPreservesLZ4ChecksumError(t *testing.T) {
+	payload := []byte(`{"blobs":[]}`)
+	data := fileWithCompressedFooterPayloadWithOptions(
+		t,
+		payload,
+		lz4.SizeOption(uint64(len(payload))),
+		lz4.ChecksumOption(true),
+	)
+	data[len(data)-puffinFooterTrailerSize-1] ^= 0xff
+
+	_, err := puffin.NewReader(bytes.NewReader(data))
+	require.ErrorContains(t, err, "invalid frame checksum")
+}
+
+func TestReaderRejectsLZ4CompressedFooterWithoutContentSize(t *testing.T) {
+	payload := []byte(`{"blobs":[]}`)
+	data := fileWithCompressedFooterPayloadNoSize(t, payload)
+
+	_, err := puffin.NewReader(bytes.NewReader(data))
+	require.ErrorContains(t, err, "missing content size")
+}
+
+func TestReaderRejectsUnsupportedLZ4FrameFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func([]byte)
+		wantErr string
+	}{
+		{
+			name: "version",
+			mutate: func(data []byte) {
+				data[compressedFooterLZ4FLGOffset] = data[compressedFooterLZ4FLGOffset]&^byte(0xc0) | 0x80
+			},
+			wantErr: "frame version",
+		},
+		{
+			name: "reserved FLG flag",
+			mutate: func(data []byte) {
+				data[compressedFooterLZ4FLGOffset] |= 0x02
+			},
+			wantErr: "reserved flag",
+		},
+		{
+			name: "dictionary ID",
+			mutate: func(data []byte) {
+				data[compressedFooterLZ4FLGOffset] |= 0x01
+			},
+			wantErr: "dictionary ID",
+		},
+		{
+			name: "reserved BD flags",
+			mutate: func(data []byte) {
+				data[compressedFooterLZ4BDOffset] |= 0x01
+			},
+			wantErr: "reserved block descriptor flags",
+		},
+		{
+			name: "reserved BD high flag",
+			mutate: func(data []byte) {
+				data[compressedFooterLZ4BDOffset] |= 0x80
+			},
+			wantErr: "reserved block descriptor flags",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := fileWithCompressedFooterPayload(t, []byte(`{"blobs":[]}`))
+			test.mutate(data)
+
+			_, err := puffin.NewReader(bytes.NewReader(data))
+			require.ErrorContains(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestReaderRejectsConcatenatedLZ4FooterFrames(t *testing.T) {
+	payload := []byte(`{"blobs":[]}`)
+	firstFrame := compressedLZ4Frame(t, payload, lz4.SizeOption(uint64(len(payload))))
+	emptySecondFrame := compressedLZ4Frame(t, nil)
+	data := fileWithCompressedFooterFrames(firstFrame, emptySecondFrame)
+
+	_, err := puffin.NewReader(bytes.NewReader(data))
+	require.ErrorContains(t, err, "trailing data")
+}
+
+func TestReaderEnforcesFooterSizeLimit(t *testing.T) {
+	t.Run("uncompressed JSON beyond limit", func(t *testing.T) {
+		data := fileWithFooterPayload([]byte(`{"blobs":[],"properties":{"large":"0123456789"}}`))
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(16))
+		require.ErrorContains(t, err, "footer exceeds maximum size")
+	})
+
+	t.Run("uncompressed payload at limit", func(t *testing.T) {
+		payload := []byte(`{"blobs":[]}`)
+		data := fileWithFooterPayload(payload)
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(int64(len(payload))))
+		require.NoError(t, err)
+	})
+
+	t.Run("uncompressed trailing content beyond limit", func(t *testing.T) {
+		payload := append([]byte(`{"blobs":[]}`), bytes.Repeat([]byte{' '}, 32)...)
+		data := fileWithFooterPayload(payload)
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(16))
+		require.ErrorContains(t, err, "footer exceeds maximum size")
+	})
+
+	t.Run("invalid limit is rejected for uncompressed JSON", func(t *testing.T) {
+		data := fileWithFooterPayload([]byte(`{"blobs":[]}`))
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(0))
+		require.ErrorContains(t, err, "invalid maximum footer size")
+	})
+
+	t.Run("compressed output beyond limit", func(t *testing.T) {
+		payload := append([]byte(`{"blobs":[]}`), bytes.Repeat([]byte{' '}, 32)...)
+		data := fileWithCompressedFooterPayloadWithSize(t, payload, 16)
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(16))
+		require.ErrorContains(t, err, "footer exceeds maximum size")
+	})
+
+	t.Run("compressed content size mismatch", func(t *testing.T) {
+		payload := []byte(`{"blobs":[]}`)
+		data := fileWithCompressedFooterPayloadWithSize(t, payload, uint64(len(payload)-1))
+		_, err := puffin.NewReader(bytes.NewReader(data))
+		require.ErrorContains(t, err, "decoded size")
+	})
+
+	t.Run("compressed advertised size", func(t *testing.T) {
+		payload := append([]byte(`{"blobs":[]}`), bytes.Repeat([]byte{' '}, 32)...)
+		data := fileWithCompressedFooterPayload(t, payload)
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(16))
+		require.ErrorContains(t, err, "footer exceeds maximum size")
+	})
+
+	t.Run("compressed advertised size overflow", func(t *testing.T) {
+		data := fileWithCompressedFooterPayloadWithSize(t, []byte(`{"blobs":[]}`), uint64(math.MaxInt64)+1)
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(16))
+		require.ErrorContains(t, err, "footer exceeds maximum size")
+	})
+
+	t.Run("trailing JSON is reported before size limit", func(t *testing.T) {
+		payload := []byte(`{"blobs":[]}42`)
+		data := fileWithCompressedFooterPayloadWithSize(t, payload, uint64(len(payload)-1))
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(int64(len(payload)-1)))
+		require.ErrorContains(t, err, "unexpected content after footer JSON")
+	})
+
+	t.Run("maximum int64 limit", func(t *testing.T) {
+		data := fileWithCompressedFooterPayload(t, []byte(`{"blobs":[]}`))
+		_, err := puffin.NewReader(bytes.NewReader(data), puffin.WithMaxFooterSize(math.MaxInt64))
+		require.NoError(t, err)
 	})
 }
 

@@ -27,7 +27,6 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/config"
 	"github.com/apache/iceberg-go/internal"
-	iceio "github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
 )
 
@@ -36,6 +35,15 @@ var ErrEmptyEqualityFieldIDs = errors.New("equality field IDs must not be empty"
 // equalityDeleteSchema projects a table schema to only the fields specified
 // by the given field IDs, using Schema.Select for proper nested field handling.
 func equalityDeleteSchema(tableSchema *iceberg.Schema, fieldIDs []int) (*iceberg.Schema, error) {
+	names, err := validateEqualityFieldIDs(tableSchema, fieldIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	return tableSchema.Select(true, names...)
+}
+
+func validateEqualityFieldIDs(tableSchema *iceberg.Schema, fieldIDs []int) ([]string, error) {
 	if len(fieldIDs) == 0 {
 		return nil, ErrEmptyEqualityFieldIDs
 	}
@@ -47,10 +55,31 @@ func equalityDeleteSchema(tableSchema *iceberg.Schema, fieldIDs []int) (*iceberg
 			return nil, fmt.Errorf("%w: field ID %d not found in table schema", iceberg.ErrInvalidSchema, id)
 		}
 
+		// Keep both lookups: FindColumnName returns the dotted path Schema.Select
+		// needs for nested fields, while FindFieldByID exposes the field type.
+		field, ok := tableSchema.FindFieldByID(id)
+		if !ok {
+			// Defensive only: FindColumnName already found this field ID.
+			return nil, fmt.Errorf("%w: field ID %d not found in table schema", iceberg.ErrInvalidSchema, id)
+		}
+		if isFloatingPointType(field.Type) {
+			return nil, fmt.Errorf("%w: equality field ID %d (%s) has unsupported floating-point type %s: floating-point columns cannot be used as equality delete keys",
+				iceberg.ErrInvalidSchema, id, name, field.Type)
+		}
+
 		names = append(names, name)
 	}
 
-	return tableSchema.Select(true, names...)
+	return names, nil
+}
+
+func isFloatingPointType(typ iceberg.Type) bool {
+	switch typ.(type) {
+	case iceberg.Float32Type, iceberg.Float64Type:
+		return true
+	default:
+		return false
+	}
 }
 
 // WriteEqualityDeletes writes Arrow record batches as equality delete
@@ -76,12 +105,17 @@ func equalityDeleteSchema(tableSchema *iceberg.Schema, fieldIDs []int) (*iceberg
 //	rd.AddDeletes(deleteFiles...)
 //	err = rd.Commit(ctx)
 func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs []int, records iter.Seq2[arrow.RecordBatch, error]) ([]iceberg.DataFile, error) {
-	if t.meta.formatVersion < 2 {
-		return nil, fmt.Errorf("equality deletes require table format version >= 2, got v%d",
-			t.meta.formatVersion)
+	meta, err := t.txnMeta()
+	if err != nil {
+		return nil, err
 	}
 
-	deleteSchema, err := equalityDeleteSchema(t.meta.CurrentSchema(), equalityFieldIDs)
+	if meta.formatVersion < 2 {
+		return nil, fmt.Errorf("equality deletes require table format version >= 2, got v%d",
+			meta.formatVersion)
+	}
+
+	deleteSchema, err := equalityDeleteSchema(meta.CurrentSchema(), equalityFieldIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -91,12 +125,15 @@ func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs
 		return nil, err
 	}
 
-	wfs, ok := fs.(iceio.WriteFileIO)
-	if !ok {
-		return nil, errors.New("filesystem does not support writing")
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		return nil, err
 	}
 
-	arrowSc, err := SchemaToArrowSchema(deleteSchema, nil, true, false)
+	arrowSc, err := SchemaToArrowSchemaWithOptions(deleteSchema, ArrowSchemaOptions{
+		IncludeFieldIDs: true,
+		TableProperties: meta.props,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +151,7 @@ func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs
 		counter:   internal.Counter(0),
 	}
 
-	dataFiles, err := equalityDeleteRecordsToDataFiles(ctx, t.tbl.Location(), t.meta, deleteSchema, equalityFieldIDs, args)
+	dataFiles, err := equalityDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, deleteSchema, equalityFieldIDs, args)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +166,51 @@ func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs
 	}
 
 	return result, nil
+}
+
+// CommitEqualityDeletes is a convenience wrapper that writes the given
+// records as equality delete files and stages a delete-only row delta in
+// this transaction. It composes [Transaction.WriteEqualityDeletes] with
+// [Transaction.NewRowDelta] + [RowDelta.AddDeletes] + [RowDelta.Commit],
+// so it is the delete-only shortcut for CDC/upsert workloads whose caller
+// already holds the equality-key values.
+//
+// Like the other row-level operations, the change is staged within the
+// transaction; call [Transaction.Commit] to make it durable in the
+// catalog. Conflict detection runs at that point.
+//
+// It adds no behavior of its own beyond that composition. In particular:
+//   - the format-version >= 2 requirement is enforced by WriteEqualityDeletes;
+//   - equality field IDs are validated by WriteEqualityDeletes and again by
+//     RowDelta.Commit;
+//   - concurrent-writer conflict detection is inherited from RowDelta, which
+//     validates against write.delete.isolation-level (serializable by
+//     default) when the transaction is committed.
+//
+// snapshotProps are recorded in the resulting snapshot summary. For update
+// CDC events that must commit deletes and appends in one snapshot, use the
+// lower-level RowDelta flow (AddRows + AddDeletes) directly.
+//
+// When records yields no rows, no delete files are produced and this is a
+// no-op that returns nil rather than staging an empty snapshot.
+//
+// Usage:
+//
+//	if err := tx.CommitEqualityDeletes(ctx, []int{1, 2}, records, nil); err != nil {
+//		return err
+//	}
+//	_, err := tx.Commit(ctx)
+func (t *Transaction) CommitEqualityDeletes(ctx context.Context, equalityFieldIDs []int, records iter.Seq2[arrow.RecordBatch, error], snapshotProps iceberg.Properties) error {
+	deleteFiles, err := t.WriteEqualityDeletes(ctx, equalityFieldIDs, records)
+	if err != nil {
+		return err
+	}
+
+	if len(deleteFiles) == 0 {
+		return nil
+	}
+
+	return t.NewRowDelta(snapshotProps).AddDeletes(deleteFiles...).Commit(ctx)
 }
 
 func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, meta *MetadataBuilder, deleteSchema *iceberg.Schema, equalityFieldIDs []int, args recordWritingArgs) (ret iter.Seq2[iceberg.DataFile, error], retErr error) {
@@ -158,9 +240,6 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 	targetFileSize := int64(meta.props.GetInt(WriteTargetFileSizeBytesKey,
 		WriteTargetFileSizeBytesDefault))
 
-	cw := newConcurrentDataFileWriter(newEqualityDeleteWriterMaker(deleteSchema, equalityFieldIDs),
-		withSchemaSanitization(false))
-
 	latestMetadata, err := meta.Build()
 	if err != nil {
 		return nil, err
@@ -184,11 +263,14 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 		}
 
 		partitionWriter := newPartitionedFanoutWriter(
-			partitionSpec, cw, writeSchema, args.itr, factory)
+			partitionSpec, writeSchema, args.itr, factory)
 		workers := config.EnvConfig.MaxWorkers
 
 		return partitionWriter.Write(ctx, workers), nil
 	}
+
+	cw := newConcurrentDataFileWriter(newEqualityDeleteWriterMaker(deleteSchema, equalityFieldIDs),
+		withSchemaSanitization(false))
 
 	nextCount, stopCount := iter.Pull(args.counter)
 	tasks := func(yield func(WriteTask) bool) {
@@ -205,7 +287,6 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 				FileCount:   fileCount,
 				Schema:      deleteSchema,
 				Batches:     batch,
-				SortOrderID: meta.defaultSortOrderID,
 			}
 			if !yield(t) {
 				return
@@ -221,17 +302,16 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 // writer to extract partition values from the records while keeping the delete
 // key as the equality identifier.
 func equalityDeleteWriteSchema(tableSchema *iceberg.Schema, equalityFieldIDs []int, spec iceberg.PartitionSpec) (*iceberg.Schema, error) {
+	names, err := validateEqualityFieldIDs(tableSchema, equalityFieldIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	seen := make(map[int]struct{}, len(equalityFieldIDs))
-	names := make([]string, 0, len(equalityFieldIDs))
 
 	// Equality key columns first (deterministic order).
 	for _, id := range equalityFieldIDs {
-		name, ok := tableSchema.FindColumnName(id)
-		if !ok {
-			return nil, fmt.Errorf("%w: field ID %d not found in table schema", iceberg.ErrInvalidSchema, id)
-		}
 		seen[id] = struct{}{}
-		names = append(names, name)
 	}
 
 	// Partition source columns not already in the equality key.

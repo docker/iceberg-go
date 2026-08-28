@@ -18,12 +18,14 @@
 package table
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/io"
@@ -73,17 +75,136 @@ type Update interface {
 
 type Updates []Update
 
+var requiredUpdateFields = map[string][]string{
+	UpdateAssignUUID:                {"uuid"},
+	UpdateUpgradeFormatVersion:      {"format-version"},
+	UpdateAddSchema:                 {"schema"},
+	UpdateSetCurrentSchema:          {"schema-id"},
+	UpdateAddSpec:                   {"spec"},
+	UpdateSetDefaultSpec:            {"spec-id"},
+	UpdateAddSortOrder:              {"sort-order"},
+	UpdateSetDefaultSortOrder:       {"sort-order-id"},
+	UpdateAddSnapshot:               {"snapshot"},
+	UpdateSetSnapshotRef:            {"ref-name", "type", "snapshot-id"},
+	UpdateRemoveSnapshots:           {"snapshot-ids"},
+	UpdateRemoveSnapshotRef:         {"ref-name"},
+	UpdateSetLocation:               {"location"},
+	UpdateSetProperties:             {"updates"},
+	UpdateRemoveProperties:          {"removals"},
+	UpdateRemoveSpec:                {"spec-ids"},
+	UpdateRemoveSchemas:             {"schema-ids"},
+	UpdateSetStatistics:             {"statistics"},
+	UpdateRemoveStatistics:          {"snapshot-id"},
+	UpdateSetPartitionStatistics:    {"partition-statistics"},
+	UpdateRemovePartitionStatistics: {"snapshot-id"},
+	UpdateAddEncryptionKey:          {"encryption-key"},
+	UpdateRemoveEncryptionKey:       {"key-id"},
+}
+
+func normalizeLegacyPropertyFields(action string, object map[string]json.RawMessage) bool {
+	var modern, legacy string
+	switch action {
+	case UpdateSetProperties:
+		modern, legacy = "updates", "updated"
+	case UpdateRemoveProperties:
+		modern, legacy = "removals", "removed"
+	default:
+		return false
+	}
+
+	normalized := false
+	if _, ok := object[modern]; !ok {
+		if value, ok := object[legacy]; ok {
+			object[modern] = value
+			normalized = true
+		}
+	}
+	if _, ok := object[legacy]; ok {
+		delete(object, legacy)
+		normalized = true
+	}
+
+	return normalized
+}
+
+func validateRequiredUpdateFields(action string, object map[string]json.RawMessage) error {
+	fields := requiredUpdateFields[action]
+	if len(fields) == 0 {
+		return nil
+	}
+
+	for _, field := range fields {
+		value, ok := object[field]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%w: update %q requires field %q", iceberg.ErrInvalidArgument, action, field)
+		}
+	}
+
+	return nil
+}
+
+func validateUpdateActionDecode(raw json.RawMessage) error {
+	var actionWire struct {
+		Action *string `json:"action"`
+	}
+
+	return json.Unmarshal(raw, &actionWire)
+}
+
 func (u *Updates) UnmarshalJSON(data []byte) error {
 	var rawUpdates []json.RawMessage
 	if err := json.Unmarshal(data, &rawUpdates); err != nil {
 		return err
 	}
 
+	var updates Updates
+	if len(rawUpdates) > 0 {
+		updates = make(Updates, 0, len(rawUpdates))
+	}
 	for _, raw := range rawUpdates {
-		var base baseUpdate
-		if err := json.Unmarshal(raw, &base); err != nil {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil {
 			return err
 		}
+
+		actionValue, exactAction := object["action"]
+		actionFieldCount := 0
+		caseVariantAction := false
+		for field := range object {
+			if strings.EqualFold(field, "action") {
+				actionFieldCount++
+				if field != "action" {
+					caseVariantAction = true
+				}
+			}
+		}
+
+		var action string
+		if exactAction && !caseVariantAction {
+			if bytes.Equal(bytes.TrimSpace(actionValue), []byte("null")) {
+				if err := validateUpdateActionDecode(raw); err != nil {
+					return err
+				}
+
+				return fmt.Errorf("%w: update requires field %q", iceberg.ErrInvalidArgument, "action")
+			}
+			if err := json.Unmarshal(actionValue, &action); err != nil {
+				return err
+			}
+		} else {
+			var baseWire struct {
+				Action *string `json:"action"`
+			}
+			if err := json.Unmarshal(raw, &baseWire); err != nil {
+				return err
+			}
+			if baseWire.Action == nil {
+				return fmt.Errorf("%w: update requires field %q", iceberg.ErrInvalidArgument, "action")
+			}
+			action = *baseWire.Action
+		}
+
+		base := baseUpdate{ActionName: action}
 
 		var upd Update
 		switch base.ActionName {
@@ -134,14 +255,49 @@ func (u *Updates) UnmarshalJSON(data []byte) error {
 		case UpdateRemoveEncryptionKey:
 			upd = &removeEncryptionKeyUpdate{}
 		default:
+			if err := validateUpdateActionDecode(raw); err != nil {
+				return err
+			}
+
 			return fmt.Errorf("%w: unknown update action: %s", iceberg.ErrInvalidArgument, base.ActionName)
+		}
+		if normalizeLegacyPropertyFields(base.ActionName, object) {
+			if err := validateUpdateActionDecode(raw); err != nil {
+				return err
+			}
+			if actionFieldCount > 1 {
+				for field := range object {
+					if strings.EqualFold(field, "action") {
+						delete(object, field)
+					}
+				}
+				actionJSON, err := json.Marshal(base.ActionName)
+				if err != nil {
+					return err
+				}
+				object["action"] = actionJSON
+			}
+			normalized, err := json.Marshal(object)
+			if err != nil {
+				return err
+			}
+			raw = normalized
+		}
+		if err := validateRequiredUpdateFields(base.ActionName, object); err != nil {
+			if actionErr := validateUpdateActionDecode(raw); actionErr != nil {
+				return actionErr
+			}
+
+			return err
 		}
 
 		if err := json.Unmarshal(raw, upd); err != nil {
 			return err
 		}
-		*u = append(*u, upd)
+		updates = append(updates, upd)
 	}
+
+	*u = updates
 
 	return nil
 }
@@ -233,7 +389,11 @@ func (u *setCurrentSchemaUpdate) Apply(builder *MetadataBuilder) error {
 
 type addPartitionSpecUpdate struct {
 	baseUpdate
-	Spec    *iceberg.PartitionSpec `json:"spec"`
+	// The spec arrives unbound: Apply binds it to the table's current schema,
+	// so its source IDs are only required to resolve there. A dropped
+	// partition field in particular is a void transform over source ID 0,
+	// which BindToSchema carries across but a bound decode rejects.
+	Spec    *iceberg.UnboundPartitionSpec `json:"spec"`
 	initial bool
 }
 
@@ -241,15 +401,23 @@ type addPartitionSpecUpdate struct {
 // metadata. If the initial flag is set to true, the spec is considered the initial spec of the table,
 // and all other previously added specs in the metadata builder are removed.
 func NewAddPartitionSpecUpdate(spec *iceberg.PartitionSpec, initial bool) *addPartitionSpecUpdate {
-	return &addPartitionSpecUpdate{
+	upd := &addPartitionSpecUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateAddSpec},
-		Spec:       spec,
 		initial:    initial,
 	}
+	if spec != nil {
+		upd.Spec = &iceberg.UnboundPartitionSpec{PartitionSpec: *spec}
+	}
+
+	return upd
 }
 
 func (u *addPartitionSpecUpdate) Apply(builder *MetadataBuilder) error {
-	return builder.AddPartitionSpec(u.Spec, u.initial)
+	if u.Spec == nil {
+		return fmt.Errorf("%w: update %q requires field %q", iceberg.ErrInvalidArgument, UpdateAddSpec, "spec")
+	}
+
+	return builder.AddPartitionSpec(&u.Spec.PartitionSpec, u.initial)
 }
 
 type setDefaultSpecUpdate struct {
@@ -272,7 +440,10 @@ func (u *setDefaultSpecUpdate) Apply(builder *MetadataBuilder) error {
 
 type addSortOrderUpdate struct {
 	baseUpdate
-	SortOrder *SortOrder `json:"sort-order"`
+	// Unbound so decoding accepts placeholder source IDs. Unlike the spec
+	// above, none are exempt at Apply: CheckCompatibility still requires every
+	// source ID to resolve in the current schema, so this only defers the error.
+	SortOrder *UnboundSortOrder `json:"sort-order"`
 	initial   bool
 }
 
@@ -280,14 +451,24 @@ type addSortOrderUpdate struct {
 // If the initial flag is set to true, the sort order is considered the initial sort order of the table,
 // and all previously added sort orders in the metadata builder are removed.
 func NewAddSortOrderUpdate(sortOrder *SortOrder) *addSortOrderUpdate {
-	return &addSortOrderUpdate{
+	upd := &addSortOrderUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateAddSortOrder},
-		SortOrder:  sortOrder,
 	}
+	if sortOrder != nil {
+		upd.SortOrder = &UnboundSortOrder{SortOrder: *sortOrder}
+	}
+
+	return upd
 }
 
 func (u *addSortOrderUpdate) Apply(builder *MetadataBuilder) error {
-	return builder.AddSortOrder(u.SortOrder)
+	if u.SortOrder == nil {
+		return fmt.Errorf("%w: update %q requires field %q", iceberg.ErrInvalidArgument, UpdateAddSortOrder, "sort-order")
+	}
+
+	// AddSortOrder writes the fresh order ID into the order it is given and
+	// keeps a pointer to that field, so the builder aliases this update.
+	return builder.AddSortOrder(&u.SortOrder.SortOrder)
 }
 
 type setDefaultSortOrderUpdate struct {
@@ -323,6 +504,13 @@ type addSnapshotUpdate struct {
 	// each retry snapshot correctly inherits all files committed by
 	// concurrent writers since the original build.
 	rebuildManifestList func(ctx context.Context, freshMeta Metadata, freshParent *Snapshot, fio io.WriteFileIO, attempt int) (*Snapshot, error)
+
+	// supersededSource, when non-nil, is the producer whose merged manifests a
+	// rebuild on a prior attempt wrote and a later attempt replaced. doCommit
+	// reads its accumulated paths and removes them once the commit resolves.
+	// Distinct from the manifest-LIST orphans rebuildSnapshotUpdates returns:
+	// these are the inner data manifests a rewrite re-merges on every retry.
+	supersededSource supersededAccumulator
 }
 
 // NewAddSnapshotUpdate creates a new update that adds the given snapshot to the table metadata.
@@ -469,7 +657,7 @@ func (u *removeSnapshotsUpdate) Apply(builder *MetadataBuilder) error {
 }
 
 func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table, postTable *Table) error {
-	if !u.postCommit {
+	if !u.postCommit || postTable == nil || !isGCEnabled(postTable.Properties()) {
 		return nil
 	}
 
@@ -506,10 +694,33 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		}
 	}
 
+	// Preload retained manifest lists once so the live-data-file pass below can walk them without re-fetching.
+	retainedSnapshots := postTable.Metadata().Snapshots()
+	retainedManifests := make(map[string]struct{})
+	retainedSnapshotManifests := make([]iceberg.ManifestFile, 0, len(retainedSnapshots))
+	for _, snap := range retainedSnapshots {
+		mans, err := snap.Manifests(prefs)
+		if err != nil {
+			return err
+		}
+		for _, man := range mans {
+			manPath := man.FilePath()
+			if _, ok := retainedManifests[manPath]; !ok {
+				retainedManifests[manPath] = struct{}{}
+				retainedSnapshotManifests = append(retainedSnapshotManifests, man)
+			}
+		}
+	}
+
+	// Open each orphaned manifest at most once: skip manifests that
+	// retained snapshots still reference, and dedupe across expired
+	// snapshots that share manifests by reference.
+	visitedManifests := make(map[string]struct{})
+
 	for _, snapId := range u.SnapshotIDs {
 		snap := preTable.SnapshotByID(snapId)
 		if snap == nil {
-			return errors.New("missing snapshot")
+			return fmt.Errorf("missing snapshot %d", snapId)
 		}
 
 		mans, err := snap.Manifests(prefs)
@@ -518,7 +729,17 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		}
 
 		for _, man := range mans {
-			filesToDelete[man.FilePath()] = struct{}{}
+			manPath := man.FilePath()
+
+			if _, ok := retainedManifests[manPath]; ok {
+				continue
+			}
+			if _, ok := visitedManifests[manPath]; ok {
+				continue
+			}
+			visitedManifests[manPath] = struct{}{}
+
+			filesToDelete[manPath] = struct{}{}
 
 			for entry, err := range man.Entries(prefs, false) {
 				if err != nil {
@@ -529,15 +750,10 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		}
 	}
 
-	for _, snap := range postTable.Metadata().Snapshots() {
-		mans, err := snap.Manifests(prefs)
-		if err != nil {
-			return err
-		}
-
-		for _, man := range mans {
-			delete(filesToDelete, man.FilePath())
-
+	// Keep files still referenced (non-DELETED) by retained manifests,
+	// including data files carried forward as EXISTING by manifest merges.
+	if len(filesToDelete) > 0 {
+		for _, man := range retainedSnapshotManifests {
 			for entry, err := range man.Entries(prefs, false) {
 				if err != nil {
 					return err

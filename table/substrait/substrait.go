@@ -19,8 +19,11 @@ package substrait
 
 import (
 	_ "embed"
+	"encoding/binary"
 	"fmt"
+	"sort"
 	"strings"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
 	"github.com/apache/iceberg-go"
@@ -49,9 +52,10 @@ func NewExtensionSet() exprs.ExtensionIDSet {
 	return exprs.NewExtensionSetDefault(expr.NewEmptyExtensionRegistry(collection))
 }
 
-// ConvertExpr binds the provided expression to the given schema and converts it to a
-// substrait expression so that it can be utilized for computation.
-func ConvertExpr(schema *iceberg.Schema, e iceberg.BooleanExpression, caseSensitive bool) (*expr.ExtensionRegistry, expr.Expression, error) {
+// ConvertExpr converts a bound expression to a Substrait expression so that it can
+// be utilized for computation. Case sensitivity is applied when binding; the third
+// argument is retained for API compatibility.
+func ConvertExpr(schema *iceberg.Schema, e iceberg.BooleanExpression, _ bool) (*expr.ExtensionRegistry, expr.Expression, error) {
 	base, err := ConvertSchema(schema)
 	if err != nil {
 		return nil, nil, err
@@ -60,10 +64,7 @@ func ConvertExpr(schema *iceberg.Schema, e iceberg.BooleanExpression, caseSensit
 	reg := expr.NewEmptyExtensionRegistry(collection)
 
 	bldr := expr.ExprBuilder{Reg: reg, BaseSchema: types.NewRecordTypeFromStruct(base.Struct)}
-	b, err := iceberg.VisitExpr(e, &toSubstraitExpr{
-		bldr: bldr, schema: schema,
-		caseSensitive: caseSensitive,
-	})
+	b, err := iceberg.VisitExpr(e, &toSubstraitExpr{bldr: bldr})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -135,6 +136,7 @@ func (c convertToSubstrait) Map(m iceberg.MapType, keyResult, valResult types.Ty
 }
 
 func (convertToSubstrait) Primitive(iceberg.PrimitiveType) types.Type { panic("should not be called") }
+func (convertToSubstrait) Variant(iceberg.VariantType) types.Type     { panic("should not be called") }
 
 func (convertToSubstrait) VisitFixed(f iceberg.FixedType) types.Type {
 	return &types.FixedBinaryType{Length: int32(f.Len())}
@@ -170,6 +172,22 @@ func (convertToSubstrait) VisitUnknown() types.Type {
 	return nil
 }
 
+func (convertToSubstrait) VisitGeometry(iceberg.GeometryType) types.Type {
+	return &types.BinaryType{}
+}
+
+func (convertToSubstrait) VisitGeography(iceberg.GeographyType) types.Type {
+	return &types.BinaryType{}
+}
+
+func (convertToSubstrait) VisitVariant() types.Type {
+	// Variant has no Substrait equivalent today. We return BinaryType as a
+	// structural placeholder so that schema conversion and expression binding
+	// on sibling columns don't panic with a nil type. A proper user-defined
+	// Substrait type will be needed once shredding enables predicate pushdown.
+	return &types.BinaryType{}
+}
+
 var _ iceberg.SchemaVisitorPerPrimitiveType[types.Type] = (*convertToSubstrait)(nil)
 
 var (
@@ -194,9 +212,7 @@ var (
 )
 
 type toSubstraitExpr struct {
-	schema        *iceberg.Schema
-	bldr          expr.ExprBuilder
-	caseSensitive bool
+	bldr expr.ExprBuilder
 }
 
 func (t *toSubstraitExpr) VisitTrue() expr.Builder {
@@ -226,6 +242,10 @@ func (t *toSubstraitExpr) VisitUnbound(iceberg.UnboundPredicate) expr.Builder {
 }
 
 func (t *toSubstraitExpr) VisitBound(pred iceberg.BoundPredicate) expr.Builder {
+	if _, ok := pred.Term().(*iceberg.BoundTransform); ok {
+		panic(fmt.Errorf("%w: transformed terms cannot be converted to substrait", iceberg.ErrNotImplemented))
+	}
+
 	return iceberg.VisitBoundPredicate(pred, t)
 }
 
@@ -241,12 +261,35 @@ func toByteSliceSubstraitLiteral[T []byte | types.UUID](v T) expr.Literal {
 	return expr.NewByteSliceLiteral(v, false)
 }
 
-func toDecimalLiteral(v iceberg.DecimalLiteral) expr.Literal {
-	byts, _ := v.MarshalBinary()
+// toDecimalLiteral converts an iceberg.DecimalLiteral into a Substrait decimal
+// literal. Precision is taken from the bound field's iceberg.DecimalType (typ),
+// NOT from v.Type(). DecimalLiteral does not carry the originating column's
+// precision, so v.Type() always reports a hardcoded precision of 9 (see
+// https://github.com/apache/iceberg-go/issues/1028). If typ is not a
+// DecimalType, this falls back to v.Type()'s (hardcoded) precision.
+func toDecimalLiteral(typ iceberg.Type, v iceberg.DecimalLiteral) expr.Literal {
+	precision := int32(9)
+	if dt, ok := typ.(iceberg.DecimalType); ok {
+		precision = int32(dt.Precision())
+	}
+
+	// decimal128.Num is {lo uint64, hi int64} — its raw in-memory bytes on
+	// LE hosts are already the 16-byte little-endian two's-complement
+	// representation Substrait wants. hostIsLE is a build-tag const, so the
+	// compiler drops the unused branch on every known GOARCH.
+	n := v.Value().Val
+	buf := make([]byte, 16)
+	if hostIsLE {
+		copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(&n)), 16))
+	} else {
+		binary.LittleEndian.PutUint64(buf[:8], n.LowBits())
+		binary.LittleEndian.PutUint64(buf[8:], uint64(n.HighBits()))
+	}
+
 	result, _ := expr.NewLiteral(&types.Decimal{
 		Scale:     int32(v.Scale),
-		Value:     byts,
-		Precision: int32(v.Type().(*iceberg.DecimalType).Precision()),
+		Value:     buf,
+		Precision: int32(precision),
 	}, false)
 
 	return result
@@ -276,6 +319,16 @@ func toSubstraitLiteral(typ iceberg.Type, lit iceberg.Literal) expr.Literal {
 		}
 
 		return toPrimitiveSubstraitLiteral(types.Timestamp(lit))
+	case iceberg.TimestampNsLiteral:
+		if typ.Equals(iceberg.PrimitiveTypes.TimestampTzNs) {
+			return expr.NewPrecisionTimestampTzLiteral(
+				int64(lit), types.PrecisionNanoSeconds, types.NullabilityRequired,
+			)
+		}
+
+		return expr.NewPrecisionTimestampLiteral(
+			int64(lit), types.PrecisionNanoSeconds, types.NullabilityRequired,
+		)
 	case iceberg.DateLiteral:
 		return toPrimitiveSubstraitLiteral(types.Date(lit))
 	case iceberg.TimeLiteral:
@@ -287,7 +340,7 @@ func toSubstraitLiteral(typ iceberg.Type, lit iceberg.Literal) expr.Literal {
 	case iceberg.UUIDLiteral:
 		return toByteSliceSubstraitLiteral(types.UUID(lit[:]))
 	case iceberg.DecimalLiteral:
-		return toDecimalLiteral(lit)
+		return toDecimalLiteral(typ, lit)
 	}
 	panic(fmt.Errorf("invalid literal type: %s", lit.Type()))
 }
@@ -296,6 +349,10 @@ func toSubstraitLiteralSet(typ iceberg.Type, lits []iceberg.Literal) expr.ListLi
 	if len(lits) == 0 {
 		return nil
 	}
+
+	sort.Slice(lits, func(i, j int) bool {
+		return lits[i].String() < lits[j].String()
+	})
 
 	out := make([]expr.Literal, len(lits))
 	for i, l := range lits {
@@ -306,12 +363,7 @@ func toSubstraitLiteralSet(typ iceberg.Type, lits []iceberg.Literal) expr.ListLi
 }
 
 func (t *toSubstraitExpr) getRef(ref iceberg.BoundReference) expr.Reference {
-	updatedRef, err := iceberg.Reference(ref.Field().Name).Bind(t.schema, t.caseSensitive)
-	if err != nil {
-		panic(err)
-	}
-
-	path := updatedRef.Ref().PosPath()
+	path := ref.PosPath()
 	out := expr.NewStructFieldRef(int32(path[0]))
 	if len(path) == 1 {
 		return out
@@ -351,7 +403,8 @@ func (t *toSubstraitExpr) VisitIsNan(term iceberg.BoundTerm) expr.Builder {
 
 func (t *toSubstraitExpr) VisitNotNan(term iceberg.BoundTerm) expr.Builder {
 	return t.bldr.ScalarFunc(notID).Args(
-		t.makeRefFunc(isNaNID, term).(expr.FuncArgBuilder))
+		t.makeRefFunc(isNaNID, term).(expr.FuncArgBuilder),
+	)
 }
 
 func (t *toSubstraitExpr) VisitIsNull(term iceberg.BoundTerm) expr.Builder {
@@ -397,5 +450,21 @@ func (t *toSubstraitExpr) VisitStartsWith(term iceberg.BoundTerm, lit iceberg.Li
 
 func (t *toSubstraitExpr) VisitNotStartsWith(term iceberg.BoundTerm, lit iceberg.Literal) expr.Builder {
 	return t.bldr.ScalarFunc(notID).Args(
-		t.makeLitFunc(startsWithID, term, lit).(expr.FuncArgBuilder))
+		t.makeLitFunc(startsWithID, term, lit).(expr.FuncArgBuilder),
+	)
+}
+
+// toSubstraitExpr implements the optional BoundGeospatialExprVisitor as a
+// backstop: bbox predicates are dropped to always-true during column-name
+// translation and never reach substrait, but if one ever did these panic with a
+// wrapped ErrNotImplemented (recovered into a typed, wrappable error by
+// iceberg.VisitExpr) rather than a bare string.
+var _ iceberg.BoundGeospatialExprVisitor[expr.Builder] = (*toSubstraitExpr)(nil)
+
+func (t *toSubstraitExpr) VisitBBoxIntersects(iceberg.BoundTerm, iceberg.BoundingBox) expr.Builder {
+	panic(fmt.Errorf("%w: geospatial bbox predicates cannot be converted to substrait", iceberg.ErrNotImplemented))
+}
+
+func (t *toSubstraitExpr) VisitBBoxNotIntersects(iceberg.BoundTerm, iceberg.BoundingBox) expr.Builder {
+	panic(fmt.Errorf("%w: geospatial bbox predicates cannot be converted to substrait", iceberg.ErrNotImplemented))
 }

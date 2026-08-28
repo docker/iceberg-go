@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -46,7 +47,7 @@ type RestIntegrationSuite struct {
 	cat *rest.Catalog
 }
 
-const TestNamespaceIdent = "TEST NS"
+const TestNamespaceIdent = "rest-integration-test"
 
 func (s *RestIntegrationSuite) loadCatalog(ctx context.Context) *rest.Catalog {
 	cat, err := catalog.Load(ctx, "local", iceberg.Properties{
@@ -63,6 +64,10 @@ func (s *RestIntegrationSuite) loadCatalog(ctx context.Context) *rest.Catalog {
 
 func (s *RestIntegrationSuite) SetupTest() {
 	s.ctx = context.Background()
+	if strings.Contains(s.T().Name(), "/TestScanPlanningJava") {
+		return
+	}
+
 	s.cat = s.loadCatalog(s.ctx)
 }
 
@@ -172,23 +177,20 @@ func (s *RestIntegrationSuite) TestUpdateNamespaceProps() {
 func (s *RestIntegrationSuite) TestCreateTable() {
 	s.ensureNamespace()
 
-	const location = "s3://warehouse/iceberg"
-
 	tbl, err := s.cat.CreateTable(s.ctx,
-		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
-		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
-		catalog.WithLocation(location))
+		catalog.ToIdentifier(TestNamespaceIdent, "test-create-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 
-	s.Equal(location, tbl.Location())
+	s.Equal("s3://warehouse/rest-integration-test/test-create-table", tbl.Location())
 	s.Equal("baz", tbl.Properties()["foobar"])
 
-	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table"))
+	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-create-table"))
 	s.Require().NoError(err)
 	s.True(exists)
 
-	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-create-table")))
 }
 
 func (s *RestIntegrationSuite) TestCreateView() {
@@ -292,22 +294,67 @@ func (s *RestIntegrationSuite) TestUpdateView() {
 	s.Require().NoError(s.cat.DropView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view")))
 }
 
-func (s *RestIntegrationSuite) TestWriteCommitTable() {
+func (s *RestIntegrationSuite) TestRenameView() {
 	s.ensureNamespace()
 
 	const location = "s3://warehouse/iceberg"
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
+		catalog.WithLocation(location))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	// Create a view to rename
+	fromIdent := catalog.ToIdentifier(TestNamespaceIdent, "test-view")
+	toIdent := catalog.ToIdentifier(TestNamespaceIdent, "renamed-view")
+
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM %s.%s", TestNamespaceIdent, "test-table"), "trino")
+	viewVersion, err := view.NewVersion(1, 1, []view.Representation{viewRepr}, table.Identifier{TestNamespaceIdent})
+	s.Require().NoError(err)
+
+	created, err := s.cat.CreateView(s.ctx, fromIdent, viewVersion, tableSchemaSimple,
+		catalog.WithViewProperties(iceberg.Properties{"foobar": "baz"}))
+	s.Require().NoError(err)
+
+	// Rename it
+	renamed, err := s.cat.RenameView(s.ctx, fromIdent, toIdent)
+	s.Require().NoError(err)
+	s.Equal(toIdent, renamed.Identifier())
+	s.Equal(created.Metadata().ViewUUID(), renamed.Metadata().ViewUUID())
+	// A rename moves the pointer, it must not rewrite the metadata.
+	s.Equal(created.MetadataLocation(), renamed.MetadataLocation())
+
+	// The old name is gone, the new one exists
+	exists, err := s.cat.CheckViewExists(s.ctx, fromIdent)
+	s.Require().NoError(err)
+	s.False(exists)
+
+	exists, err = s.cat.CheckViewExists(s.ctx, toIdent)
+	s.Require().NoError(err)
+	s.True(exists)
+
+	// Cleanup
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
+	s.Require().NoError(s.cat.DropView(s.ctx, toIdent))
+}
+
+func (s *RestIntegrationSuite) TestWriteCommitTable() {
+	s.ensureNamespace()
+
+	const expectedLocation = "s3://warehouse/rest-integration-test/test-write-commit-table"
 
 	tbl, err := s.cat.CreateTable(s.ctx,
-		catalog.ToIdentifier(TestNamespaceIdent, "test-table-2"),
-		tableSchemaNested, catalog.WithLocation(location))
+		catalog.ToIdentifier(TestNamespaceIdent, "test-write-commit-table"),
+		tableSchemaNested)
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 
 	defer func() {
-		s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table-2")))
+		s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-write-commit-table")))
 	}()
 
-	s.Equal(location, tbl.Location())
+	s.Equal(expectedLocation, tbl.Location())
 
 	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
 	s.Require().NoError(err)
@@ -328,7 +375,7 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 	s.Require().NoError(err)
 	defer table.Release()
 
-	pqfile, err := url.JoinPath(location, "data", "test_commit_table_data", "test.parquet")
+	pqfile, err := url.JoinPath(expectedLocation, "data", "test_commit_table_data", "test.parquet")
 	s.Require().NoError(err)
 
 	fw, err := mustFS(s.T(), tbl).(io.WriteFileIO).Create(pqfile)

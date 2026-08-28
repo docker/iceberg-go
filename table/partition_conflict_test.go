@@ -174,48 +174,112 @@ func buildPartitionedContext(
 	return ctx
 }
 
-// ---------------------------------------------------------------------------
-// anyToLiteral
-// ---------------------------------------------------------------------------
-
-func TestAnyToLiteral_SupportedTypes(t *testing.T) {
-	cases := []struct {
-		name string
-		v    any
-	}{
-		{"bool", true},
-		{"int32", int32(42)},
-		{"int64", int64(42)},
-		{"float32", float32(1.5)},
-		{"float64", float64(1.5)},
-		{"string", "hello"},
-		{"bytes", []byte{0x01}},
-		{"Date", iceberg.Date(100)},
-		{"Time", iceberg.Time(1000)},
-		{"Timestamp", iceberg.Timestamp(9999)},
-		// TimestampNano: arm in anyToLiteral was unreachable from the manifest read path
-		// because convertAvroValueToIcebergType had no timestamp-nanos case; now fixed.
-		{"TimestampNano", iceberg.TimestampNano(9999)},
-		{"UUID", uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")},
-		// DecimalLiteral is the named type returned by convertAvroValueToIcebergType
-		// (type DecimalLiteral Decimal). It must be accepted without falling through
-		// to the default error branch.
-		{"DecimalLiteral", iceberg.DecimalLiteral{Scale: 2}},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			lit, err := anyToLiteral(tc.v)
-			require.NoError(t, err)
-			assert.NotNil(t, lit)
-		})
-	}
+type countingPartitionConflictMetadata struct {
+	Metadata
+	specOverrides        map[int]*iceberg.PartitionSpec
+	currentSchemaCalls   int
+	partitionSpecIDCalls int
 }
 
-func TestAnyToLiteral_UnsupportedType(t *testing.T) {
-	_, err := anyToLiteral(struct{}{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported partition value type")
+func (m *countingPartitionConflictMetadata) CurrentSchema() *iceberg.Schema {
+	m.currentSchemaCalls++
+
+	return m.Metadata.CurrentSchema()
+}
+
+func (m *countingPartitionConflictMetadata) PartitionSpecByID(id int) *iceberg.PartitionSpec {
+	m.partitionSpecIDCalls++
+	if spec, ok := m.specOverrides[id]; ok {
+		return spec
+	}
+
+	return m.Metadata.PartitionSpecByID(id)
+}
+
+func equalityDeleteTestFile(
+	t *testing.T,
+	spec iceberg.PartitionSpec,
+	path string,
+	partition map[int]any,
+) iceberg.DataFile {
+	t.Helper()
+
+	builder, err := iceberg.NewDataFileBuilder(
+		spec,
+		iceberg.EntryContentEqDeletes,
+		path,
+		iceberg.ParquetFile,
+		partition,
+		nil,
+		nil,
+		1,
+		1024,
+	)
+	require.NoError(t, err)
+
+	return builder.Build()
+}
+
+func TestEqDeletePartitionsToFilterDeduplicatesPartitions(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "region", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	meta := partitionedConflictMeta(t, schema, 2, nil)
+	spec := meta.PartitionSpec()
+	fieldID := spec.Field(0).FieldID
+	countingMeta := &countingPartitionConflictMetadata{Metadata: meta}
+
+	files := []iceberg.DataFile{
+		equalityDeleteTestFile(t, spec, "eq-us-1.parquet", map[int]any{fieldID: "us-east-1"}),
+		equalityDeleteTestFile(t, spec, "eq-us-2.parquet", map[int]any{fieldID: "us-east-1"}),
+		equalityDeleteTestFile(t, spec, "eq-eu.parquet", map[int]any{fieldID: "eu-west-1"}),
+		equalityDeleteTestFile(t, spec, "eq-us-3.parquet", map[int]any{fieldID: "us-east-1"}),
+	}
+
+	filter, err := eqDeletePartitionsToFilter(files, countingMeta)
+	require.NoError(t, err)
+
+	expected := iceberg.NewOr(
+		iceberg.EqualTo(iceberg.Reference("region"), "us-east-1"),
+		iceberg.EqualTo(iceberg.Reference("region"), "eu-west-1"),
+	)
+	assert.True(t, filter.Equals(expected), "duplicate equality-delete partitions should produce one filter term")
+	assert.Equal(t, 1, countingMeta.currentSchemaCalls,
+		"the current schema should be cloned once per filter")
+	assert.Equal(t, 1, countingMeta.partitionSpecIDCalls,
+		"each partition spec should be resolved once per filter")
+}
+
+func TestEqDeletePartitionsToFilterKeepsSpecIDsDistinct(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "region", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	meta := partitionedConflictMeta(t, schema, 1, nil)
+	specA := meta.PartitionSpec()
+	specB := iceberg.NewPartitionSpecID(1, iceberg.PartitionField{
+		FieldID:   specA.Field(0).FieldID,
+		SourceIDs: []int{1},
+		Name:      "region_v2",
+		Transform: iceberg.IdentityTransform{},
+	})
+	countingMeta := &countingPartitionConflictMetadata{
+		Metadata:      meta,
+		specOverrides: map[int]*iceberg.PartitionSpec{specB.ID(): &specB},
+	}
+
+	files := []iceberg.DataFile{
+		equalityDeleteTestFile(t, specA, "eq-a.parquet", map[int]any{specA.Field(0).FieldID: "us-east-1"}),
+		equalityDeleteTestFile(t, specB, "eq-b.parquet", map[int]any{specB.Field(0).FieldID: "us-east-1"}),
+	}
+
+	filter, err := eqDeletePartitionsToFilter(files, countingMeta)
+	require.NoError(t, err)
+
+	leaf := iceberg.EqualTo(iceberg.Reference("region"), "us-east-1")
+	expected := iceberg.NewOr(leaf, leaf)
+	assert.True(t, filter.Equals(expected),
+		"identical partition values under different specs must remain separate terms")
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +398,42 @@ func TestRowDeltaValidate_SamePartitionRejected(t *testing.T) {
 		spec, iceberg.EntryContentEqDeletes,
 		dir+"/us-eq-del.parquet", iceberg.ParquetFile,
 		usPartition, nil, nil, 1, 1024,
+	)
+	require.NoError(t, err)
+
+	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrConflictingDataFiles)
+}
+
+func TestRowDeltaValidate_NullIdentityPartitionRejected(t *testing.T) {
+	dir := filepath.ToSlash(t.TempDir())
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "dt", Type: iceberg.PrimitiveTypes.Date},
+	)
+
+	writerBaseID := int64(249)
+	baseMeta := partitionedConflictMeta(t, schema, 2, &writerBaseID)
+	concSnapshotID := int64(250)
+
+	spec := baseMeta.PartitionSpec()
+
+	nullPartition := map[int]any{}
+	for _, pf := range spec.Fields() {
+		nullPartition[pf.FieldID] = nil
+	}
+	mf := writeTestManifest(t, dir, spec, schema, concSnapshotID, nullPartition, dir+"/null-dt-data.parquet")
+	listPath := writeTestManifestList(t, dir, concSnapshotID, []iceberg.ManifestFile{mf})
+
+	ctx := buildPartitionedContext(t, baseMeta, listPath, writerBaseID, concSnapshotID)
+	require.Len(t, ctx.concurrent, 1)
+
+	eqDf, err := iceberg.NewDataFileBuilder(
+		spec, iceberg.EntryContentEqDeletes,
+		dir+"/null-dt-eq-del.parquet", iceberg.ParquetFile,
+		nullPartition, nil, nil, 1, 1024,
 	)
 	require.NoError(t, err)
 

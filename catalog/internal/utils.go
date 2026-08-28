@@ -74,8 +74,8 @@ func WriteTableMetadata(metadata table.Metadata, fs icebergio.WriteFileIO, loc s
 	return
 }
 
-func WriteMetadata(ctx context.Context, metadata table.Metadata, loc string, props iceberg.Properties) error {
-	fs, err := icebergio.LoadFS(ctx, props, loc)
+func WriteMetadata(ctx context.Context, tbl *table.Table) error {
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return err
 	}
@@ -85,9 +85,9 @@ func WriteMetadata(ctx context.Context, metadata table.Metadata, loc string, pro
 		return errors.New("filesystem IO does not support writing")
 	}
 
-	compression := props.Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
+	compression := tbl.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
 
-	return WriteTableMetadata(metadata, wfs, loc, compression)
+	return WriteTableMetadata(tbl.Metadata(), wfs, tbl.MetadataLocation(), compression)
 }
 
 func UpdateTableMetadata(base table.Metadata, updates []table.Update, metadataLoc string) (table.Metadata, error) {
@@ -95,6 +95,40 @@ func UpdateTableMetadata(base table.Metadata, updates []table.Update, metadataLo
 }
 
 func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nspropsFn GetNamespacePropsFn, ident table.Identifier, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) (table.StagedTable, error) {
+	return createStagedTable(ctx, catprops, nspropsFn, ident, "", sc, opts...)
+}
+
+// CreateStagedTableWithNamespaceKey creates a staged table using namespaceKey
+// in its default warehouse location while retaining ident's namespace
+// components for namespace property lookup.
+func CreateStagedTableWithNamespaceKey(
+	ctx context.Context,
+	catprops iceberg.Properties,
+	nspropsFn GetNamespacePropsFn,
+	ident table.Identifier,
+	namespaceKey string,
+	sc *iceberg.Schema,
+	opts ...catalog.CreateTableOpt,
+) (table.StagedTable, error) {
+	return createStagedTable(ctx, catprops, nspropsFn, ident, namespaceKey, sc, opts...)
+}
+
+func createStagedTable(
+	ctx context.Context,
+	catprops iceberg.Properties,
+	nspropsFn GetNamespacePropsFn,
+	ident table.Identifier,
+	namespaceKey string,
+	sc *iceberg.Schema,
+	opts ...catalog.CreateTableOpt,
+) (table.StagedTable, error) {
+	if len(ident) < 2 {
+		return table.StagedTable{}, fmt.Errorf("%w: missing namespace or invalid identifier %v", catalog.ErrNoSuchNamespace, ident)
+	}
+	if err := catalog.ValidateTableIdentifier(ident); err != nil {
+		return table.StagedTable{}, err
+	}
+
 	var cfg catalog.CreateTableCfg
 	for _, opt := range opts {
 		opt(&cfg)
@@ -102,9 +136,12 @@ func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nsprops
 
 	dbIdent := catalog.NamespaceFromIdent(ident)
 	tblname := catalog.TableNameFromIdent(ident)
-	dbname := strings.Join(dbIdent, ".")
+	if namespaceKey == "" {
+		namespaceKey = strings.Join(dbIdent, ".")
+	}
 
-	loc, err := ResolveTableLocation(ctx, cfg.Location, dbname, tblname, catprops, nspropsFn)
+	loc, err := ResolveTableLocationWithNamespace(
+		ctx, cfg.Location, dbIdent, namespaceKey, tblname, catprops, nspropsFn)
 	if err != nil {
 		return table.StagedTable{}, err
 	}
@@ -125,6 +162,9 @@ func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nsprops
 	}
 
 	ioProps := maps.Clone(catprops)
+	if ioProps == nil {
+		ioProps = iceberg.Properties{}
+	}
 	maps.Copy(ioProps, cfg.Properties)
 
 	return table.StagedTable{
@@ -140,26 +180,45 @@ func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nsprops
 
 type GetNamespacePropsFn func(context.Context, table.Identifier) (iceberg.Properties, error)
 
-func ResolveTableLocation(ctx context.Context, loc, dbname, tablename string, catprops iceberg.Properties, nsprops GetNamespacePropsFn) (string, error) {
+func ResolveTableLocation(
+	ctx context.Context,
+	loc, dbname, tablename string,
+	catprops iceberg.Properties,
+	nsprops GetNamespacePropsFn,
+) (string, error) {
+	return ResolveTableLocationWithNamespace(
+		ctx, loc, strings.Split(dbname, "."), dbname, tablename, catprops, nsprops)
+}
+
+// ResolveTableLocationWithNamespace keeps namespace property lookup component-aware
+// while allowing catalogs to provide a distinct key for the default warehouse path.
+func ResolveTableLocationWithNamespace(
+	ctx context.Context,
+	loc string,
+	namespace table.Identifier,
+	namespaceKey, tablename string,
+	catprops iceberg.Properties,
+	nsprops GetNamespacePropsFn,
+) (string, error) {
 	if len(loc) == 0 {
-		dbprops, err := nsprops(ctx, strings.Split(dbname, "."))
+		dbprops, err := nsprops(ctx, namespace)
 		if err != nil {
 			return "", err
 		}
 
-		return getDefaultWarehouseLocation(dbname, tablename, dbprops, catprops)
+		return getDefaultWarehouseLocation(namespaceKey, tablename, dbprops, catprops)
 	}
 
 	return strings.TrimSuffix(loc, "/"), nil
 }
 
-func getDefaultWarehouseLocation(dbname, tablename string, nsprops, catprops iceberg.Properties) (string, error) {
+func getDefaultWarehouseLocation(namespaceKey, tablename string, nsprops, catprops iceberg.Properties) (string, error) {
 	if dblocation := nsprops.Get("location", ""); dblocation != "" {
 		return url.JoinPath(dblocation, tablename)
 	}
 
 	if warehousepath := catprops.Get("warehouse", ""); warehousepath != "" {
-		return url.JoinPath(warehousepath, dbname+".db", tablename)
+		return url.JoinPath(warehousepath, namespaceKey+".db", tablename)
 	}
 
 	return "", errors.New("no default path set, please specify a location when creating a table")
@@ -169,19 +228,29 @@ func getDefaultWarehouseLocation(dbname, tablename string, nsprops, catprops ice
 // -                -> separator
 // ([\w-]{36})      -> UUID (36 characters, including hyphens)
 // (?:\.\w+)?       -> optional codec name
-// \.metadata\.json -> file extension
-var tableMetadataFileNameRegex = regexp.MustCompile(`^(\d+)-([\w-]{36})(?:\.\w+)?\.metadata\.json`)
+// \.metadata\.json -> file extension at the end of the filename
+var (
+	tableMetadataFileNameRegex       = regexp.MustCompile(`^(\d+)-([\w-]{36})(?:\.\w+)?\.metadata\.json$`)
+	legacyTableMetadataFileNameRegex = regexp.MustCompile(`^v(\d+)(?:\.gz)?\.metadata\.json$`)
+)
 
 func ParseMetadataVersion(location string) int {
-	fileName := path.Base(location)
-	matches := tableMetadataFileNameRegex.FindStringSubmatch(fileName)
-
-	if len(matches) != 3 {
+	if strings.HasSuffix(location, "/") {
 		return -1
 	}
 
-	if _, err := uuid.Parse(matches[2]); err != nil {
-		return -1
+	fileName := path.Base(location)
+	matches := tableMetadataFileNameRegex.FindStringSubmatch(fileName)
+
+	if len(matches) == 3 {
+		if _, err := uuid.Parse(matches[2]); err != nil {
+			return -1
+		}
+	} else {
+		matches = legacyTableMetadataFileNameRegex.FindStringSubmatch(fileName)
+		if len(matches) != 2 {
+			return -1
+		}
 	}
 
 	v, err := strconv.Atoi(matches[1])
@@ -192,25 +261,34 @@ func ParseMetadataVersion(location string) int {
 	return v
 }
 
-func UpdateAndStageTable(ctx context.Context, current *table.Table, ident table.Identifier, reqs []table.Requirement, updates []table.Update, cat table.CatalogIO) (*table.StagedTable, error) {
+func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, current *table.Table, ident table.Identifier, reqs []table.Requirement, updates []table.Update, cat table.CatalogIO) (*table.StagedTable, error) {
 	var (
-		baseMeta    table.Metadata
-		metadataLoc string
+		baseMeta        table.Metadata
+		currentMetadata table.Metadata
+		metadataLoc     string
 	)
 
 	if current != nil {
-		for _, r := range reqs {
-			if err := r.Validate(current.Metadata()); err != nil {
-				return nil, err
-			}
-		}
-
-		baseMeta = current.Metadata()
+		currentMetadata = current.Metadata()
+		baseMeta = currentMetadata
 		metadataLoc = current.MetadataLocation()
 	} else {
 		var err error
 		baseMeta, err = table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", nil)
 		if err != nil {
+			return nil, err
+		}
+	}
+	newVersion := 0
+	if current != nil {
+		metadataVersion := ParseMetadataVersion(metadataLoc)
+		if metadataVersion < 0 {
+			return nil, fmt.Errorf("invalid metadata location: %s", metadataLoc)
+		}
+		newVersion = metadataVersion + 1
+	}
+	for _, r := range reqs {
+		if err := r.Validate(currentMetadata); err != nil {
 			return nil, err
 		}
 	}
@@ -225,18 +303,23 @@ func UpdateAndStageTable(ctx context.Context, current *table.Table, ident table.
 		return nil, err
 	}
 
-	newVersion := ParseMetadataVersion(metadataLoc) + 1
 	newLocation, err := provider.NewTableMetadataFileLocation(newVersion)
 	if err != nil {
 		return nil, err
 	}
+
+	ioProps := maps.Clone(catprops)
+	if ioProps == nil {
+		ioProps = iceberg.Properties{}
+	}
+	maps.Copy(ioProps, updated.Properties())
 
 	return &table.StagedTable{
 		Table: table.New(
 			ident,
 			updated,
 			newLocation,
-			icebergio.LoadFSFunc(updated.Properties(), newLocation),
+			icebergio.LoadFSFunc(ioProps, newLocation),
 			cat,
 		),
 	}, nil

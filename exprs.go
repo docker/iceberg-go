@@ -19,8 +19,10 @@ package iceberg
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 
+	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/google/uuid"
 )
 
@@ -58,6 +60,12 @@ const (
 	OpNot // Not
 	OpAnd // And
 	OpOr  // Or
+	// geospatial ops. Kept after the boolean ops so the group ranges above
+	// (used for quick op-kind validation) are undisturbed. These have their own
+	// predicate constructor (BBoxIntersects) rather than belonging to the
+	// unary/literal/set groups.
+	OpBBoxIntersects    // BBoxIntersects
+	OpBBoxNotIntersects // BBoxNotIntersects
 )
 
 // Negate returns the inverse operation for a given op
@@ -91,6 +99,10 @@ func (op Operation) Negate() Operation {
 		return OpNotStartsWith
 	case OpNotStartsWith:
 		return OpStartsWith
+	case OpBBoxIntersects:
+		return OpBBoxNotIntersects
+	case OpBBoxNotIntersects:
+		return OpBBoxIntersects
 	default:
 		panic("no negation for operation " + op.String())
 	}
@@ -442,14 +454,18 @@ func createBoundRef(field NestedField, acc accessor) BoundReference {
 		return &boundRef[Time]{field: field, acc: acc}
 	case TimestampType, TimestampTzType:
 		return &boundRef[Timestamp]{field: field, acc: acc}
+	case TimestampNsType, TimestampTzNsType:
+		return &boundRef[TimestampNano]{field: field, acc: acc}
 	case StringType:
 		return &boundRef[string]{field: field, acc: acc}
-	case FixedType, BinaryType:
+	case FixedType, BinaryType, GeographyType, GeometryType:
 		return &boundRef[[]byte]{field: field, acc: acc}
 	case DecimalType:
 		return &boundRef[Decimal]{field: field, acc: acc}
 	case UUIDType:
 		return &boundRef[uuid.UUID]{field: field, acc: acc}
+	case VariantType:
+		return &boundRef[variant.Value]{field: field, acc: acc}
 	}
 	panic("unhandled bound reference type: " + field.Type.String())
 }
@@ -571,15 +587,26 @@ func (up *unboundUnaryPredicate) Bind(schema *Schema, caseSensitive bool) (Boole
 	if err != nil {
 		return nil, err
 	}
-
 	// fast case optimizations
 	switch up.op {
 	case OpIsNull:
-		if bound.Ref().Field().Required && !schema.FieldHasOptionalParent(bound.Ref().Field().ID) {
+		if transform, ok := bound.(*BoundTransform); ok {
+			if _, alwaysNull := transform.transform.(VoidTransform); alwaysNull {
+				return AlwaysTrue{}, nil
+			}
+		}
+		if ref, ok := bound.(BoundReference); ok &&
+			ref.Field().Required && !schema.FieldHasOptionalParent(ref.Field().ID) {
 			return AlwaysFalse{}, nil
 		}
 	case OpNotNull:
-		if bound.Ref().Field().Required && !schema.FieldHasOptionalParent(bound.Ref().Field().ID) {
+		if transform, ok := bound.(*BoundTransform); ok {
+			if _, alwaysNull := transform.transform.(VoidTransform); alwaysNull {
+				return AlwaysFalse{}, nil
+			}
+		}
+		if ref, ok := bound.(BoundReference); ok &&
+			ref.Field().Required && !schema.FieldHasOptionalParent(ref.Field().ID) {
 			return AlwaysTrue{}, nil
 		}
 	case OpIsNan:
@@ -602,14 +629,8 @@ type BoundUnaryPredicate interface {
 	AsUnbound(Reference) UnboundPredicate
 }
 
-type bound[T LiteralType] interface {
-	BoundTerm
-
-	eval(StructLike) Optional[T]
-}
-
 func newBoundUnaryPred[T LiteralType](op Operation, term BoundTerm) BoundUnaryPredicate {
-	return &boundUnaryPredicate[T]{op: op, term: term.(bound[T])}
+	return &boundUnaryPredicate[T]{op: op, term: term}
 }
 
 func createBoundUnaryPredicate(op Operation, term BoundTerm) BoundUnaryPredicate {
@@ -630,25 +651,29 @@ func createBoundUnaryPredicate(op Operation, term BoundTerm) BoundUnaryPredicate
 		return newBoundUnaryPred[Time](op, term)
 	case TimestampType, TimestampTzType:
 		return newBoundUnaryPred[Timestamp](op, term)
+	case TimestampNsType, TimestampTzNsType:
+		return newBoundUnaryPred[TimestampNano](op, term)
 	case StringType:
 		return newBoundUnaryPred[string](op, term)
-	case FixedType, BinaryType:
+	case FixedType, BinaryType, GeographyType, GeometryType:
 		return newBoundUnaryPred[[]byte](op, term)
 	case DecimalType:
 		return newBoundUnaryPred[Decimal](op, term)
 	case UUIDType:
 		return newBoundUnaryPred[uuid.UUID](op, term)
+	case VariantType:
+		return newBoundUnaryPred[variant.Value](op, term)
 	}
 	panic("unhandled bound reference type: " + term.Type().String())
 }
 
 type boundUnaryPredicate[T LiteralType] struct {
 	op   Operation
-	term bound[T]
+	term BoundTerm
 }
 
 func (bp *boundUnaryPredicate[T]) AsUnbound(r Reference) UnboundPredicate {
-	return &unboundUnaryPredicate{op: bp.op, term: r}
+	return &unboundUnaryPredicate{op: bp.op, term: unboundTermForBound(bp.term, r)}
 }
 
 func (bp *boundUnaryPredicate[T]) Equals(other BooleanExpression) bool {
@@ -721,7 +746,6 @@ func (ul *unboundLiteralPredicate) Bind(schema *Schema, caseSensitive bool) (Boo
 	if err != nil {
 		return nil, err
 	}
-
 	if (ul.op == OpStartsWith || ul.op == OpNotStartsWith) &&
 		(!bound.Type().Equals(PrimitiveTypes.String) && !bound.Type().Equals(PrimitiveTypes.Binary)) {
 		return nil, fmt.Errorf("%w: StartsWith and NotStartsWith must bind to String type, not %s",
@@ -764,7 +788,7 @@ type BoundLiteralPredicate interface {
 
 func newBoundLiteralPredicate[T LiteralType](op Operation, term BoundTerm, lit Literal) BoundPredicate {
 	return &boundLiteralPredicate[T]{
-		op: op, term: term.(bound[T]),
+		op: op, term: term,
 		lit: lit.(TypedLiteral[T]),
 	}
 }
@@ -792,14 +816,18 @@ func createBoundLiteralPredicate(op Operation, term BoundTerm, lit Literal) (Bou
 		return newBoundLiteralPredicate[Time](op, term, finalLit), nil
 	case TimestampType, TimestampTzType:
 		return newBoundLiteralPredicate[Timestamp](op, term, finalLit), nil
+	case TimestampNsType, TimestampTzNsType:
+		return newBoundLiteralPredicate[TimestampNano](op, term, finalLit), nil
 	case StringType:
 		return newBoundLiteralPredicate[string](op, term, finalLit), nil
-	case FixedType, BinaryType:
+	case FixedType, BinaryType, GeographyType, GeometryType:
 		return newBoundLiteralPredicate[[]byte](op, term, finalLit), nil
 	case DecimalType:
 		return newBoundLiteralPredicate[Decimal](op, term, finalLit), nil
 	case UUIDType:
 		return newBoundLiteralPredicate[uuid.UUID](op, term, finalLit), nil
+	case VariantType:
+		return nil, fmt.Errorf("%w: ordered predicates are not supported on variant fields", ErrInvalidArgument)
 	}
 
 	return nil, fmt.Errorf("%w: could not create bound literal predicate for term type %s",
@@ -808,7 +836,7 @@ func createBoundLiteralPredicate(op Operation, term BoundTerm, lit Literal) (Bou
 
 type boundLiteralPredicate[T LiteralType] struct {
 	op   Operation
-	term bound[T]
+	term BoundTerm
 	lit  TypedLiteral[T]
 }
 
@@ -832,7 +860,7 @@ func (blp *boundLiteralPredicate[T]) String() string {
 }
 func (blp *boundLiteralPredicate[T]) Literal() Literal { return blp.lit }
 func (blp *boundLiteralPredicate[T]) AsUnbound(r Reference, l Literal) UnboundPredicate {
-	return &unboundLiteralPredicate{op: blp.op, term: r, lit: l}
+	return &unboundLiteralPredicate{op: blp.op, term: unboundTermForBound(blp.term, r), lit: l}
 }
 
 // SetPredicate creates a boolean expression representing a predicate that uses a set
@@ -917,13 +945,17 @@ type BoundSetPredicate interface {
 func createBoundSetPredicate(op Operation, term BoundTerm, lits Set[Literal]) (BooleanExpression, error) {
 	boundType := term.Type()
 
-	typedSet := newLiteralSet()
+	typedSet := make(literalSet, lits.Len())
 	for _, v := range lits.Members() {
 		casted, err := v.To(boundType)
 		if err != nil {
 			return nil, err
 		}
-		typedSet.Add(casted)
+		switch casted.(type) {
+		case AboveMaxLiteral, BelowMinLiteral:
+			continue
+		}
+		typedSet.Add(cloneBoundLiteral(casted))
 	}
 
 	switch typedSet.Len() {
@@ -960,9 +992,11 @@ func createBoundSetPredicate(op Operation, term BoundTerm, lits Set[Literal]) (B
 		return newBoundSetPredicate[Time](op, term, typedSet), nil
 	case TimestampType, TimestampTzType:
 		return newBoundSetPredicate[Timestamp](op, term, typedSet), nil
+	case TimestampNsType, TimestampTzNsType:
+		return newBoundSetPredicate[TimestampNano](op, term, typedSet), nil
 	case StringType:
 		return newBoundSetPredicate[string](op, term, typedSet), nil
-	case BinaryType, FixedType:
+	case BinaryType, FixedType, GeographyType, GeometryType:
 		return newBoundSetPredicate[[]byte](op, term, typedSet), nil
 	case DecimalType:
 		return newBoundSetPredicate[Decimal](op, term, typedSet), nil
@@ -974,14 +1008,64 @@ func createBoundSetPredicate(op Operation, term BoundTerm, lits Set[Literal]) (B
 		ErrType, term.Type())
 }
 
-func newBoundSetPredicate[T LiteralType](op Operation, term BoundTerm, lits Set[Literal]) *boundSetPredicate[T] {
-	return &boundSetPredicate[T]{op: op, term: term.(bound[T]), lits: lits}
+func newBoundSetPredicate[T LiteralType](op Operation, term BoundTerm, lits literalSet) *boundSetPredicate[T] {
+	predicate := &boundSetPredicate[T]{op: op, term: term, lits: lits}
+	if op == OpIn {
+		predicate.minLiteral, predicate.maxLiteral, predicate.hasExtrema = literalSetExtrema[T](lits)
+	}
+
+	return predicate
 }
 
 type boundSetPredicate[T LiteralType] struct {
-	op   Operation
-	term bound[T]
-	lits Set[Literal]
+	op         Operation
+	term       BoundTerm
+	lits       Set[Literal]
+	minLiteral Literal
+	maxLiteral Literal
+	hasExtrema bool
+}
+
+func literalSetExtrema[T LiteralType](lits literalSet) (minLit, maxLit Literal, ok bool) {
+	var (
+		cmp                Comparator[T]
+		minValue, maxValue T
+		valid              = true
+	)
+
+	lits.All(func(lit Literal) bool {
+		typed, typeOK := lit.(TypedLiteral[T])
+		if !typeOK {
+			valid = false
+
+			return false
+		}
+
+		value := typed.Value()
+		if !ok {
+			cmp = typed.Comparator()
+			minLit, maxLit = lit, lit
+			minValue, maxValue = value, value
+			ok = true
+
+			return true
+		}
+
+		if cmp(value, minValue) < 0 {
+			minLit, minValue = lit, value
+		}
+		if cmp(value, maxValue) > 0 {
+			maxLit, maxValue = lit, value
+		}
+
+		return true
+	})
+
+	if !valid {
+		return nil, nil, false
+	}
+
+	return minLit, maxLit, ok
 }
 
 func (bsp *boundSetPredicate[T]) Equals(other BooleanExpression) bool {
@@ -997,7 +1081,8 @@ func (bsp *boundSetPredicate[T]) Equals(other BooleanExpression) bool {
 func (bsp *boundSetPredicate[T]) Op() Operation { return bsp.op }
 func (bsp *boundSetPredicate[T]) Negate() BooleanExpression {
 	return &boundSetPredicate[T]{
-		op: bsp.op.Negate(), term: bsp.term,
+		op:   bsp.op.Negate(),
+		term: bsp.term,
 		lits: bsp.lits,
 	}
 }
@@ -1012,17 +1097,17 @@ func (bsp *boundSetPredicate[T]) AsUnbound(r Reference, lits []Literal) UnboundP
 	if litSet.Len() == 1 {
 		switch bsp.op {
 		case OpIn:
-			return LiteralPredicate(OpEQ, r, lits[0])
+			return LiteralPredicate(OpEQ, unboundTermForBound(bsp.term, r), lits[0])
 		case OpNotIn:
-			return LiteralPredicate(OpNEQ, r, lits[0])
+			return LiteralPredicate(OpNEQ, unboundTermForBound(bsp.term, r), lits[0])
 		}
 	}
 
-	return &unboundSetPredicate{op: bsp.op, term: r, lits: litSet}
+	return &unboundSetPredicate{op: bsp.op, term: unboundTermForBound(bsp.term, r), lits: litSet}
 }
 
 func (bsp *boundSetPredicate[T]) Literals() Set[Literal] {
-	return bsp.lits
+	return cloneBoundLiteralSet(bsp.lits)
 }
 
 type BoundTransform struct {
@@ -1054,4 +1139,289 @@ func (b *BoundTransform) evalToLiteral(st StructLike) Optional[Literal] {
 
 func (b *BoundTransform) evalIsNull(st StructLike) bool {
 	return !b.evalToLiteral(st).Valid
+}
+
+func unboundTermForBound(term BoundTerm, ref Reference) UnboundTerm {
+	if transform, ok := term.(*BoundTransform); ok {
+		return NewUnboundTransform(transform.transform, ref)
+	}
+
+	return ref
+}
+
+// UnboundTransform is a transform applied to a term, not yet bound to a schema;
+// the unbound counterpart of BoundTransform. It's what a transform term in a
+// REST expression (e.g. bucket[16](id)) parses into.
+type UnboundTransform struct {
+	transform Transform
+	term      UnboundTerm
+}
+
+func NewUnboundTransform(transform Transform, term UnboundTerm) *UnboundTransform {
+	return &UnboundTransform{transform: transform, term: term}
+}
+
+func (*UnboundTransform) isTerm() {}
+func (u *UnboundTransform) String() string {
+	if u == nil {
+		return "UnboundTransform(<nil>)"
+	}
+
+	transform := "<nil>"
+	if !isNilTransform(u.transform) {
+		transform = u.transform.String()
+	}
+
+	return fmt.Sprintf("UnboundTransform(transform=%s, term=%s)", transform, u.term)
+}
+
+// Transform returns the transform applied to the term.
+func (u *UnboundTransform) Transform() Transform { return u.transform }
+
+func (u *UnboundTransform) Equals(other UnboundTerm) bool {
+	rhs, ok := other.(*UnboundTransform)
+	if !ok {
+		return false
+	}
+	if u == nil || rhs == nil {
+		return u == rhs
+	}
+
+	leftNil, rightNil := isNilTransform(u.transform), isNilTransform(rhs.transform)
+	if leftNil || rightNil {
+		if !leftNil || !rightNil || reflect.TypeOf(u.transform) != reflect.TypeOf(rhs.transform) {
+			return false
+		}
+		if u.term == nil || rhs.term == nil {
+			return u.term == nil && rhs.term == nil
+		}
+
+		return u.term.Equals(rhs.term)
+	}
+
+	return u.transform.Equals(rhs.transform) && u.term.Equals(rhs.term)
+}
+
+func (u *UnboundTransform) Bind(schema *Schema, caseSensitive bool) (BoundTerm, error) {
+	if isNilTransform(u.transform) {
+		return nil, fmt.Errorf("%w: transform cannot be nil", ErrInvalidArgument)
+	}
+	if isUnknownTransform(u.transform) {
+		return nil, fmt.Errorf("%w: unknown transform %s cannot be evaluated", ErrNotImplemented, u.transform)
+	}
+
+	ref, ok := u.term.(Reference)
+	if !ok {
+		return nil, fmt.Errorf("%w: transform terms must wrap a direct reference, got %T",
+			ErrInvalidArgument, u.term)
+	}
+
+	bound, err := ref.Bind(schema, caseSensitive)
+	if err != nil {
+		return nil, err
+	}
+	if !u.transform.CanTransform(bound.Type()) {
+		return nil, fmt.Errorf("%w: transform %s cannot be applied to %s",
+			ErrInvalidArgument, u.transform, bound.Type())
+	}
+
+	return &BoundTransform{transform: u.transform, term: bound}, nil
+}
+
+func isNilTransform(transform Transform) bool {
+	if transform == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(transform)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func isUnknownTransform(transform Transform) bool {
+	switch transform.(type) {
+	case UnknownTransform, *UnknownTransform:
+		return true
+	default:
+		return false
+	}
+}
+
+// rejectTransformTerm guards predicates that still do not support transform
+// terms, such as bounding-box predicates.
+func rejectTransformTerm(term BoundTerm) error {
+	if _, ok := term.(*BoundTransform); ok {
+		return fmt.Errorf("%w: binding a predicate over a transform term is not supported", ErrNotImplemented)
+	}
+
+	return nil
+}
+
+// BoundingBox is a planar (XY) query bounding box used by the geospatial
+// BBoxIntersects predicate. MinX/MinY are the lower-left corner and MaxX/MaxY
+// the upper-right corner (X is longitude/easting, Y is latitude/northing).
+//
+// The box is two-dimensional: pruning only compares the X and Y extents of a
+// geometry column's bounds, which is all the Iceberg spec requires for
+// bbox-based data skipping. Z/M extents in a column's bounds are ignored.
+//
+// Z/M are intentionally omitted for now rather than reserved as fields: XY is
+// sufficient for spec-compliant pruning, and adding optional MinZ/MaxZ/MinM/MaxM
+// later is source-additive. The forward-compat contract is that Valid and Equals
+// are defined over whichever extents the box carries - today X and Y - so adding
+// higher dimensions later extends, rather than reinterprets, existing XY boxes.
+type BoundingBox struct {
+	MinX, MinY, MaxX, MaxY float64
+}
+
+func (b BoundingBox) String() string {
+	return fmt.Sprintf("BoundingBox(minX=%g, minY=%g, maxX=%g, maxY=%g)",
+		b.MinX, b.MinY, b.MaxX, b.MaxY)
+}
+
+// Equals reports whether two bounding boxes have identical extents.
+func (b BoundingBox) Equals(other BoundingBox) bool {
+	return b.MinX == other.MinX && b.MinY == other.MinY &&
+		b.MaxX == other.MaxX && b.MaxY == other.MaxY
+}
+
+// Valid reports whether the box is well-formed: no coordinate is NaN and the
+// minimum of each axis does not exceed its maximum. An infinite bound is allowed
+// (an open half-plane). An invalid box would silently mis-prune - a NaN makes
+// every intersection test false (pruning matching files), and an inverted box
+// (min > max) reports the wrong overlap - so BBoxIntersects rejects one.
+func (b BoundingBox) Valid() bool {
+	if math.IsNaN(b.MinX) || math.IsNaN(b.MinY) ||
+		math.IsNaN(b.MaxX) || math.IsNaN(b.MaxY) {
+		return false
+	}
+
+	return b.MinX <= b.MaxX && b.MinY <= b.MaxY
+}
+
+// isGeoType reports whether t is a geometry or geography type, the only types a
+// bbox predicate may bind to.
+func isGeoType(t Type) bool {
+	switch t.(type) {
+	case GeometryType, GeographyType:
+		return true
+	default:
+		return false
+	}
+}
+
+// BBoxIntersects constructs an unbound geospatial predicate that matches rows
+// whose geometry/geography value's bounding box intersects the query box. It is
+// used to prune data files whose stored geo bounds cannot overlap the query
+// region; the spec only requires bbox-based pruning, so full geometric predicate
+// evaluation (ST_Intersects/ST_Within) remains a query-engine concern.
+//
+// Panics if the term is nil or the bbox is not Valid (NaN coordinate or an
+// inverted min/max), either of which would cause silent mis-pruning. Panicking
+// on invalid construction is consistent with the other predicate constructors in
+// this package (UnaryPredicate, LiteralPredicate, SetPredicate, NewAnd, NewNot),
+// which all panic rather than return an error; a caller building a box from
+// untrusted input should validate it with BoundingBox.Valid first.
+func BBoxIntersects(t UnboundTerm, bbox BoundingBox) UnboundPredicate {
+	if t == nil {
+		panic(fmt.Errorf("%w: cannot create bbox predicate with nil term",
+			ErrInvalidArgument))
+	}
+	if !bbox.Valid() {
+		panic(fmt.Errorf("%w: invalid bounding box %s (NaN coordinate or min > max)",
+			ErrInvalidArgument, bbox))
+	}
+
+	return &unboundBBoxPredicate{op: OpBBoxIntersects, term: t, bbox: bbox}
+}
+
+type unboundBBoxPredicate struct {
+	op   Operation
+	term UnboundTerm
+	bbox BoundingBox
+}
+
+func (u *unboundBBoxPredicate) String() string {
+	return fmt.Sprintf("%s(term=%s, bbox=%s)", u.op, u.term, u.bbox)
+}
+
+func (u *unboundBBoxPredicate) Op() Operation     { return u.op }
+func (u *unboundBBoxPredicate) Term() UnboundTerm { return u.term }
+func (u *unboundBBoxPredicate) Negate() BooleanExpression {
+	return &unboundBBoxPredicate{op: u.op.Negate(), term: u.term, bbox: u.bbox}
+}
+
+func (u *unboundBBoxPredicate) Equals(other BooleanExpression) bool {
+	rhs, ok := other.(*unboundBBoxPredicate)
+	if !ok {
+		return false
+	}
+
+	return u.op == rhs.op && u.term.Equals(rhs.term) && u.bbox.Equals(rhs.bbox)
+}
+
+func (u *unboundBBoxPredicate) Bind(schema *Schema, caseSensitive bool) (BooleanExpression, error) {
+	bound, err := u.term.Bind(schema, caseSensitive)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectTransformTerm(bound); err != nil {
+		return nil, err
+	}
+
+	if !isGeoType(bound.Type()) {
+		return nil, fmt.Errorf("%w: BBoxIntersects must bind to a geometry or geography type, not %s",
+			ErrType, bound.Type())
+	}
+
+	return &boundBBoxPredicate{op: u.op, term: bound, bbox: u.bbox}, nil
+}
+
+// BoundBBoxPredicate is a bound geospatial predicate that tests whether a
+// geometry/geography column's bounds intersect a query bounding box.
+type BoundBBoxPredicate interface {
+	BoundPredicate
+
+	BBox() BoundingBox
+}
+
+// boundBBoxPredicate carries a bound geo term plus the query box. Unlike the
+// other bound predicates it intentionally has no AsUnbound(Reference) method, so
+// it does NOT satisfy BoundUnaryPredicate: a bbox predicate must never be rebuilt
+// as a generic unary predicate (it would reach substrait and error, or be
+// dropped to AlwaysFalse when a column is absent). It has no record-filter or
+// REST-JSON form at all, so the two visitors that would otherwise rebuild a bound
+// predicate - columnNameTranslator.VisitBound and sanitizeVisitor.VisitBound -
+// special-case *boundBBoxPredicate and collapse it to AlwaysTrue. Data-file
+// pruning is done separately by inclusiveMetricsEval.
+type boundBBoxPredicate struct {
+	op   Operation
+	term BoundTerm
+	bbox BoundingBox
+}
+
+func (b *boundBBoxPredicate) String() string {
+	return fmt.Sprintf("Bound%s(term=%s, bbox=%s)", b.op, b.term, b.bbox)
+}
+
+func (b *boundBBoxPredicate) Op() Operation       { return b.op }
+func (b *boundBBoxPredicate) Term() BoundTerm     { return b.term }
+func (b *boundBBoxPredicate) Ref() BoundReference { return b.term.Ref() }
+func (b *boundBBoxPredicate) BBox() BoundingBox   { return b.bbox }
+
+func (b *boundBBoxPredicate) Negate() BooleanExpression {
+	return &boundBBoxPredicate{op: b.op.Negate(), term: b.term, bbox: b.bbox}
+}
+
+func (b *boundBBoxPredicate) Equals(other BooleanExpression) bool {
+	rhs, ok := other.(*boundBBoxPredicate)
+	if !ok {
+		return false
+	}
+
+	return b.op == rhs.op && b.term.Equals(rhs.term) && b.bbox.Equals(rhs.bbox)
 }
