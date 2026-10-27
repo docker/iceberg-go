@@ -124,7 +124,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="variant.html">Variant Type</a></li><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -273,7 +273,7 @@
 <p>In this quickstart, we’ll glean insights from code segments and learn how to:</p>
 <h2 id="requirements"><a class="header" href="#requirements">Requirements</a></h2>
 <div class="warning">
-Go 1.25 or later is required to build.
+Go 1.26 or later is required to build.
 </div>
 <h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
 <p>To install <code>iceberg-go</code> package, you need to install Go and set your Go workspace first.
@@ -322,7 +322,7 @@ go get github.com/apache/iceberg-go@latest
 go get github.com/apache/arrow-go/v18@latest
 go get github.com/uptrace/bun/driver/sqliteshim@latest
 </code></pre>
-<p><code>iceberg-go</code> itself only registers the local file system. For S3, GCS, or Azure Blob you would also blank-import <code>github.com/apache/iceberg-go/io/gocloud</code>. We are staying on local disk for this tutorial.</p>
+<p><code>iceberg-go</code> itself only registers the local file system. For S3, GCS, or Azure Blob you would also blank-import the matching backend package, such as <code>github.com/apache/iceberg-go/io/gocloud/s3</code>. We are staying on local disk for this tutorial.</p>
 <h2 id="2-open-a-local-catalog"><a class="header" href="#2-open-a-local-catalog">2. Open a local catalog</a></h2>
 <p>The SQL catalog stores its metadata in a database, and the actual data files live under a &quot;warehouse&quot; directory. We will use SQLite for both the catalog DB and a local folder for the warehouse.</p>
 <pre><code class="language-go">package main
@@ -485,7 +485,10 @@ func createExperimentBranch(ctx context.Context, cat *sqlcat.Catalog, tbl *table
 
 // Step 2: open a transaction on the branch and write.
 func writeOnBranch(ctx context.Context, tbl *table.Table, arrowTbl arrow.Table) (*table.Table, error) {
-    txn := tbl.NewTransactionOnBranch(&quot;experiment&quot;)
+    txn, err := tbl.NewTransactionOnBranch(&quot;experiment&quot;)
+    if err != nil {
+        return nil, err
+    }
     if err := txn.AppendTable(ctx, arrowTbl, 1024, nil); err != nil {
         return nil, err
     }
@@ -550,7 +553,7 @@ catalog:
 <tr><td><code>catalog.&lt;name&gt;.aws-profile</code></td><td>AWS named profile for the Glue catalog. When unset, the AWS SDK default credential chain is used.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-driver</code></td><td><code>database/sql</code> driver name for the SQL catalog. Maps to the <code>sql.driver</code> property. The default CLI binary only compiles in <code>sqliteshim</code>; other drivers require a custom build.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-dialect</code></td><td>SQL dialect for the SQL catalog (<code>postgres</code>, <code>mysql</code>, <code>sqlite</code>, <code>mssql</code>, <code>oracle</code>). Maps to the <code>sql.dialect</code> property. The default CLI binary only ships <code>sqlite</code> via <code>sqliteshim</code>; other dialects need a custom build with their drivers.</td></tr>
-<tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST. When enabled, requests are signed with the <code>s3.*</code> credential properties if set (<code>s3.access-key-id</code> / <code>s3.secret-access-key</code> / <code>s3.session-token</code>), otherwise with the AWS default credential chain. The Java-client names (<code>rest.access-key-id</code> / <code>rest.secret-access-key</code> / <code>rest.session-token</code>) are accepted as aliases, resolved per field with the <code>s3.*</code> keys taking precedence.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-name</code></td><td>SigV4 service name.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-region</code></td><td>SigV4 region.</td></tr>
 </tbody></table>
@@ -561,12 +564,36 @@ catalog:
 <p>The most option-rich surface. Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/options.go"><code>catalog/rest/options.go</code></a>.</p>
 <div class="table-wrapper"><table><thead><tr><th>Group</th><th>Options</th></tr></thead><tbody>
 <tr><td>Authentication</td><td><code>WithCredential</code>, <code>WithOAuthToken</code>, <code>WithAuthManager</code>, <code>WithAuthURI</code>, <code>WithScope</code>, <code>WithAudience</code>, <code>WithResource</code></td></tr>
-<tr><td>AWS SigV4</td><td><code>WithSigV4</code>, <code>WithSigV4RegionSvc</code>, <code>WithAwsConfig</code></td></tr>
+<tr><td>AWS SigV4</td><td><code>WithSigV4</code>, <code>WithSigV4RegionSvc</code>, <code>WithSigner</code></td></tr>
 <tr><td>HTTP</td><td><code>WithHeaders</code>, <code>WithTLSConfig</code>, <code>WithOAuthTLSConfig</code>, <code>WithCustomTransport</code></td></tr>
 <tr><td>Catalog routing</td><td><code>WithPrefix</code>, <code>WithWarehouseLocation</code>, <code>WithMetadataLocation</code></td></tr>
 <tr><td>Pass-through</td><td><code>WithAdditionalProps</code></td></tr>
 </tbody></table>
 </div>
+<blockquote>
+<p><strong>AWS SigV4 is an optional backend.</strong> <code>catalog/rest</code> no longer links the AWS
+SDK. To sign REST requests with SigV4, pull in the
+<a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/sigv4/sigv4.go"><code>catalog/rest/sigv4</code></a>
+sub-package one of two ways:</p>
+<ul>
+<li>Property or ambient credentials: add a blank import
+<code>_ &quot;github.com/apache/iceberg-go/catalog/rest/sigv4&quot;</code> and enable signing with
+<code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> or the <code>rest.sigv4-enabled</code> property. The
+backend signs with the <code>s3.*</code> credential properties when set (falling back to
+the <code>rest.*</code> aliases), otherwise with the AWS default credential chain.</li>
+<li>Explicit config: pass <code>sigv4.WithAWSConfig(cfg)</code> to <code>NewCatalog</code> alongside
+<code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> (no blank import needed). It supplies the
+<code>aws.Config</code>; the signing service comes from those options (or a server
+<code>/v1/config</code> override), and so does the region when one is set. Otherwise
+the region falls back to <code>cfg.Region</code>.</li>
+</ul>
+<p>The former <code>rest.WithAwsConfig(aws.Config)</code> has been removed in favor of these
+paths. Because signing is enabled by <code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> (or the
+<code>rest.sigv4-enabled</code> property) rather than by supplying a config, a program
+that loads a REST catalog with <code>rest.sigv4-enabled=true</code> now fails at startup
+until the <code>catalog/rest/sigv4</code> backend is blank-imported; the error names the
+import to add.</p>
+</blockquote>
 <h4 id="metrics-reporting"><a class="header" href="#metrics-reporting">Metrics reporting</a></h4>
 <p>The REST catalog can POST scan and commit metrics to the catalog's
 <code>.../tables/{table}/metrics</code> endpoint. These properties are passed as
@@ -609,8 +636,8 @@ assume parity on it in multi-client deployments.</p>
 <h3 id="glue-catalogglue"><a class="header" href="#glue-catalogglue">Glue (<code>catalog/glue</code>)</a></h3>
 <p>Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/glue/options.go"><code>catalog/glue/options.go</code></a>.</p>
 <ul>
-<li><code>WithAwsConfig(cfg aws.Config)</code> - AWS SDK v2 config; respects the AWS default credential chain.</li>
-<li><code>WithAwsProperties(props AwsProperties)</code> - explicit overrides for region/endpoint/access keys.</li>
+<li><code>WithAWSConfig(cfg aws.Config)</code> - AWS SDK v2 config; respects the AWS default credential chain.</li>
+<li><code>WithAWSProperties(props AWSProperties)</code> - catalog properties, such as <code>glue.id</code> and the <code>s3.*</code> FileIO keys. <code>NewCatalog</code> ignores the <code>glue.region</code>, endpoint, credential, and retry keys; only <code>catalog.Load</code> reads them.</li>
 </ul>
 <h3 id="sql-catalogsql"><a class="header" href="#sql-catalogsql">SQL (<code>catalog/sql</code>)</a></h3>
 <p>The SQL catalog has no functional-option surface. Construct it with <code>NewCatalog</code>:</p>
@@ -628,12 +655,15 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 </ul>
 <h2 id="file-system-credentials"><a class="header" href="#file-system-credentials">File-system credentials</a></h2>
 <p>iceberg-go registers the local file system (<code>file://</code>) automatically. Cloud schemes are <em>not</em> registered until you add a blank import:</p>
-<pre><code class="language-go">import _ &quot;github.com/apache/iceberg-go/io/gocloud&quot;
+<pre><code class="language-go">import _ &quot;github.com/apache/iceberg-go/io/gocloud/s3&quot;    // s3, s3a, s3n, oss
+import _ &quot;github.com/apache/iceberg-go/io/gocloud/gcs&quot;   // gs
+import _ &quot;github.com/apache/iceberg-go/io/gocloud/azure&quot; // abfs, abfss, wasb, wasbs
 </code></pre>
-<p>The <code>init()</code> function in <a href="https://github.com/apache/iceberg-go/blob/main/io/gocloud/register.go"><code>io/gocloud/register.go</code></a> registers <code>s3</code>, <code>s3a</code>, <code>s3n</code>, <code>oss</code>, <code>gs</code>, <code>abfs</code>, <code>abfss</code>, <code>wasb</code>, and <code>wasbs</code>. Without the blank import, these schemes return <code>ErrIOSchemeNotFound</code> with a hint to add the import.</p>
+<p>Each backend package links its own cloud SDK. Importing <code>io/gocloud</code> registers all three at once and links all cloud SDKs.</p>
+<p>Without a matching blank import, these schemes return <code>ErrIOSchemeNotFound</code> with a hint naming the package to import.</p>
 <p>All credential and tuning property keys are constants in <a href="https://github.com/apache/iceberg-go/blob/main/io/config.go"><code>io/config.go</code></a>. They can be supplied through table properties, catalog properties, or per-call <code>iceberg.Properties</code> arguments depending on context.</p>
 <h3 id="s3"><a class="header" href="#s3">S3</a></h3>
-<p>Authentication is resolved in this order (<code>io/gocloud/s3.go</code>):</p>
+<p>Authentication is resolved in this order (<code>io/gocloud/s3/s3.go</code>):</p>
 <ol>
 <li>Static credentials in properties: <code>s3.access-key-id</code> + <code>s3.secret-access-key</code> (+ optional <code>s3.session-token</code>).</li>
 <li>The standard AWS SDK v2 default credential chain - environment variables (<code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_SESSION_TOKEN</code>), <code>~/.aws/credentials</code>, container/IAM role.</li>
@@ -653,7 +683,7 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 </tbody></table>
 </div>
 <h3 id="google-cloud-storage"><a class="header" href="#google-cloud-storage">Google Cloud Storage</a></h3>
-<p>Authentication resolution (<code>io/gocloud/gcs.go</code>):</p>
+<p>Authentication resolution (<code>io/gocloud/gcs/gcs.go</code>):</p>
 <ol>
 <li>Explicit JSON key bytes via <code>gcs.jsonkey</code> or path via <code>gcs.keypath</code>.</li>
 <li>Optional <code>gcs.credtype</code> selecting one of <code>service_account</code>, <code>authorized_user</code>, <code>impersonated_service_account</code>, <code>external_account</code>.</li>
@@ -669,23 +699,42 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 </tbody></table>
 </div>
 <h3 id="azure-data-lake-storage--blob"><a class="header" href="#azure-data-lake-storage--blob">Azure Data Lake Storage / Blob</a></h3>
-<p>Authentication is selected based on the property keys present (<code>io/gocloud/azure.go</code>):</p>
+<p>Authentication is selected in the following order (<code>io/gocloud/azure/azure.go</code>); the first applicable option wins, and if none of 1-5 apply the default credential chain (6) is used:</p>
 <ol>
-<li>Shared key: both <code>adls.auth.shared-key.account.name</code> and <code>adls.auth.shared-key.account.key</code> set.</li>
-<li>Per-host SAS token: <code>adls.sas-token.&lt;hostname&gt;</code> (prefix-matched against the storage account host).</li>
-<li>Per-host connection string: <code>adls.connection-string.&lt;hostname&gt;</code>.</li>
-<li>Managed identity: <code>adls.auth.managed-identity.enabled</code> set to a truthy value.</li>
+<li>Shared key: a nonempty <code>adls.auth.shared-key.account.name</code> selects this path and requires a nonempty <code>adls.auth.shared-key.account.key</code>.</li>
+<li>Per-host SAS token: <code>adls.sas-token.&lt;hostname&gt;</code>, where <code>&lt;hostname&gt;</code> exactly matches the storage account hostname (for example, <code>myaccount.dfs.core.windows.net</code>).</li>
+<li>Per-account connection string: <code>adls.connection-string.&lt;account-name&gt;</code> (for example, <code>adls.connection-string.myaccount</code>).</li>
+<li>Static access token: a nonempty <code>adls.token</code>, supplied without the <code>Bearer </code> prefix.</li>
+<li>Managed identity: <code>adls.auth.managed-identity.enabled</code> set to exactly <code>&quot;true&quot;</code> selects this path and uses <code>ManagedIdentityCredential</code> directly. Set <code>adls.client-id</code> to select a user-assigned managed identity; otherwise, the system-assigned managed identity is used.</li>
+<li>Default credential chain: <code>DefaultAzureCredential</code>, which includes managed identity among its credential sources.</li>
 </ol>
+<p><code>adls.token</code> accepts an OAuth2 access token for Azure Storage, including a token supplied by a catalog. An empty value is ignored. A rejected or expired token does not fall back to managed identity or the default credential chain.</p>
+<p>The token is static and is not refreshed. As in <a href="https://github.com/apache/iceberg/blob/main/azure/src/main/java/org/apache/iceberg/azure/AzureProperties.java">Java</a> and <a href="https://github.com/apache/iceberg-python/blob/main/pyiceberg/io/fsspec.py">PyIceberg</a>, the credential reports a one-hour cache window to the Azure SDK each time the SDK requests the token. This does not extend the token's actual validity: Azure enforces its expiration. Callers must obtain a new token and recreate the FileIO when it expires; changing the original properties map does not update an existing FileIO.</p>
+<p>A REST catalog can also vend <code>adls.token</code> as a storage credential. The token carries no expiry of its own, so a vended token's expiry comes from <code>expiration-time</code> in the same credential when the catalog supplies one. Without it, a table FileIO that can fetch new credentials assumes a 60-minute lifetime and renews them shortly before it ends, and one that cannot, such as a FileIO for a scan plan's credentials, treats them as never expiring. A token whose actual lifetime is shorter than that fails with authorization errors until it is renewed, so catalogs that vend <code>adls.token</code> should send <code>expiration-time</code> with it. For the storage account it is vended for, a vended token replaces the SAS token and connection string configured for that account and any shared key, which would otherwise take precedence over it; a shared key is not scoped to an account, so one configured for another account would be used for this account too. The SAS tokens and connection strings of other accounts are kept. Expiries configured for other credentials, such as a SAS expiry or an <code>expiration-time</code> in the catalog or table configuration, do not affect when the token is renewed.</p>
+<blockquote>
+<p><strong>Note on cross-client parity.</strong> The two properties in step 5 diverge from the
+other clients. <code>adls.auth.managed-identity.enabled</code> is Go-specific: neither
+Iceberg Java nor PyIceberg defines a property that forces
+<code>ManagedIdentityCredential</code>, so catalog properties that set it do not carry
+over. <code>adls.client-id</code> collides in name only — PyIceberg reads it as a service
+principal client ID used together with <code>adls.client-secret</code> and
+<code>adls.tenant-id</code>, neither of which iceberg-go defines (see the
+<a href="https://py.iceberg.apache.org/configuration/#azure-data-lake">PyIceberg ADLS configuration</a>),
+while Java's <code>AzureProperties</code> defines no <code>adls.client-id</code> at all. Here it is
+only ever read as a user-assigned managed identity ID, and only when step 5 is
+selected.</p>
+</blockquote>
 <p>Tuning properties:</p>
 <div class="table-wrapper"><table><thead><tr><th>Key (constant)</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>adls.auth.shared-key.account.name</code> (<code>io.ADLSSharedKeyAccountName</code>)</td><td>Account name.</td></tr>
 <tr><td><code>adls.auth.shared-key.account.key</code> (<code>io.ADLSSharedKeyAccountKey</code>)</td><td>Account key.</td></tr>
 <tr><td><code>adls.sas-token.&lt;host&gt;</code> (prefix <code>io.ADLSSasTokenPrefix</code>)</td><td>Per-host SAS token.</td></tr>
-<tr><td><code>adls.connection-string.&lt;host&gt;</code> (prefix <code>io.ADLSConnectionStringPrefix</code>)</td><td>Per-host connection string.</td></tr>
-<tr><td><code>adls.client-id</code> (<code>io.ADLSClientID</code>)</td><td>Client/application ID for AAD auth.</td></tr>
+<tr><td><code>adls.connection-string.&lt;account-name&gt;</code> (prefix <code>io.ADLSConnectionStringPrefix</code>)</td><td>Per-account connection string.</td></tr>
+<tr><td><code>adls.token</code> (<code>io.ADLSToken</code>)</td><td>Static Azure Storage access token, without the <code>Bearer </code> prefix. Subject to the precedence above; not refreshed.</td></tr>
+<tr><td><code>adls.client-id</code> (<code>io.ADLSClientID</code>)</td><td>Client ID of a user-assigned managed identity. Used only when the explicit managed-identity authentication path is selected.</td></tr>
 <tr><td><code>adls.endpoint</code> (<code>io.ADLSEndpoint</code>)</td><td>Storage domain (e.g. <code>blob.core.windows.net</code>).</td></tr>
 <tr><td><code>adls.protocol</code> (<code>io.ADLSProtocol</code>)</td><td><code>http</code> or <code>https</code>.</td></tr>
-<tr><td><code>adls.auth.managed-identity.enabled</code> (<code>io.ADLSManagedIdentityEnabled</code>)</td><td>Enable Azure Managed Identity auth.</td></tr>
+<tr><td><code>adls.auth.managed-identity.enabled</code> (<code>io.ADLSManagedIdentityEnabled</code>)</td><td>Set to exactly <code>&quot;true&quot;</code> to use <code>ManagedIdentityCredential</code> directly, subject to the precedence above.</td></tr>
 </tbody></table>
 </div>
 <h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
@@ -693,14 +742,14 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Purpose</th><th>Read at</th></tr></thead><tbody>
 <tr><td><code>GOICEBERG_HOME</code></td><td>Directory containing <code>.iceberg-go.yaml</code>. Defaults to the user's home directory.</td><td><code>config/config.go:87</code></td></tr>
 <tr><td><code>ICEBERG_SQL_DEBUG</code></td><td>SQL catalog query logging - <code>1</code> (failed queries), <code>2</code> (all queries).</td><td><code>catalog/sql/sql.go:206</code></td></tr>
-<tr><td><code>AWS_S3_ENDPOINT</code></td><td>Fallback S3 endpoint when <code>s3.endpoint</code> is unset.</td><td><code>io/gocloud/s3.go:193</code></td></tr>
+<tr><td><code>AWS_S3_ENDPOINT</code></td><td>Fallback S3 endpoint when <code>s3.endpoint</code> is unset.</td><td><code>io/gocloud/s3/s3.go</code></td></tr>
 </tbody></table>
 </div>
 <p>There is no <code>PYICEBERG_*</code>-style env var convention. Use the YAML config file or pass <code>iceberg.Properties</code> to overrides programmatically.</p>
 <h2 id="concurrency"><a class="header" href="#concurrency">Concurrency</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Source</th><th>Effect</th></tr></thead><tbody>
 <tr><td><code>max-workers</code> in <code>~/.iceberg-go.yaml</code> (<code>config.EnvConfig.MaxWorkers</code>)</td><td>YAML config</td><td>Worker pool size used by parallel column writes, snapshot producers, scan plan, equality-delete writers. Default <code>5</code>.</td></tr>
-<tr><td><code>WithMaxConcurrency(n int) ScanOption</code></td><td>Code (<code>table.WithMaxConcurrency</code>)</td><td>Per-scan override. <code>WitMaxConcurrency</code> (missing <code>h</code>) remains as a deprecated alias.</td></tr>
+<tr><td><code>WithMaxConcurrency(n int) ScanOption</code></td><td>Code (<code>table.WithMaxConcurrency</code>)</td><td>Per-scan override.</td></tr>
 <tr><td><code>WithMaxWriteWorkers(n int)</code></td><td>Code (per-write API on <code>WriteRecords</code>)</td><td>Per-write override of the worker count.</td></tr>
 <tr><td><code>WithClusteredWrite()</code></td><td>Code (per-write API on <code>WriteRecords</code>)</td><td>Forces single-threaded writes. Mutually exclusive with <code>WithMaxWriteWorkers</code>.</td></tr>
 </tbody></table>
@@ -722,7 +771,8 @@ func init() {
     })
 }
 </code></pre>
-<p><code>io.Register</code> panics on <code>nil</code> factory or duplicate scheme. Built-in schemes: <code>file</code>, <code>&quot;&quot;</code> (the empty scheme). Cloud schemes (<code>s3</code>, <code>gs</code>, <code>abfs</code>, etc.) are registered by <code>io/gocloud</code> only when its package is blank-imported.</p>
+<p><code>io.Register</code> panics on <code>nil</code> factory or duplicate scheme. Built-in schemes: <code>file</code>, <code>&quot;&quot;</code> (the empty scheme).
+Cloud schemes (<code>s3</code>, <code>gs</code>, <code>abfs</code>, etc.) are registered only when the matching backend package under <code>io/gocloud</code> is blank-imported.</p>
 <p><code>io.GetRegisteredSchemes()</code> returns the current scheme list; <code>io.Unregister(scheme)</code> removes one.</p>
 <h3 id="catalog-type-registry"><a class="header" href="#catalog-type-registry">Catalog type registry</a></h3>
 <p>Register a custom catalog type with <a href="https://github.com/apache/iceberg-go/blob/main/catalog/registry.go"><code>catalog.Register</code></a>:</p>
@@ -741,7 +791,7 @@ func init() {
     ))
 }
 </code></pre>
-<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</p>
+<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Custom catalogs must implement <code>Close() error</code> to satisfy <code>catalog.Catalog</code>, and callers must close them when finished. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</p>
 <p><code>catalog.GetRegisteredCatalogs()</code> returns the current list; <code>catalog.Unregister(catalogType)</code> removes one.</p>
 <h3 id="locationprovider"><a class="header" href="#locationprovider">LocationProvider</a></h3>
 <p><a href="https://github.com/apache/iceberg-go/blob/main/table/locations.go"><code>table/locations.go</code></a> defines the <code>LocationProvider</code> interface and ships two implementations: <code>simpleLocationProvider</code> (default) and <code>objectStoreLocationProvider</code> (selected by <code>write.object-storage.enabled = true</code>). The provider is chosen by table properties and is not user-pluggable today.</p>
@@ -753,6 +803,41 @@ func init() {
 <tr><td><code>write.target-file-size-bytes</code></td><td>(set by writer)</td><td>Target size for newly written data files. Read in <code>table/arrow_utils.go</code> and <code>table/equality_delete_writer.go</code>.</td></tr>
 </tbody></table>
 </div>
+<h3 id="scan-reads"><a class="header" href="#scan-reads">Scan reads</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>read.split.target-size</code></td><td><code>134217728</code></td><td>Target size for coalescing safe row-group ranges when splitting large local Parquet files. A range may exceed the target when no supplied offset can divide it safely.</td></tr>
+<tr><td><code>read.manifest-list-cache.enabled</code></td><td><code>true</code></td><td>Reuse decoded snapshot manifest lists across scans of a table handle. Set to <code>false</code> to disable retention and shared in-flight reads. Applied when loading or refreshing a table, and when creating a transaction scan.</td></tr>
+<tr><td><code>io.manifest.cache-enabled</code></td><td><code>false</code></td><td>Reuse raw manifest file content across local scans. Read from catalog FileIO properties in REST, Glue, SQL, Hive and Hadoop; REST table metadata and load-response config may override the catalog value.</td></tr>
+<tr><td><code>io.manifest.cache.expiration-interval-ms</code></td><td><code>60000</code></td><td>Idle expiration in milliseconds. Zero disables time-based expiration; negative or unparsable values warn and disable the cache. Expired entries are reclaimed on cache access/insertion, without a background cleanup task.</td></tr>
+<tr><td><code>io.manifest.cache.max-total-bytes</code></td><td><code>104857600</code></td><td>Retained raw bytes per independently loaded table. Handles returned by commit share their source table's cache and budget. Concurrent population buffers and bytes held by active readers are not counted. Non-positive or unparsable values warn and disable caching.</td></tr>
+<tr><td><code>io.manifest.cache.max-content-length</code></td><td><code>8388608</code></td><td>Maximum size of one manifest eligible for content caching. Non-positive or unparsable values warn and disable caching.</td></tr>
+</tbody></table>
+</div>
+<p>The catalog's FileIO properties configure manifest caching for all built-in
+catalogs. With direct <code>table.New</code> calls, use <code>WithScanPlanningIOProperties</code>
+or <code>WithSavedConfig</code>; saved config wins when the same key is present in both.
+Matching expiration interval, total byte limit and per-manifest byte limit
+preserve warm cache entries across refresh and commit. Changing a limit replaces
+the cache.</p>
+<p>Unlike Java, which rejects invalid manifest-cache limits, Go warns and disables
+the content cache for negative or unparsable expiration or
+non-positive/unparsable size limits.</p>
+<p>The manifest-list cache retains at most 64 snapshots and 32,768 manifest
+descriptors in total per table handle. These are count limits, not byte limits:
+memory use also depends on manifest paths, partition summaries, and key metadata.
+Refreshing the table replaces its manifest-list cache.</p>
+<p>The optional manifest-content cache is separate. It stores immutable raw manifest
+bytes and still decodes, projects, and filters entries independently for each
+scan. Cache misses for the same manifest share one in-flight read. If population
+fails, its producer and each existing waiter independently fall back to one
+ordinary FileIO open; if the producer was canceled, live waiters can start
+another shared load. Failed content is not
+retained, so a later scan can retry. Manifests larger than the configured
+per-file limit bypass the cache. The current integration covers local scan
+planning; manifest lists continue to use the decoded manifest-list cache.</p>
+<p>The Java-compatible <code>read.split.planning-lookback</code> and <code>read.split.open-file-cost</code>
+names and defaults are also exported by the Go API for shared configuration,
+but are reserved for future task-group planning and are not currently read.</p>
 <h3 id="metrics-and-metadata-lifecycle"><a class="header" href="#metrics-and-metadata-lifecycle">Metrics and metadata lifecycle</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>write.metadata.metrics.default</code></td><td>Default per-column metrics mode.</td></tr>
@@ -900,7 +985,7 @@ catalog:
 </code></pre>
 <p><strong>Create table</strong></p>
 <p>Note: only the identity transform is supported for <code>--partition-spec</code> at this moment.</p>
-<pre><code class="language-shell"># Create a simple table with REST catalog and Minio
+<pre><code class="language-shell"># Create a simple table with REST catalog and object store
 ./iceberg create table default.table-1 \
         --properties write.format.default=parquet \
         --partition-spec foo \
@@ -912,30 +997,30 @@ Table default.table-1 created successfully
 
 # Describe the newly created table
 ./iceberg describe --catalog rest --uri http://localhost:8181 default.table-1
-Table format version | 2
-Metadata location    | s3://warehouse/default/table-1/metadata/00000-f0ccaadd-d988-482e-99da-3a37870288fe.metadata.json
-Table UUID           | 33fa3fac-e638-4335-a085-343c6d9e7de5
-Last updated         | 1753133512562
-Sort Order           | 1: [
-                     | 1 desc nulls-last
-                     | ]
-Partition Spec       | [
-                     |  1000: foo: identity(1)
-                     | ]
+Table format version │ 2
+Metadata location    │ s3://warehouse/default/table-1/metadata/00000-f0ccaadd-d988-482e-99da-3a37870288fe.metadata.json
+Table UUID           │ 33fa3fac-e638-4335-a085-343c6d9e7de5
+Last updated         │ 1753133512562
+Sort Order           │ 1: [
+                     │ 1 desc nulls-last
+                     │ ]
+Partition Spec       │ [
+                     │  1000: foo: identity(1)
+                     │ ]
 
 Current Schema, id=0
-├──1: foo: optional string
-└──2: bar: required int
+├── 1: foo: optional string
+└── 2: bar: required int
 
-Current Snapshot |
+Current Snapshot │
 
 Snapshots
 
 Properties
-key                             | value
+key                             │ value
 -----------------------------------------
-write.format.default            | parquet
-write.parquet.compression-codec | zstd
+write.format.default            │ parquet
+write.parquet.compression-codec │ zstd
 </code></pre>
 <h2 id="inspecting-tables"><a class="header" href="#inspecting-tables">Inspecting tables</a></h2>
 <h3 id="info--single-screen-summary"><a class="header" href="#info--single-screen-summary"><code>info</code> — single-screen summary</a></h3>
@@ -957,6 +1042,14 @@ iceberg refs --type tag    my_db.events
 iceberg partition-stats --snapshot-id 7234981023498 my_db.events
 iceberg partition-stats --all my_db.events                    # all snapshots
 </code></pre>
+<h3 id="files--data-files"><a class="header" href="#files--data-files"><code>files</code> — data files</a></h3>
+<pre><code class="language-shell">iceberg files my_db.events                              # current snapshot
+iceberg files --history my_db.events                    # all snapshots
+iceberg files --scan-planning-mode remote my_db.events  # from a server-side scan plan
+</code></pre>
+<p>By default <code>files</code> reads the manifest list and manifests itself and prints them as a tree: snapshot, manifest, then each manifest entry.</p>
+<p>With <code>--scan-planning-mode remote</code> or <code>auto</code>, or when a REST catalog sets <code>scan-planning-mode=server</code> for the table, <code>files</code> plans a scan of the current snapshot instead and lists the data files it returns, each with its delete files. A scan plan carries no manifests, so the tree has no manifest level, and it only shows live files. <code>--history</code> needs every snapshot's manifests and fails in this mode, as does <code>--scan-planning-mode local</code> on a <code>server</code> table.</p>
+<p><code>compact</code> plans its input with a table scan, so it follows the catalog's <code>scan-planning-mode</code> as well. Every other command reads table metadata directly.</p>
 <h3 id="schema---show-defaults"><a class="header" href="#schema---show-defaults"><code>schema --show-defaults</code></a></h3>
 <pre><code class="language-shell">iceberg schema --show-defaults my_db.events
 </code></pre>
@@ -1132,7 +1225,7 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 
 awsCfg, err := config.LoadDefaultConfig(context.TODO())
 // handle err
-cat := glue.NewCatalog(glue.WithAwsConfig(awsCfg))
+cat := glue.NewCatalog(glue.WithAWSConfig(awsCfg))
 </code></pre>
 <h4 id="hive"><a class="header" href="#hive">Hive</a></h4>
 <pre><code class="language-go">import (
@@ -1148,9 +1241,10 @@ cat, err := hive.NewCatalog(iceberg.Properties{},
 <pre><code class="language-go">import (
     &quot;github.com/apache/iceberg-go&quot;
     &quot;github.com/apache/iceberg-go/catalog/hadoop&quot;
+    &quot;context&quot;
 )
 
-cat, err := hadoop.NewCatalog(&quot;default&quot;, &quot;file:///tmp/warehouse&quot;, iceberg.Properties{})
+cat, err := hadoop.NewCatalog(context.Background(), &quot;default&quot;, &quot;file:///tmp/warehouse&quot;, iceberg.Properties{})
 </code></pre>
 <h4 id="via-the-registry"><a class="header" href="#via-the-registry">Via the registry</a></h4>
 <p><code>catalog.Load</code> looks up the right backend via the <code>type</code> property (or <code>uri</code> scheme as a fallback) plus your <code>~/.iceberg-go.yaml</code>. Useful when you want runtime selection:</p>
@@ -1164,7 +1258,11 @@ cat, err := catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{
     &quot;uri&quot;:       &quot;http://localhost:8181&quot;,
     &quot;warehouse&quot;: &quot;s3://my-bucket/warehouse&quot;,
 })
+if err != nil { panic(err) }
+defer cat.Close()
 </code></pre>
+<p>Every catalog implements <code>Close() error</code>. Close it when done to release catalog-owned
+resources. A caller-supplied database connection remains caller-owned.</p>
 <h3 id="namespaces"><a class="header" href="#namespaces">Namespaces</a></h3>
 <pre><code class="language-go">ns := table.Identifier{&quot;sales&quot;}
 
@@ -1341,7 +1439,7 @@ newTbl, err = tbl.Overwrite(ctx, recordReader, nil,
 <h3 id="add-existing-files"><a class="header" href="#add-existing-files">Add existing files</a></h3>
 <p>When you already have data files (e.g. produced by another writer), register them without rewriting:</p>
 <pre><code class="language-go">txn := tbl.NewTransaction()
-err := txn.AddFiles(ctx, []string{
+err := txn.AddDataFilesByPath(ctx, []string{
     &quot;s3://my-bucket/sales/orders/data/file-1.parquet&quot;,
     &quot;s3://my-bucket/sales/orders/data/file-2.parquet&quot;,
 }, nil /* snapshot props */, false /* ignoreDuplicates */)
@@ -1349,7 +1447,7 @@ if err != nil { /* ... */ }
 
 newTbl, err := txn.Commit(ctx)
 </code></pre>
-<p><code>ReplaceDataFiles(ctx, filesToDelete, filesToAdd, snapshotProps)</code> and <code>ReplaceDataFilesWithDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)</code> are also available on <code>*Transaction</code> for swapping files atomically.</p>
+<p><code>ReplaceDataFilesByPath(ctx, filesToDelete, filesToAdd, snapshotProps)</code> and <code>ReplaceDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)</code> are also available on <code>*Transaction</code> for swapping files atomically.</p>
 <h3 id="transactions"><a class="header" href="#transactions">Transactions</a></h3>
 <p>Group writes and metadata changes into one atomic snapshot:</p>
 <pre><code class="language-go">txn := tbl.NewTransaction()
@@ -1368,7 +1466,8 @@ if err := txn.SetProperties(iceberg.Properties{&quot;commit.user&quot;: &quot;da
 newTbl, err := txn.Commit(ctx)
 </code></pre>
 <p>To target a specific branch:</p>
-<pre><code class="language-go">txn := tbl.NewTransactionOnBranch(&quot;staging&quot;)
+<pre><code class="language-go">txn, err := tbl.NewTransactionOnBranch(&quot;staging&quot;)
+if err != nil { /* ... */ }
 </code></pre>
 <p><code>Commit</code> retries automatically on conflict (<code>ErrCommitFailed</code>) - tune via the <code>commit.retry.*</code> table properties.</p>
 <h2 id="schema-and-partition-evolution"><a class="header" href="#schema-and-partition-evolution">Schema and partition evolution</a></h2>
@@ -1441,18 +1540,18 @@ err = txn.RollbackToSnapshot(targetSnapshotID)
 <pre><code class="language-go">import (
     &quot;time&quot;
 
-    &quot;github.com/apache/iceberg-go/table&quot;
+    &quot;github.com/apache/iceberg-go/table/maintenance&quot;
 )
 
-result, err := tbl.DeleteOrphanFiles(ctx,
-    table.WithFilesOlderThan(72*time.Hour),
-    table.WithDryRun(false),
-    table.WithCleanupMaxConcurrency(8),
+result, err := maintenance.DeleteOrphanFiles(ctx, tbl,
+    maintenance.WithCleanupFilesOlderThan(72*time.Hour),
+    maintenance.WithCleanupDryRun(false),
+    maintenance.WithCleanupMaxConcurrency(8),
 )
 if err != nil { /* ... */ }
 fmt.Printf(&quot;removed %d files\n&quot;, len(result.DeletedFiles))
 </code></pre>
-<p>Also see <code>table.WithLocation</code>, <code>table.WithDeleteFunc</code>, <code>table.WithPrefixMismatchMode</code>, <code>table.WithEqualSchemes</code>, and <code>table.WithEqualAuthorities</code> in <code>table/orphan_cleanup.go</code>.</p>
+<p>Also see <code>maintenance.WithCleanupLocation</code>, <code>maintenance.WithCleanupDeleteFunc</code>, <code>maintenance.WithPrefixMismatchMode</code>, <code>maintenance.WithEqualSchemes</code>, and <code>maintenance.WithEqualAuthorities</code> in <code>table/maintenance/orphan_cleanup.go</code>.</p>
 <h3 id="compaction-rewrite-data-files"><a class="header" href="#compaction-rewrite-data-files">Compaction (rewrite data files)</a></h3>
 <pre><code class="language-go">import &quot;github.com/apache/iceberg-go/table&quot;
 
@@ -1465,6 +1564,7 @@ fmt.Printf(&quot;rewrote %d files into %d (%d -&gt; %d bytes)\n&quot;,
     result.RemovedDataFiles, result.AddedDataFiles, result.BytesBefore, result.BytesAfter)
 </code></pre>
 <p>The <code>table/compaction</code> subpackage provides bin-packing planning. The <code>iceberg compact analyze</code> and <code>compact run</code> CLI commands wrap the same machinery - see <a href="./cli.html">CLI</a>.</p>
+<p>Compaction tasks represent complete data files, not independent scan splits. The planner collapses split tasks for the same file into one whole-file task, rejecting inconsistent delete or lineage metadata and dropping residual filters because they select files but do not filter rows during compaction. Direct calls to <code>ExecuteCompactionGroup</code> reject partial ranges and residual row filters. Attached delete files are still applied when rewriting each source file.</p>
 <h3 id="expiring-snapshots"><a class="header" href="#expiring-snapshots">Expiring snapshots</a></h3>
 <pre><code class="language-go">import (
     &quot;time&quot;
@@ -1492,7 +1592,7 @@ v, err := view.CreateView(
     &quot;my-catalog&quot;,
     table.Identifier{&quot;analytics&quot;, &quot;monthly_orders&quot;},
     schema,
-    &quot;SELECT month, sum(amount) FROM orders GROUP BY month&quot;,
+    view.Representation{SQL: &quot;SELECT month, sum(amount) FROM orders GROUP BY month&quot;, Dialect: &quot;spark&quot;},
     table.Identifier{&quot;sales&quot;},                      // default namespace for unqualified names
     &quot;s3://my-bucket/views/monthly_orders&quot;,
     iceberg.Properties{},
@@ -1528,7 +1628,7 @@ v.Properties()          // iceberg.Properties
 <tr><td><code>struct&lt;...&gt;</code></td><td><code>arrow.StructOf(...)</code></td></tr>
 <tr><td><code>list&lt;E&gt;</code></td><td><code>arrow.ListOf(E)</code> (or <code>LargeListOf</code> if <code>useLargeTypes</code>)</td></tr>
 <tr><td><code>map&lt;K, V&gt;</code></td><td><code>arrow.MapOf(K, V)</code></td></tr>
-<tr><td><code>variant</code></td><td><code>arrow.ExtensionType</code> for Variant</td></tr>
+<tr><td><code>variant</code></td><td><code>arrow.ExtensionType</code> for Variant (see <a href="./variant.html">Variant Type</a>)</td></tr>
 </tbody></table>
 </div>
 <p>Helpers in <a href="https://github.com/apache/iceberg-go/blob/main/table/arrow_utils.go"><code>table/arrow_utils.go</code></a>:</p>
@@ -1537,6 +1637,102 @@ v.Properties()          // iceberg.Properties
 <li><code>VisitArrowSchema[T](sc *arrow.Schema, visitor ArrowSchemaVisitor[T]) (T, error)</code></li>
 </ul>
 <p>For a writer-side schema (Arrow → Iceberg), the scanner and writers handle conversion automatically as long as your Arrow schema is compatible with the table schema.</p>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="variant-type"><a class="header" href="#variant-type">Variant Type</a></h1>
+<p><code>variant</code> is the Iceberg v3 semi-structured type: a single self-describing column
+that holds arbitrary JSON-like values (objects, arrays, and scalars) without a
+fixed schema. iceberg-go supports both non-shredded and shredded variants, and can
+push predicates down into individual variant fields.</p>
+<h2 id="reading-and-writing"><a class="header" href="#reading-and-writing">Reading and writing</a></h2>
+<p>A variant column is declared with <code>iceberg.VariantType{}</code> in the table schema and
+maps to the Arrow <code>variant</code> extension type (see <a href="./api.html">API</a>). Non-shredded
+variant values need no extra configuration: write an Arrow record whose variant
+column uses the extension type, and read it back the same way.</p>
+<p>Build the column with a variant builder and write it like any other Arrow column
+(the table must be format version 3):</p>
+<pre><code class="language-go">import (
+    &quot;fmt&quot;
+
+    &quot;github.com/apache/arrow-go/v18/arrow&quot;
+    &quot;github.com/apache/arrow-go/v18/arrow/array&quot;
+    &quot;github.com/apache/arrow-go/v18/arrow/extensions&quot;
+    &quot;github.com/apache/arrow-go/v18/arrow/memory&quot;
+    &quot;github.com/apache/arrow-go/v18/parquet/variant&quot;
+    &quot;github.com/apache/iceberg-go&quot;
+    &quot;github.com/apache/iceberg-go/table&quot;
+)
+
+// tbl was created with table.PropertyFormatVersion = &quot;3&quot; and this schema.
+schema := iceberg.NewSchema(0,
+    iceberg.NestedField{ID: 1, Name: &quot;payload&quot;, Type: iceberg.VariantType{}},
+)
+arrowSchema, _ := table.SchemaToArrowSchema(schema, nil, true, false)
+
+bldr := extensions.NewVariantBuilder(memory.DefaultAllocator, extensions.NewDefaultVariantType())
+defer bldr.Release()
+
+var vb variant.Builder
+_ = vb.Append(map[string]any{&quot;x&quot;: int64(320), &quot;target&quot;: &quot;button-submit&quot;})
+val, _ := vb.Build()
+bldr.Append(val)
+
+col := bldr.NewArray()
+defer col.Release()
+rec := array.NewRecordBatch(arrowSchema, []arrow.Array{col}, 1)
+defer rec.Release()
+
+tx := tbl.NewTransaction()
+arrTable := array.NewTableFromRecords(arrowSchema, []arrow.Record{rec})
+defer arrTable.Release()
+_ = tx.AppendTable(ctx, arrTable, 1024, nil)
+tbl, _ = tx.Commit(ctx)
+</code></pre>
+<p>A normal scan reads it back; the variant column comes back as an <code>*extensions.VariantArray</code>:</p>
+<pre><code class="language-go">result, _ := tbl.Scan().ToArrowTable(ctx)
+defer result.Release()
+
+variants := result.Column(0).Data().Chunk(0).(*extensions.VariantArray)
+v, _ := variants.Value(0)
+fmt.Println(v.Value()) // variant.ObjectValue for the object above
+</code></pre>
+<h2 id="shredding"><a class="header" href="#shredding">Shredding</a></h2>
+<p>Shredding stores the fields of a variant as typed Parquet sub-columns instead of a
+single opaque blob. This lets scans read and filter a field as a native column
+rather than decoding every value. Shredding is opt-in and configured with two write
+properties (see <a href="./configuration.html#parquet-writer">Configuration</a>):</p>
+<ul>
+<li><code>write.parquet.shred-variants</code> - enable shredding of top-level variant columns
+(default <code>false</code>).</li>
+<li><code>write.parquet.variant-inference-buffer-size</code> - rows buffered per file to infer
+the shredding schema (default <code>100</code>).</li>
+</ul>
+<p>The reader accepts both shredded and non-shredded data; no read-side
+configuration is required.</p>
+<h2 id="filtering-on-variant-fields"><a class="header" href="#filtering-on-variant-fields">Filtering on variant fields</a></h2>
+<p>Filter on a field inside a variant with <code>iceberg.Extract</code>, which plugs into the
+usual predicate builders. See <a href="./row-filter-syntax.html#variant-extraction">Row Filter Syntax</a>
+for usage, supported target types, and caveats.</p>
+<h2 id="constraints"><a class="header" href="#constraints">Constraints</a></h2>
+<ul>
+<li>A variant column cannot be a partition source or an identity-transform source.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
   ~ or more contributor license agreements.  See the NOTICE file
@@ -1597,6 +1793,20 @@ iceberg.NotNaN(iceberg.Reference(&quot;ratio&quot;))
 iceberg.NotStartsWith(iceberg.Reference(&quot;name&quot;), &quot;tmp_&quot;)
 </code></pre>
 <p>Operators <code>OpStartsWith</code> and <code>OpNotStartsWith</code> (<code>exprs.go:53-54</code>). The value must be a <code>string</code>.</p>
+<h2 id="variant-extraction"><a class="header" href="#variant-extraction">Variant extraction</a></h2>
+<p><code>iceberg.Extract(ref, path, typ)</code> builds a term that navigates a member-selector path into a <code>variant</code> column and casts the leaf to <code>typ</code>. The path uses dot (<code>$.user.age</code>) or quoted-bracket (<code>$['user']['age']</code>) notation; array indexing (<code>$.items[0]</code>), wildcards, filters, and recursive descent are rejected at bind time. It is an <code>UnboundTerm</code>, so it plugs into the same predicate builders as <code>iceberg.Reference</code>:</p>
+<pre><code class="language-go">filter := iceberg.EqualTo(
+    iceberg.Extract(iceberg.Reference(&quot;payload&quot;), &quot;$.user.age&quot;, iceberg.PrimitiveTypes.Int64),
+    int64(30),
+)
+</code></pre>
+<p>The referenced column must be a <code>variant</code>, and a target type is required. Supported target types: <code>bool</code>, <code>int32</code>, <code>int64</code>, <code>float32</code>, <code>float64</code>, <code>date</code>, <code>time</code>, <code>timestamp</code>, <code>timestamptz</code>, <code>timestamp_ns</code>, <code>timestamptz_ns</code>, <code>string</code>, <code>fixed</code>, <code>binary</code>, <code>decimal</code>, <code>uuid</code>.</p>
+<p>Caveats:</p>
+<ul>
+<li>Extract predicates prune whole data files by shredded-field bounds (best-effort, and only for shredded fields), then filter row by row. Row-group statistics and bloom filters do not apply to them.</li>
+<li>Extract terms are DSL-only (no string row-filter form) and are not REST-serializable. Under local scan planning (the default) they run as local residuals; with remote scan planning, a filter containing an Extract term fails to serialize rather than being silently dropped.</li>
+</ul>
+<p>See <a href="./variant.html">Variant Type</a> for shredding.</p>
 <h2 id="constants"><a class="header" href="#constants">Constants</a></h2>
 <pre><code class="language-go">iceberg.AlwaysTrue{}
 iceberg.AlwaysFalse{}
@@ -1684,6 +1894,7 @@ iceberg.AlwaysFalse{}
 <ul>
 <li><code>Reference(&quot;column_name&quot;)</code> - an unbound term that names a column (<code>exprs.go:373</code>). Typing happens at bind time, when the expression is matched against a schema. This is what you almost always want.</li>
 <li><code>BoundReference</code> - the resolved form, produced by <code>Reference.Bind(schema, caseSensitive)</code> (<code>exprs.go:389</code>). You only encounter these when writing custom expression visitors.</li>
+<li><code>Extract(ref, path, typ)</code> - a variant sub-path term that navigates a member-selector path (<code>$.a.b</code> or <code>$['a']['b']</code>; no array indexing or wildcards) into a <code>variant</code> column and casts the leaf to <code>typ</code> (<code>variant_extract.go</code>). Use it inside any predicate builder to filter on a field within a variant. See <a href="./row-filter-syntax.html#variant-extraction">Row Filter Syntax</a>.</li>
 </ul>
 <p>The interfaces are:</p>
 <pre><code class="language-go">type Term interface { ... }                        // shared marker
@@ -1730,6 +1941,7 @@ inverted := expr.Negate()  // equivalent to NotEqualTo(...)
 <tr><td>Filter a scan or row-level delete</td><td>Convenience builders + <code>NewAnd</code>/<code>NewOr</code>/<code>NewNot</code></td></tr>
 <tr><td>Combine many clauses dynamically</td><td>Start from <code>AlwaysTrue{}</code> (for AND) or <code>AlwaysFalse{}</code> (for OR), fold with <code>NewAnd</code>/<code>NewOr</code></td></tr>
 <tr><td>Construct a predicate whose operator is chosen at runtime</td><td><code>UnaryPredicate(op, term)</code>, <code>LiteralPredicate(op, term, lit)</code>, <code>SetPredicate(op, term, lits)</code></td></tr>
+<tr><td>Filter on a field inside a variant column</td><td><code>Extract(ref, path, typ)</code> inside a predicate builder</td></tr>
 <tr><td>Walk an expression tree</td><td>A custom <code>BooleanExprVisitor</code> from <code>visitors.go</code></td></tr>
 </tbody></table>
 </div>
@@ -1798,7 +2010,11 @@ rejects when concurrent deletes touch the same files.</p>
 <p>iceberg-go can refresh the table and replay the operation against the latest
 snapshot between attempts. On each retry the table metadata is reloaded, the
 producer's validators re-run against the fresh snapshot, and the commit is
-re-submitted only if it is still valid.</p>
+re-submitted only if it is still valid. <code>RollbackToSnapshot</code>, <code>ExpireSnapshots</code>
+and <code>AssertRefSnapshotID</code> pin the refs they guard, so a retry does not rebase
+those assertions. If a guarded ref has moved, the commit fails with
+<code>ErrCommitFailed</code> instead of retrying. An <code>ExpireSnapshots</code> that removes nothing
+adds no guards.</p>
 <p>Retry is <strong>off by default</strong> (<code>commit.retry.num-retries</code> is <code>0</code>). Opt in by
 setting the retry properties — see <a href="./configuration.html#manifest-and-commit">Manifest and commit</a>
 in the configuration reference for the full list:</p>
@@ -1810,9 +2026,9 @@ _, err := cat.CreateTable(ctx, ident, schema,
 )
 </code></pre>
 <blockquote>
-<p><strong>Catalog support:</strong> retry currently engages on the REST catalog, which wraps
-commit conflicts as <code>ErrCommitFailed</code>. The Glue, SQL, and Hive catalogs do
-not yet wrap their conflict errors, so the retry loop will not fire on them.</p>
+<p><strong>Catalog support:</strong> the REST, SQL, Glue, Hive, and Hadoop catalogs report
+commit conflicts, including requirements that fail because of a concurrent
+change, as <code>ErrCommitFailed</code>, so the retry loop engages on all of them.</p>
 </blockquote>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
@@ -1983,7 +2199,7 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td>Equality deletes</td><td>Supported (read + write). Write via <code>Transaction.WriteEqualityDeletes</code>; row-level commits via <code>Transaction.NewRowDelta</code>; delete-only CDC via <code>Transaction.CommitEqualityDeletes</code></td></tr>
 <tr><td>Partition spec evolution</td><td>Supported</td></tr>
 <tr><td>Sort order enforcement on write</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1157">#1157</a>, closes <a href="https://github.com/apache/iceberg-go/issues/833">#833</a>)</td></tr>
-<tr><td><code>ReplaceDataFiles</code> using <code>OpReplace</code></td><td>Pending (<a href="https://github.com/apache/iceberg-go/issues/841">#841</a>)</td></tr>
+<tr><td><code>ReplaceDataFilesByPath</code> using <code>OpReplace</code></td><td>Pending (<a href="https://github.com/apache/iceberg-go/issues/841">#841</a>)</td></tr>
 </tbody></table>
 </div>
 <h3 id="v3"><a class="header" href="#v3">V3</a></h3>
@@ -1991,15 +2207,20 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td>Nanosecond timestamps (<code>timestamp_ns</code>, <code>timestamptz_ns</code>)</td><td>Supported</td></tr>
 <tr><td>Default values (<code>initial-default</code>, <code>write-default</code>)</td><td>Supported</td></tr>
 <tr><td>Row lineage (<code>_row_id</code>, <code>_last_updated_sequence_number</code>)</td><td>Supported</td></tr>
-<tr><td>Encryption keys in metadata</td><td>Supported</td></tr>
+<tr><td>Encryption keys in metadata</td><td>Supported (metadata-level storage + <code>EncryptionManager</code> interface; file-level envelope encryption not yet implemented <a href="https://github.com/apache/iceberg-go/pull/1620">PR #1620 in review</a>)</td></tr>
 <tr><td>Variant type, non-shredded</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/932">#932</a>; umbrella <a href="https://github.com/apache/iceberg-go/issues/929">#929</a>)</td></tr>
-<tr><td>Variant type, shredded reader / writer</td><td>In progress (<a href="https://github.com/apache/iceberg-go/issues/986">#986</a>, <a href="https://github.com/apache/iceberg-go/issues/987">#987</a>)</td></tr>
+<tr><td>Variant type, shredded reader / writer</td><td>Supported (reader <a href="https://github.com/apache/iceberg-go/pull/1238">#1238</a>, writer <a href="https://github.com/apache/iceberg-go/pull/1351">#1351</a>)</td></tr>
+<tr><td>Variant predicate pushdown / field extract</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1607">#1607</a>)</td></tr>
 <tr><td>Deletion vectors, read</td><td>Supported</td></tr>
 <tr><td>Deletion vectors, write (unpartitioned)</td><td>Supported</td></tr>
-<tr><td>Deletion vectors, write (partitioned)</td><td>In progress (<a href="https://github.com/apache/iceberg-go/issues/1135">#1135</a>, PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
+<tr><td>Deletion vectors, write (partitioned)</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
 <tr><td>Geometry / Geography types (schema)</td><td>Supported</td></tr>
-<tr><td>Geometry / Geography (transforms, statistics, pruning)</td><td>In progress (umbrella <a href="https://github.com/apache/iceberg-go/issues/989">#989</a>)</td></tr>
+<tr><td>Geometry: statistics and pruning</td><td>Supported</td></tr>
+<tr><td>Geography: read, write, and schema</td><td>Supported (bounds/pruning intentionally omitted for geodesic safety)</td></tr>
+<tr><td>Geometry / Geography: nested-geo null counts</td><td>Supported (like other nested fields, no bounds are written)</td></tr>
 <tr><td>Multi-argument transforms</td><td>Infrastructure present; no concrete implementations exercised yet</td></tr>
+<tr><td>Statistics files (read / round-trip)</td><td>Supported</td></tr>
+<tr><td>NDV (Theta-sketch) statistics computation</td><td>Roadmap (<a href="https://github.com/apache/iceberg-go/issues/1929">#1929</a>)</td></tr>
 </tbody></table>
 </div>
 <h2 id="filesystem-support"><a class="header" href="#filesystem-support">FileSystem support</a></h2>
@@ -2010,7 +2231,7 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td style="text-align: center">Local Filesystem</td><td style="text-align: center">X</td></tr>
 </tbody></table>
 </div>
-<p>S3, GCS, and Azure require a blank import: <code>_ &quot;github.com/apache/iceberg-go/io/gocloud&quot;</code>. See <a href="./configuration.html">Configuration</a>.</p>
+<p>S3, GCS, and Azure each require a blank import of their backend package, for example <code>_ &quot;github.com/apache/iceberg-go/io/gocloud/s3&quot;</code>. See <a href="./configuration.html">Configuration</a>.</p>
 <h2 id="metadata-operations"><a class="header" href="#metadata-operations">Metadata operations</a></h2>
 <div class="table-wrapper"><table><thead><tr><th style="text-align: left">Operation</th><th style="text-align: center">Supported</th></tr></thead><tbody>
 <tr><td style="text-align: left">Get Schema</td><td style="text-align: center">X</td></tr>
@@ -2058,7 +2279,7 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td style="text-align: left">Append Stream</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Append Data Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Rewrite Files</td><td style="text-align: center">X</td></tr>
-<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center"></td></tr>
+<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Overwrite Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Copy-On-Write Delete</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Write Pos Delete</td><td style="text-align: center">X</td></tr>
@@ -2115,6 +2336,7 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <li>Keep PRs focused — one issue per PR.</li>
 <li>Run <code>make test</code> and <code>make lint</code> before pushing. CI runs all of these too, but catching issues locally saves a round-trip. <code>make lint-install</code> will install the linter if you don't have it yet.</li>
 <li>All commits must have a <code>Signed-off-by</code> line (<a href="https://developercertificate.org/">DCO</a>).</li>
+<li>CI checks the exported API against the base branch with <code>apidiff</code>. If your PR changes it incompatibly on purpose, mark the PR title as breaking with a <code>!</code>, for example <code>refactor(io)!: add context to IO.Open</code>. You can run the same check locally with <code>dev/check-api-compat.sh</code> after installing the <code>apidiff</code> version it names.</li>
 </ul>
 <h2 id="code-review"><a class="header" href="#code-review">Code Review</a></h2>
 <ul>
@@ -2131,8 +2353,17 @@ make test-race # runs all unit tests with race detector
 </code></pre>
 <h3 id="integration-tests"><a class="header" href="#integration-tests">Integration Tests</a></h3>
 <p>Integration tests require Docker and are gated behind a build tag:</p>
-<pre><code class="language-bash">docker compose -f internal/recipe/docker-compose.yml up -d rest minio mc --wait
+<pre><code class="language-bash">docker compose -f internal/recipe/docker-compose.yml up -d rest object-store create-bucket --wait
 go test -tags integration ./...
+</code></pre>
+<h4 id="external-rest-catalog-conformance"><a class="header" href="#external-rest-catalog-conformance">External REST Catalog Conformance</a></h4>
+<p><code>TestExternalRestCatalogConformance</code> runs the catalog conformance suite against any REST catalog server. It is skipped unless <code>REST_CATALOG_URI</code> is set. CI runs it against <a href="https://polaris.apache.org/">Apache Polaris</a>; to do the same locally (requires <code>jq</code>):</p>
+<pre><code class="language-bash">make integration-setup-polaris
+make integration-external-rest
+</code></pre>
+<p>To test another catalog, override the Polaris defaults with <code>REST_CATALOG_URI</code>, <code>REST_CATALOG_CREDENTIAL</code> (<code>client_id:client_secret</code>), <code>REST_CATALOG_SCOPE</code> and <code>REST_CATALOG_WAREHOUSE</code>. Set any of them to an empty value to leave it unset, for example:</p>
+<pre><code class="language-bash">REST_CATALOG_URI=http://localhost:8181 REST_CATALOG_CREDENTIAL= REST_CATALOG_SCOPE= REST_CATALOG_WAREHOUSE= \
+  make integration-external-rest
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
@@ -2365,6 +2596,76 @@ go test -tags integration ./...
 <p>To track <code>main</code>, use <code>@main</code> instead of a version tag.</p>
 <h2 id="release-notes"><a class="header" href="#release-notes">Release notes</a></h2>
 <p>Per-release notes (highlights, breaking changes, contributors) are published on the <a href="https://github.com/apache/iceberg-go/releases">GitHub Releases page</a>. Iceberg Go does not maintain a curated <code>CHANGELOG.md</code> in the repository; the GitHub Releases page is the canonical source.</p>
+<h3 id="unreleased-compatibility-notes"><a class="header" href="#unreleased-compatibility-notes">Unreleased compatibility notes</a></h3>
+<ul>
+<li>
+<p><strong>Data file block size setter removed.</strong> <code>iceberg.DataFileBuilder.BlockSizeInBytes</code> is removed. New v1 manifests use the Avro schema's 64 MiB default when the field is unset. V2/v3 omit this deprecated field, and legacy v1 values remain readable.</p>
+</li>
+<li>
+<p><strong>View creation APIs take a named SQL representation.</strong> <code>view.NewVersionFromSQL</code>, <code>view.CreateView</code>, <code>view.CreateViewWithIOProperties</code>, and <code>sql.Catalog.CreateView</code> now accept a <code>view.Representation{SQL: sql, Dialect: dialect}</code> instead of positional SQL/dialect strings. The dialect is required; Hive preserves the selected representation's dialect.</p>
+</li>
+<li>
+<p><strong>View SQL representation construction uses named fields.</strong> Replace <code>view.NewRepresentation(sql, dialect)</code> with <code>view.NewRepresentation(view.Representation{SQL: sql, Dialect: dialect})</code>. Serialized JSON is unchanged.</p>
+</li>
+<li>
+<p><strong>Reserved table properties now use a read-only API.</strong> Replace references to <code>table.ReservedProperties</code> with <code>table.ReservedProperties()</code>. The function returns a fresh slice, so callers cannot change metadata validation by modifying it.</p>
+</li>
+<li>
+<p><strong>Fixed and decimal constructors return errors.</strong> <code>iceberg.FixedTypeOf</code> and <code>iceberg.DecimalTypeOf</code> now return <code>(type, error)</code> instead of panicking for invalid inputs. Use <code>MustFixedTypeOf</code> or <code>MustDecimalTypeOf</code> only for known-valid values.</p>
+</li>
+<li>
+<p><strong>SQL UDF representations now use struct literals.</strong> The <code>udf.NewSQLRepresentation(dialect, sql)</code> function, available since v0.7.0, is removed. Use <code>udf.SQLRepresentation{Dialect: &quot;trino&quot;, SQL: &quot;x + 1&quot;}</code> instead. Empty fields and duplicate dialects are checked during metadata validation; serialized JSON is unchanged.</p>
+</li>
+<li>
+<p><strong>Filesystem adapter construction consolidated.</strong> Replace <code>io.FSPreProcName(fsys, fn)</code> with <code>io.FS(fsys, io.WithNamePreprocessor(fn))</code>. Plain <code>io.FS(fsys)</code> remains supported.</p>
+</li>
+<li>
+<p><strong>Table purge is required on catalogs.</strong> The <code>catalog.Catalog</code> interface now embeds <code>catalog.PurgeableCatalog</code>; every custom catalog implementation must provide <code>PurgeTable(ctx, identifier) error</code>. The narrow <code>catalog.PurgeableTable</code> interface is renamed to <code>catalog.PurgeableCatalog</code>. Built-in purge behavior is unchanged.</p>
+</li>
+<li>
+<p><strong>Unify statistics blob types with Puffin.</strong> Replace <code>table.BlobType</code> with <code>puffin.BlobType</code> when constructing <code>table.BlobMetadata</code>. Replace <code>table.BlobTypeApacheDatasketchesThetaV1</code> with <code>puffin.BlobTypeDataSketchesTheta</code> and <code>table.BlobTypeDeletionVectorV1</code> with <code>puffin.BlobTypeDeletionVector</code>. Use <code>puffin.BlobType.IsKnown()</code> to identify the types defined by the Puffin specification; the redundant <code>table.BlobType.IsValid()</code> method is removed. Unknown non-empty blob type names still round-trip through table metadata.</p>
+</li>
+<li>
+<p><strong>View representation field uses the Go SQL initialism.</strong> Replace <code>view.Representation.Sql</code> with <code>view.Representation.SQL</code>. Serialized view metadata still uses the <code>sql</code> JSON field.</p>
+</li>
+<li>
+<p><strong>Orphan cleanup results now expose only <code>OrphanFiles</code>.</strong> Replace <code>result.OrphanFileLocations</code> with <code>result.OrphanFiles</code> (each entry has <code>Path</code> and <code>SizeBytes</code>). <code>OrphanCleanupPlan.Files()</code> still provides path-only lists during planning.</p>
+</li>
+<li>
+<p><strong>Catalog identifier helper renamed.</strong> <code>catalog.TableNameFromIdent</code> is removed. Use <code>catalog.ObjectNameFromIdent</code> for tables, views, and functions.</p>
+</li>
+<li>
+<p><strong>Substrait expression conversion no longer takes case sensitivity.</strong> <code>substrait.ConvertExpr(schema, expression, caseSensitive)</code> becomes <code>substrait.ConvertExpr(schema, expression)</code>. Case sensitivity remains part of expression binding.</p>
+</li>
+<li>
+<p><strong>Transform formatting requires the result type and uses the Java-aligned method name.</strong> <code>Transform.ToHumanStr(value)</code> and <code>Transform.ToHumanStrType(resultType, value)</code> are removed. Use <code>Transform.ToHumanString(resultType, value)</code> to format partition values, including timestamps with time zones.</p>
+</li>
+<li>
+<p><strong>Catalogs now require cleanup.</strong> The <code>catalog.Catalog</code> interface includes <code>Close() error</code>. Custom catalog implementations must provide <code>Close</code>, and callers should close catalog instances after use. <code>catalog.Closer</code> is removed. Replace <code>cat.(catalog.Closer)</code> checks with <code>defer cat.Close()</code>; <code>catalog.Catalog</code> already implements <code>io.Closer</code>, so no type assertion is needed.</p>
+</li>
+<li>
+<p><strong>Puffin writer property setter renamed.</strong> <code>puffin.Writer.AddProperties</code> is now <code>puffin.Writer.SetProperties</code>. Repeated calls still merge keys; use <code>ClearProperties</code> to clear custom properties before finishing.</p>
+</li>
+<li>
+<p><strong>Orphan file cleanup moved to <code>table/maintenance</code>.</strong> The orphan-cleanup and file-purge API is no longer on <code>table.Table</code>; it now lives in the <code>table/maintenance</code> package as free functions that take the table as their first argument (matching <code>table/compaction</code>). For example, <code>tbl.DeleteOrphanFiles(ctx, ...)</code> becomes <code>maintenance.DeleteOrphanFiles(ctx, tbl, ...)</code>. Because <code>table/maintenance</code> imports <code>table</code> (and not the reverse), this cannot be offered as a deprecation shim on <code>table.Table</code> without an import cycle, so callers must switch to the new package. The following moved from <code>table</code> to <code>table/maintenance</code>:</p>
+<ul>
+<li>Functions (now free functions taking <code>*table.Table</code>): <code>DeleteOrphanFiles</code>, <code>PlanOrphanFiles</code>, <code>ExecuteOrphanCleanup</code>, <code>PurgeFiles</code>.</li>
+<li>Types: <code>OrphanCleanupOption</code>, <code>OrphanCleanupResult</code>, <code>OrphanFile</code>, <code>OrphanCleanupPlan</code>, <code>PrefixMismatchMode</code>.</li>
+<li>Constants: <code>PrefixMismatchError</code>, <code>PrefixMismatchIgnore</code>, <code>PrefixMismatchDelete</code>.</li>
+<li>Option constructors: <code>WithCleanupLocation</code>, <code>WithCleanupFilesOlderThan</code>, <code>WithCleanupDryRun</code>, <code>WithCleanupDeleteFunc</code>, <code>WithCleanupMaxConcurrency</code>, <code>WithPrefixMismatchMode</code>, <code>WithEqualSchemes</code>, <code>WithEqualAuthorities</code>. The four generic names (<code>WithLocation</code>, <code>WithFilesOlderThan</code>, <code>WithDryRun</code>, <code>WithDeleteFunc</code>) gained the <code>WithCleanup</code> prefix for consistency.</li>
+</ul>
+<p>Relatedly, the previously unexported <code>isGCEnabled</code> is now <code>table.IsGCEnabled</code>, so the new package can gate destructive operations on the <code>gc.enabled</code> table property.</p>
+</li>
+<li>
+<p><strong>Data-file replacement methods renamed.</strong> Use <code>ReplaceDataFilesByPath</code> for string paths. Use <code>ReplaceDataFiles</code> for prebuilt <code>DataFile</code> values instead of <code>ReplaceDataFilesWithDataFiles</code>.</p>
+</li>
+<li>
+<p><code>maintenance.PurgeFiles</code> (previously <code>Table.PurgeFiles</code>) now calls <code>IO.Remove</code> concurrently, with up to 32 calls in flight, when the filesystem does not implement <code>BulkRemovableIO</code>. Custom IO implementations, including those registered with <code>io.Register</code>, must make <code>Remove</code> safe for concurrent use and synchronize any shared mutable state. The bulk deletion path is unchanged.</p>
+</li>
+<li>
+<p><strong>Partition and sort source accessors renamed.</strong> Replace <code>PartitionField.SourceID()</code> and <code>SortField.SourceID()</code> with <code>FirstSourceID()</code>. Their behavior and serialized fields are unchanged.</p>
+</li>
+</ul>
 <h2 id="verifying-and-producing-releases"><a class="header" href="#verifying-and-producing-releases">Verifying and producing releases</a></h2>
 <p>If you are validating an RC or cutting a new release, see:</p>
 <ul>

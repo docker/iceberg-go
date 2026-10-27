@@ -123,7 +123,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html" class="active">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="getting-started.html">Getting Started</a></li><li class="chapter-item expanded "><a href="configuration.html">Configuration</a></li><li class="chapter-item expanded "><a href="cli.html">CLI</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="variant.html">Variant Type</a></li><li class="chapter-item expanded "><a href="row-filter-syntax.html">Row Filter Syntax</a></li><li class="chapter-item expanded "><a href="expression-dsl.html">Expression DSL</a></li><li class="chapter-item expanded "><a href="concurrent-writes.html">Concurrent Writes</a></li><li class="chapter-item expanded "><a href="metrics-reporting.html">Metrics Reporting</a></li></ol></li><li class="chapter-item expanded "><a href="feature-status.html" class="active">Feature Status</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="contributing.html">Contributing</a></li><li class="chapter-item expanded "><a href="community.html">Community</a></li><li class="chapter-item expanded "><a href="glossary.html">Glossary</a></li><li class="chapter-item expanded affix "><li class="part-title">Releases</li><li class="chapter-item expanded "><a href="releases.html">Releases</a></li><li><ol class="section"><li class="chapter-item expanded "><a href="verify-release.html">Verify a release</a></li><li class="chapter-item expanded "><a href="how-to-release.html">How to release</a></li></ol></li><li class="chapter-item expanded "><li class="part-title">Ecosystem</li><li class="chapter-item expanded "><a href="ecosystem.html">Other Iceberg implementations</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -246,7 +246,7 @@
 <tr><td>Equality deletes</td><td>Supported (read + write). Write via <code>Transaction.WriteEqualityDeletes</code>; row-level commits via <code>Transaction.NewRowDelta</code>; delete-only CDC via <code>Transaction.CommitEqualityDeletes</code></td></tr>
 <tr><td>Partition spec evolution</td><td>Supported</td></tr>
 <tr><td>Sort order enforcement on write</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1157">#1157</a>, closes <a href="https://github.com/apache/iceberg-go/issues/833">#833</a>)</td></tr>
-<tr><td><code>ReplaceDataFiles</code> using <code>OpReplace</code></td><td>Pending (<a href="https://github.com/apache/iceberg-go/issues/841">#841</a>)</td></tr>
+<tr><td><code>ReplaceDataFilesByPath</code> using <code>OpReplace</code></td><td>Pending (<a href="https://github.com/apache/iceberg-go/issues/841">#841</a>)</td></tr>
 </tbody></table>
 </div>
 <h3 id="v3"><a class="header" href="#v3">V3</a></h3>
@@ -254,15 +254,20 @@
 <tr><td>Nanosecond timestamps (<code>timestamp_ns</code>, <code>timestamptz_ns</code>)</td><td>Supported</td></tr>
 <tr><td>Default values (<code>initial-default</code>, <code>write-default</code>)</td><td>Supported</td></tr>
 <tr><td>Row lineage (<code>_row_id</code>, <code>_last_updated_sequence_number</code>)</td><td>Supported</td></tr>
-<tr><td>Encryption keys in metadata</td><td>Supported</td></tr>
+<tr><td>Encryption keys in metadata</td><td>Supported (metadata-level storage + <code>EncryptionManager</code> interface; file-level envelope encryption not yet implemented <a href="https://github.com/apache/iceberg-go/pull/1620">PR #1620 in review</a>)</td></tr>
 <tr><td>Variant type, non-shredded</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/932">#932</a>; umbrella <a href="https://github.com/apache/iceberg-go/issues/929">#929</a>)</td></tr>
-<tr><td>Variant type, shredded reader / writer</td><td>In progress (<a href="https://github.com/apache/iceberg-go/issues/986">#986</a>, <a href="https://github.com/apache/iceberg-go/issues/987">#987</a>)</td></tr>
+<tr><td>Variant type, shredded reader / writer</td><td>Supported (reader <a href="https://github.com/apache/iceberg-go/pull/1238">#1238</a>, writer <a href="https://github.com/apache/iceberg-go/pull/1351">#1351</a>)</td></tr>
+<tr><td>Variant predicate pushdown / field extract</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1607">#1607</a>)</td></tr>
 <tr><td>Deletion vectors, read</td><td>Supported</td></tr>
 <tr><td>Deletion vectors, write (unpartitioned)</td><td>Supported</td></tr>
-<tr><td>Deletion vectors, write (partitioned)</td><td>In progress (<a href="https://github.com/apache/iceberg-go/issues/1135">#1135</a>, PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
+<tr><td>Deletion vectors, write (partitioned)</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
 <tr><td>Geometry / Geography types (schema)</td><td>Supported</td></tr>
-<tr><td>Geometry / Geography (transforms, statistics, pruning)</td><td>In progress (umbrella <a href="https://github.com/apache/iceberg-go/issues/989">#989</a>)</td></tr>
+<tr><td>Geometry: statistics and pruning</td><td>Supported</td></tr>
+<tr><td>Geography: read, write, and schema</td><td>Supported (bounds/pruning intentionally omitted for geodesic safety)</td></tr>
+<tr><td>Geometry / Geography: nested-geo null counts</td><td>Supported (like other nested fields, no bounds are written)</td></tr>
 <tr><td>Multi-argument transforms</td><td>Infrastructure present; no concrete implementations exercised yet</td></tr>
+<tr><td>Statistics files (read / round-trip)</td><td>Supported</td></tr>
+<tr><td>NDV (Theta-sketch) statistics computation</td><td>Roadmap (<a href="https://github.com/apache/iceberg-go/issues/1929">#1929</a>)</td></tr>
 </tbody></table>
 </div>
 <h2 id="filesystem-support"><a class="header" href="#filesystem-support">FileSystem support</a></h2>
@@ -273,7 +278,7 @@
 <tr><td style="text-align: center">Local Filesystem</td><td style="text-align: center">X</td></tr>
 </tbody></table>
 </div>
-<p>S3, GCS, and Azure require a blank import: <code>_ &quot;github.com/apache/iceberg-go/io/gocloud&quot;</code>. See <a href="./configuration.html">Configuration</a>.</p>
+<p>S3, GCS, and Azure each require a blank import of their backend package, for example <code>_ &quot;github.com/apache/iceberg-go/io/gocloud/s3&quot;</code>. See <a href="./configuration.html">Configuration</a>.</p>
 <h2 id="metadata-operations"><a class="header" href="#metadata-operations">Metadata operations</a></h2>
 <div class="table-wrapper"><table><thead><tr><th style="text-align: left">Operation</th><th style="text-align: center">Supported</th></tr></thead><tbody>
 <tr><td style="text-align: left">Get Schema</td><td style="text-align: center">X</td></tr>
@@ -321,7 +326,7 @@
 <tr><td style="text-align: left">Append Stream</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Append Data Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Rewrite Files</td><td style="text-align: center">X</td></tr>
-<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center"></td></tr>
+<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Overwrite Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Copy-On-Write Delete</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Write Pos Delete</td><td style="text-align: center">X</td></tr>
