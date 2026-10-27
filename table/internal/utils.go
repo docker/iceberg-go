@@ -36,6 +36,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/iceberg-go"
+	iceberginternal "github.com/apache/iceberg-go/internal"
 	"github.com/twmb/avro/atype"
 	"golang.org/x/sync/errgroup"
 )
@@ -82,11 +83,27 @@ func (pq *pqueue[T]) Pop() any {
 // based on the comesAfter and isNext functions. The values are read in from
 // the provided source and then re-ordered before being sent to the output.
 func MakeSequencedChan[T any](bufferSize uint, source <-chan T, comesAfter, isNext func(a, b *T) bool, initial T) <-chan T {
+	return MakeSequencedChanWithDiscard(bufferSize, source, comesAfter, isNext, initial, nil)
+}
+
+// MakeSequencedChanWithDiscard is MakeSequencedChan with a callback for values
+// that remain in the reorder queue when the source is closed. Values already
+// sent to the output are not passed to discard.
+func MakeSequencedChanWithDiscard[T any](bufferSize uint, source <-chan T, comesAfter, isNext func(a, b *T) bool, initial T, discard func(T)) <-chan T {
 	pq := pqueue[T]{queue: make([]*T, 0), compare: comesAfter}
 	heap.Init(&pq)
 	previous, out := &initial, make(chan T, bufferSize)
 	go func() {
 		defer close(out)
+		defer func() {
+			if discard == nil {
+				return
+			}
+
+			for _, val := range pq.queue {
+				discard(*val)
+			}
+		}()
 		for val := range source {
 			heap.Push(&pq, &val)
 			for pq.Len() > 0 && isNext(previous, pq.queue[0]) {
@@ -160,13 +177,22 @@ func PartitionRecordValue(field iceberg.PartitionField, val iceberg.Literal, sch
 		return ret, nil
 	}
 
-	f, ok := schema.FindFieldByID(field.SourceID())
+	f, ok := schema.FindFieldByIDRef(field.FirstSourceID(), iceberginternal.SchemaRef{})
 	if !ok {
 		return ret, fmt.Errorf("%w: could not find source field in schema for %s",
 			iceberg.ErrInvalidSchema, field.String())
 	}
 
-	out, err := val.To(f.Type)
+	return partitionRecordValue(val, f.Type)
+}
+
+func partitionRecordValue(val iceberg.Literal, sourceType iceberg.Type) (iceberg.Optional[iceberg.Literal], error) {
+	var ret iceberg.Optional[iceberg.Literal]
+	if val == nil {
+		return ret, nil
+	}
+
+	out, err := val.To(sourceType)
 	if err != nil {
 		return ret, err
 	}
@@ -213,7 +239,7 @@ type DataFileStatistics struct {
 }
 
 func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *iceberg.Schema) any {
-	agg, ok := d.ColAggs[field.SourceID()]
+	agg, ok := d.ColAggs[field.FirstSourceID()]
 	if !ok {
 		return nil
 	}
@@ -222,8 +248,22 @@ func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *ic
 		return nil
 	}
 
-	lowerRec := must(PartitionRecordValue(field, agg.Min(), sc))
-	upperRec := must(PartitionRecordValue(field, agg.Max(), sc))
+	sourceField, ok := sc.FindFieldByIDRef(field.FirstSourceID(), iceberginternal.SchemaRef{})
+	if !ok {
+		panic(fmt.Errorf("%w: could not find source field in schema for %s",
+			iceberg.ErrInvalidSchema, field.String()))
+	}
+
+	return d.partitionValueWithSourceType(field, agg, sourceField.Type)
+}
+
+func (d *DataFileStatistics) partitionValueWithSourceType(field iceberg.PartitionField, agg StatsAgg, sourceType iceberg.Type) any {
+	if agg == nil {
+		return nil
+	}
+
+	lowerRec := must(partitionRecordValue(agg.Min(), sourceType))
+	upperRec := must(partitionRecordValue(agg.Max(), sourceType))
 
 	lowerT := field.Transform.Apply(lowerRec)
 	upperT := field.Transform.Apply(upperRec)
@@ -269,20 +309,27 @@ func (d *DataFileStatistics) ToDataFile(opts DataFileOpts) iceberg.DataFile {
 	fieldIDToLogicalType := make(map[int]string)
 
 	if !opts.Spec.Equals(*iceberg.UnpartitionedSpec) {
-		fieldIDToPartitionData = make(map[int]any)
+		fieldIDToPartitionData = make(map[int]any, opts.Spec.NumFields())
 		for _, field := range opts.Spec.Fields() {
+			sourceField, sourceFieldFound := opts.Schema.FindFieldByIDRef(
+				field.FirstSourceID(), iceberginternal.SchemaRef{})
 			partitionVal := opts.PartitionValues[field.FieldID]
 			switch {
 			case partitionVal != nil:
 				// prioritizing caller-supplied value.
 				fieldIDToPartitionData[field.FieldID] = partitionVal
+			case field.Transform.PreservesOrder() && sourceFieldFound:
+				fieldIDToPartitionData[field.FieldID] = d.partitionValueWithSourceType(
+					field, d.ColAggs[field.FirstSourceID()], sourceField.Type)
 			case field.Transform.PreservesOrder():
+				// Preserve the existing error path for an invalid schema. This branch
+				// is not part of the valid hot path because sourceFieldFound is false.
 				fieldIDToPartitionData[field.FieldID] = d.PartitionValue(field, opts.Schema)
 			default:
 				fieldIDToPartitionData[field.FieldID] = nil
 			}
 
-			if sourceField, ok := opts.Schema.FindFieldByID(field.SourceID()); ok {
+			if sourceFieldFound {
 				resultType := field.Transform.ResultType(sourceField.Type)
 
 				switch resultType.(type) {
@@ -528,21 +575,42 @@ func (s *statsAggregator[T]) MaxAsBytes() ([]byte, error) {
 	}
 }
 
-func TruncateUpperBoundText(s string, trunc int) string {
-	if trunc >= utf8.RuneCountInString(s) {
-		return s
-	}
-
-	result := []rune(s)[:trunc]
-	for i := len(result) - 1; i >= 0; i-- {
-		if next, ok := nextValidRune(result[i]); ok {
-			result[i] = next
-
-			return string(result[:i+1])
+// truncateString returns the prefix containing at most width UTF-8 code
+// points. The boolean is true when the input was actually truncated.
+func truncateString(s string, width int) (string, bool) {
+	for idx := range s {
+		if width == 0 {
+			return s[:idx], true
 		}
+
+		width--
 	}
 
-	return ""
+	return s, false
+}
+
+func TruncateUpperBoundText(s string, trunc int) string {
+	result, _ := truncateUpperBoundText(s, trunc)
+
+	return result
+}
+
+func truncateUpperBoundText(s string, trunc int) (string, bool) {
+	result, truncated := truncateString(s, trunc)
+	if !truncated {
+		return s, false
+	}
+
+	for len(result) > 0 {
+		r, size := utf8.DecodeLastRuneInString(result)
+		if next, ok := nextValidRune(r); ok {
+			return result[:len(result)-size] + string(next), true
+		}
+
+		result = result[:len(result)-size]
+	}
+
+	return "", true
 }
 
 func nextValidRune(r rune) (rune, bool) {
@@ -557,17 +625,22 @@ func nextValidRune(r rune) (rune, bool) {
 }
 
 func TruncateUpperBoundBinary(val []byte, trunc int) []byte {
+	if trunc < 0 {
+		// A negative width cannot describe a prefix. Keep the original bound
+		// instead of panicking on the slice expression below.
+		return slices.Clone(val)
+	}
 	if trunc >= len(val) {
 		return slices.Clone(val)
 	}
 
 	result := slices.Clone(val[:trunc])
 
-	for i := len(result) - 1; i >= 0; i-- {
-		if result[i] < 255 {
+	for i, v := range slices.Backward(result) {
+		if v < 255 {
 			result[i]++
 
-			return result
+			return result[:i+1]
 		}
 	}
 

@@ -45,7 +45,6 @@ import (
 	_ "github.com/apache/iceberg-go/io/gocloud"
 	"github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/suite"
-	"github.com/testcontainers/testcontainers-go/modules/compose"
 )
 
 type SparkIntegrationTestSuite struct {
@@ -54,13 +53,10 @@ type SparkIntegrationTestSuite struct {
 	ctx   context.Context
 	cat   catalog.Catalog
 	props iceberg.Properties
-	stack *compose.DockerCompose
 }
 
 func (s *SparkIntegrationTestSuite) SetupSuite() {
-	var err error
-	s.stack, err = recipe.Start(s.T())
-	s.Require().NoError(err)
+	s.Require().NoError(recipe.Start(s.T()))
 }
 
 func (s *SparkIntegrationTestSuite) SetupTest() {
@@ -159,7 +155,7 @@ func (s *SparkIntegrationTestSuite) TestAddFile() {
 	}
 
 	tx := tbl.NewTransaction()
-	err = tx.AddFiles(s.ctx, []string{filename}, nil, false)
+	err = tx.AddDataFilesByPath(s.ctx, []string{filename}, nil, false)
 	s.Require().NoError(err)
 
 	tbl, err = tx.Commit(s.ctx)
@@ -195,10 +191,10 @@ func (s *SparkIntegrationTestSuite) TestDifferentDataTypes() {
 		iceberg.NestedField{ID: 10, Name: "date", Type: iceberg.PrimitiveTypes.Date},
 		iceberg.NestedField{ID: 11, Name: "uuid", Type: iceberg.PrimitiveTypes.UUID},
 		iceberg.NestedField{ID: 12, Name: "binary", Type: iceberg.PrimitiveTypes.Binary},
-		iceberg.NestedField{ID: 13, Name: "fixed", Type: iceberg.FixedTypeOf(16)},
-		iceberg.NestedField{ID: 14, Name: "small_dec", Type: iceberg.DecimalTypeOf(8, 2)},
-		iceberg.NestedField{ID: 15, Name: "med_dec", Type: iceberg.DecimalTypeOf(16, 2)},
-		iceberg.NestedField{ID: 16, Name: "large_dec", Type: iceberg.DecimalTypeOf(24, 2)},
+		iceberg.NestedField{ID: 13, Name: "fixed", Type: iceberg.MustFixedTypeOf(16)},
+		iceberg.NestedField{ID: 14, Name: "small_dec", Type: iceberg.MustDecimalTypeOf(8, 2)},
+		iceberg.NestedField{ID: 15, Name: "med_dec", Type: iceberg.MustDecimalTypeOf(16, 2)},
+		iceberg.NestedField{ID: 16, Name: "large_dec", Type: iceberg.MustDecimalTypeOf(24, 2)},
 		iceberg.NestedField{
 			ID: 17, Name: "list", Type: &iceberg.ListType{
 				ElementID: 18,
@@ -220,7 +216,7 @@ func (s *SparkIntegrationTestSuite) TestDifferentDataTypes() {
 				"long": 1,
 				"float": 0.0,
 				"double": 0.0,
-				"timestamp": "2023-01-01T19:25:00.000000+08:00",
+				"timestamp": "2023-01-01T11:25:00.000000",
 				"timestamptz": "2023-01-01T19:25:00.000000Z",
 				"date": "2023-01-01",
 				"uuid": "00000000-0000-0000-0000-000000000000",
@@ -258,7 +254,7 @@ func (s *SparkIntegrationTestSuite) TestDifferentDataTypes() {
 				"long": 9,
 				"float": 0.9,
 				"double": 0.9,
-				"timestamp": "2023-03-01T19:25:00.000000+08:00",
+				"timestamp": "2023-03-01T11:25:00.000000",
 				"timestamptz": "2023-03-01T19:25:00.000000Z",
 				"date": "2023-03-01",
 				"uuid": "11111111-1111-1111-1111-111111111111",
@@ -616,6 +612,33 @@ func (s *SparkIntegrationTestSuite) TestShreddedVariantSparkWriteGoRead() {
 		s.Require().Contains(out, "1000")
 		s.Require().Contains(out, "R1000")
 	})
+
+	s.Run("extract predicate pushdown over spark-shredded data", func() {
+		matchingIDs := func(filter iceberg.BooleanExpression) []int64 {
+			res, err := tbl.Scan(table.WithRowFilter(filter)).ToArrowTable(ctx)
+			s.Require().NoError(err)
+			defer res.Release()
+			var ids []int64
+			for _, ch := range res.Column(0).Data().Chunks() {
+				c := ch.(*array.Int64)
+				for i := 0; i < c.Len(); i++ {
+					ids = append(ids, c.Value(i))
+				}
+			}
+
+			return ids
+		}
+
+		// $.a == 99: only the bulk row with a=99 matches (scalar/array/null rows have no $.a).
+		s.Equal([]int64{99}, matchingIDs(iceberg.EqualTo(
+			iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64), int64(99))),
+			"$.a == 99 selects exactly the a=99 row over Spark-shredded data")
+
+		// Nested $.c.y == "y150": exercises a nested shredded string leaf.
+		s.Equal([]int64{150}, matchingIDs(iceberg.EqualTo(
+			iceberg.Extract("payload", "$.c.y", iceberg.PrimitiveTypes.String), "y150")),
+			"nested $.c.y == y150 selects exactly id 150")
+	})
 }
 
 // variantField returns the Go value of an object field, failing if absent.
@@ -630,7 +653,7 @@ func (s *SparkIntegrationTestSuite) variantField(obj variant.ObjectValue, key st
 func (s *SparkIntegrationTestSuite) assertVariantFileShredded(tbl *table.Table, path string) {
 	fs, err := tbl.FS(s.ctx)
 	s.Require().NoError(err)
-	f, err := fs.Open(path)
+	f, err := fs.Open(s.ctx, path)
 	s.Require().NoError(err)
 	defer f.Close()
 

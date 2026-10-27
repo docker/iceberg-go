@@ -23,7 +23,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal"
@@ -90,7 +89,7 @@ func walkVariantTyped(typedPath []string, ownResidual string, fields []string, d
 			return
 		}
 		*out = append(*out, variantLeaf{
-			jsonPath:    normalizedVariantPath(fields),
+			jsonPath:    iceberg.NormalizeVariantPath(fields),
 			typedPath:   joinPath(typedPath),
 			ownResidual: ownResidual,
 			icebergType: it,
@@ -137,7 +136,12 @@ func arrowLeafToIceberg(dt arrow.DataType) (iceberg.PrimitiveType, bool) {
 			return iceberg.PrimitiveTypes.TimestampTzNs, true
 		}
 	case *arrow.Decimal128Type:
-		return iceberg.DecimalTypeOf(int(t.Precision), int(t.Scale)), true
+		dec, err := iceberg.DecimalTypeOf(int(t.Precision), int(t.Scale))
+		if err != nil {
+			return nil, false
+		}
+
+		return dec, true
 	case arrow.ExtensionType:
 		if t.ExtensionName() == "arrow.uuid" {
 			return iceberg.PrimitiveTypes.UUID, true
@@ -150,60 +154,6 @@ func arrowLeafToIceberg(dt arrow.DataType) (iceberg.PrimitiveType, bool) {
 func cloneStrs(s []string) []string { return append([]string(nil), s...) }
 
 func joinPath(s []string) string { return strings.Join(s, ".") }
-
-// normalizedVariantPath builds the spec's RFC-9535 normalized JSON path.
-func normalizedVariantPath(fields []string) string {
-	if len(fields) == 0 {
-		return "$"
-	}
-
-	var b strings.Builder
-	b.WriteByte('$')
-	for _, f := range fields {
-		b.WriteString("['")
-		b.WriteString(rfc9535Escape(f))
-		b.WriteString("']")
-	}
-
-	return b.String()
-}
-
-func rfc9535Escape(name string) string {
-	if strings.IndexFunc(name, func(r rune) bool {
-		return r < 0x20 || r == '\'' || r == '\\'
-	}) < 0 {
-		return name
-	}
-
-	var b strings.Builder
-	b.Grow(len(name) + 4)
-	for _, r := range name {
-		switch r {
-		case '\b':
-			b.WriteString(`\b`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\f':
-			b.WriteString(`\f`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\'':
-			b.WriteString(`\'`)
-		case '\\':
-			b.WriteString(`\\`)
-		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, `\u%04x`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-
-	return b.String()
-}
 
 // variantFieldBound is a shredded field's lower bound and upper bound; a nil upper is omitted.
 type variantFieldBound struct {
@@ -219,11 +169,14 @@ func truncateVariantBound(it iceberg.PrimitiveType, lo, hi iceberg.Literal, trun
 	}
 	switch it.(type) {
 	case iceberg.StringType:
-		if s := lo.Any().(string); utf8.RuneCountInString(s) > truncLen {
-			lo = iceberg.StringLiteral(string([]rune(s)[:truncLen]))
+		s := lo.Any().(string)
+		if truncated, ok := truncateString(s, truncLen); ok {
+			lo = iceberg.StringLiteral(strings.Clone(truncated))
 		}
-		if s := hi.Any().(string); utf8.RuneCountInString(s) > truncLen {
-			if up := TruncateUpperBoundText(s, truncLen); up != "" {
+
+		s = hi.Any().(string)
+		if up, truncated := truncateUpperBoundText(s, truncLen); truncated {
+			if up != "" {
 				hi = iceberg.StringLiteral(up)
 			} else {
 				hi = nil
@@ -366,4 +319,37 @@ func appendDecimalToVariant(b *variant.Builder, t iceberg.DecimalType, v any) er
 	}
 
 	return fmt.Errorf("variant bounds: unsupported decimal value %T", v)
+}
+
+// VariantBoundLiteral decodes the stored variant bound object at the normalized path and casts it to typ.
+func VariantBoundLiteral(raw []byte, path string, typ iceberg.PrimitiveType) (lit iceberg.Literal, ok bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			lit, ok, err = nil, false, fmt.Errorf("variant bound decode: %v", r)
+		}
+	}()
+
+	meta, err := variant.NewMetadata(raw)
+	if err != nil {
+		return nil, false, err
+	}
+
+	v, err := variant.New(raw[:meta.SizeBytes()], raw[meta.SizeBytes():])
+	if err != nil {
+		return nil, false, err
+	}
+
+	obj, isObj := v.Value().(variant.ObjectValue)
+	if !isObj {
+		return nil, false, nil
+	}
+
+	field, err := obj.ValueByKey(path)
+	if err != nil {
+		return nil, false, nil
+	}
+
+	lit, ok = iceberg.CastVariantLiteral(field.Value, typ)
+
+	return lit, ok, nil
 }

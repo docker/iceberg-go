@@ -31,13 +31,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
-	"maps"
 	"strings"
 	"unicode"
 
 	"github.com/apache/iceberg-go"
-	iceinternal "github.com/apache/iceberg-go/internal"
 	"github.com/apache/iceberg-go/table"
 )
 
@@ -114,8 +113,17 @@ func NewCreateViewCfg() CreateViewCfg {
 	}
 }
 
-// Catalog for iceberg table operations like create, drop, load, list and others.
+// Catalog provides table and namespace operations plus an explicit resource
+// lifecycle. Implementations must release catalog-owned resources in Close.
+// Ownership of constructor-supplied dependencies depends on the implementation.
+// Using a catalog after Close is unsupported; repeated Close calls have
+// implementation-specific behavior.
 type Catalog interface {
+	io.Closer
+
+	// PurgeableCatalog provides the mandatory physical table deletion API.
+	PurgeableCatalog
+
 	// CatalogType returns the type of the catalog.
 	CatalogType() Type
 
@@ -170,13 +178,26 @@ type TransactionalCatalog interface {
 	CommitTransaction(ctx context.Context, commits []table.TableCommit) error
 }
 
-// PurgeableTable is an optional interface that catalogs can implement
-// to support physical table deletion (catalog entry + underlying files).
-// Callers should check for this capability via a type assertion:
+// RegisterableCatalog is an optional interface for catalogs that can register
+// an existing table from its metadata file. Registration adds a catalog entry
+// without creating a new table or rewriting its data.
 //
-//	if purger, ok := cat.(catalog.PurgeableTable); ok {
-//	    err := purger.PurgeTable(ctx, ident)
+// REST, Hive, and Glue catalogs implement this interface. Callers should
+// check for registration support with a type assertion:
+//
+//	if registerable, ok := cat.(catalog.RegisterableCatalog); ok {
+//		tbl, err := registerable.RegisterTable(ctx, ident, metadataLocation)
 //	}
+//
+// Backend support for registration does not guarantee that a given request
+// will succeed (for example, if the table already exists).
+type RegisterableCatalog interface {
+	RegisterTable(ctx context.Context, identifier table.Identifier, metadataLocation string) (*table.Table, error)
+}
+
+// PurgeableCatalog is the small table purge interface embedded by Catalog.
+// Every Catalog must support PurgeTable, which removes the catalog entry and
+// performs best-effort physical file deletion.
 //
 // For REST catalogs the purge is delegated server-side. For client-side
 // catalogs (SQL, Glue, Hive, Hadoop) the table is first dropped from
@@ -189,30 +210,40 @@ type TransactionalCatalog interface {
 // Any file-deletion, directory walk, or listing errors encountered are logged
 // as warnings, and the operation succeeds (returns nil) so that the catalog drop
 // remains the single source of truth.
-type PurgeableTable interface {
+type PurgeableCatalog interface {
 	PurgeTable(ctx context.Context, identifier table.Identifier) error
 }
 
-// Closer is an optional interface implemented by catalogs that hold releasable
-// resources — currently a metrics reporter and stateful resources (e.g.
-// HTTP-backed clients). It is not part of [Catalog] because adding a method to that
-// widely-implemented interface would break every external implementation; a
-// follow-up may promote it. Callers holding a [Catalog] from [Load] should
-// release it via a type assertion:
+// RefreshableCredentialCatalog is an optional interface implemented by catalogs that
+// support temporarily-vended credentials. Temporarily-vended credentials scope object
+// storage access to just files allowed by the user making a related request to the
+// catalog. Callers should check for this capability via a type assertion:
 //
-//	cat, err := catalog.Load(ctx, name, props)
-//	if err != nil {
-//	    return err
-//	}
-//	if closer, ok := cat.(catalog.Closer); ok {
-//	    defer closer.Close()
+//	if rc, ok := cat.(catalog.RefreshableCredentialCatalog); ok {
+//	    refreshed, err := rc.RefreshTableCredentials(ctx, tbl)
+//	    if err == nil {
+//	        tbl = refreshed
+//	    }
 //	}
 //
-// All built-in catalogs (REST, SQL, Glue, Hive, Hadoop) implement Closer. Close
-// releases the catalog's own resources; a catalog built on a caller-owned handle
-// (e.g. the SQL catalog's *sql.DB) does not close that handle.
-type Closer interface {
-	Close() error
+// Passing the type assertion does not guarantee that credentials can be vended.
+// An implementation may still return an error, for example when the catalog
+// service does not support vending credentials (the REST catalog returns
+// rest.ErrEndpointNotSupported if the server does not advertise the credentials
+// endpoint) or no longer knows the table ([ErrNoSuchTable]). On error the
+// returned table is nil, and callers should keep using the original table.
+type RefreshableCredentialCatalog interface {
+	// RefreshTableCredentials loads temporarily-vended credentials for a previously
+	// loaded table, and returns a new/modified table instance with up-to-date credentials
+	// if the catalog is using temporarily-vended credentials for this table.
+	// In this case, the instance should be able to refresh its own credentials internally
+	// making it useful for use as a long-lived instance. For tables that do
+	// not have catalog-vended storage credentials, the table can be returned with no
+	// modifications.
+	//
+	// The main use-case for this method is to be able to make externally-created table
+	// instances compatible with catalog-based credential refreshes.
+	RefreshTableCredentials(ctx context.Context, tbl *table.Table) (*table.Table, error)
 }
 
 func ToIdentifier(ident ...string) table.Identifier {
@@ -235,10 +266,6 @@ func ObjectNameFromIdent(ident table.Identifier) string {
 	}
 
 	return ident[len(ident)-1]
-}
-
-func TableNameFromIdent(ident table.Identifier) string {
-	return ObjectNameFromIdent(ident)
 }
 
 func NamespaceFromIdent(ident table.Identifier) table.Identifier {
@@ -356,53 +383,4 @@ func WithViewProperties(config iceberg.Properties) CreateViewOpt {
 	return func(cfg *CreateViewCfg) {
 		cfg.Properties = config
 	}
-}
-
-//lint:ignore U1000 this is linked to by catalogs via go:linkname but we don't want to export it
-func checkForOverlap(removals []string, updates iceberg.Properties) error {
-	overlap := []string{}
-	for _, key := range removals {
-		if _, ok := updates[key]; ok {
-			overlap = append(overlap, key)
-		}
-	}
-	if len(overlap) > 0 {
-		return fmt.Errorf("conflict between removals and updates for keys: %v", overlap)
-	}
-
-	return nil
-}
-
-//lint:ignore U1000 this is linked to by catalogs via go:linkname but we don't want to export it
-func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, PropertiesUpdateSummary, error) {
-	if err := checkForOverlap(removals, updates); err != nil {
-		return nil, PropertiesUpdateSummary{}, err
-	}
-	var (
-		updatedProps = maps.Clone(currentProps)
-		removed      = make([]string, 0, len(removals))
-		updated      = make([]string, 0, len(updates))
-	)
-
-	for _, key := range removals {
-		if _, exists := updatedProps[key]; exists {
-			delete(updatedProps, key)
-			removed = append(removed, key)
-		}
-	}
-
-	for key, value := range updates {
-		if updatedProps[key] != value {
-			updated = append(updated, key)
-			updatedProps[key] = value
-		}
-	}
-
-	summary := PropertiesUpdateSummary{
-		Removed: removed,
-		Updated: updated,
-		Missing: iceinternal.Difference(removals, removed),
-	}
-
-	return updatedProps, summary, nil
 }

@@ -302,7 +302,7 @@ func TestCoWRewriteDoesNotPruneMissingInitialDefault(t *testing.T) {
 
 func TestCoWRewriteNormalizesTheSurvivorComplement(t *testing.T) {
 	ctx := context.Background()
-	tbl := buildTwoRowGroupV3Table(t)
+	tbl := buildTwoRowGroupTable(t, newV3RowLineageTestTable(t))
 
 	var err error
 	tbl, err = tbl.Delete(ctx,
@@ -478,7 +478,7 @@ func TestExecuteCompactionGroupPreservesRowIDAcrossV2Upgrade(t *testing.T) {
 	require.NoError(t, tx.UpgradeFormatVersion(3))
 	tbl, err = tx.Commit(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 3, tbl.Metadata().Version())
+	require.Equal(t, 3, tbl.Metadata().FormatVersion())
 
 	v3Data, err := array.TableFromJSON(mem, arrowSchema, []string{
 		`[{"id": 3, "data": "c"}, {"id": 4, "data": "d"}]`,

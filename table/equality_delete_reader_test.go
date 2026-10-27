@@ -97,7 +97,7 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 	assertRowCount(t, tbl, 5)
@@ -143,27 +143,41 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 
 	assert.Equal(t, []int64{1, 3, 5}, ids, "expected rows with id=2 and id=4 deleted")
 
-	resultSchema, itr, err := tbl.Scan(table.WithSelectedFields("data")).ToArrowRecords(t.Context())
-	require.NoError(t, err)
-	require.Len(t, resultSchema.Fields(), 1)
-	assert.Equal(t, "data", resultSchema.Fields()[0].Name)
-
-	var data []string
-	for rec, err := range itr {
+	scanData := func(tbl *table.Table) []string {
+		resultSchema, itr, err := tbl.Scan(table.WithSelectedFields("data")).ToArrowRecords(t.Context())
 		require.NoError(t, err)
-		require.EqualValues(t, 1, rec.NumCols())
-		col := rec.Column(0).(*array.String)
-		for i := range col.Len() {
-			data = append(data, col.Value(i))
+		require.Len(t, resultSchema.Fields(), 1)
+		assert.Equal(t, "data", resultSchema.Fields()[0].Name)
+
+		var data []string
+		for rec, err := range itr {
+			require.NoError(t, err)
+			require.EqualValues(t, 1, rec.NumCols())
+			col := rec.Column(0).(*array.String)
+			for i := range col.Len() {
+				data = append(data, col.Value(i))
+			}
+			rec.Release()
 		}
-		rec.Release()
+
+		return data
 	}
 
-	assert.Equal(t, []string{"alpha", "gamma", "epsilon"}, data,
+	assert.Equal(t, []string{"alpha", "gamma", "epsilon"}, scanData(tbl),
 		"expected equality deletes to apply when the equality field is not projected")
+
+	tx3 := tbl.NewTransaction()
+	require.NoError(t, tx3.UpdateSchema(true, false).DeleteColumn([]string{"id"}).Commit())
+	tbl, err = tx3.Commit(t.Context())
+	require.NoError(t, err)
+	_, currentHasEqualityField := tbl.Schema().FindFieldByID(1)
+	require.False(t, currentHasEqualityField)
+
+	assert.Equal(t, []string{"alpha", "gamma", "epsilon"}, scanData(tbl),
+		"expected equality deletes to apply when the equality field exists only in schema history")
 }
 
-func TestEqualityDeleteReadSharesMultiFileUnionAcrossConcurrentTasks(t *testing.T) {
+func TestEqualityDeleteReadPrunesNonOverlappingDeleteFiles(t *testing.T) {
 	ctx := t.Context()
 	tbl := newEqDeleteReadTestTable(t)
 	arrowSc, err := table.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
@@ -183,7 +197,7 @@ func TestEqualityDeleteReadSharesMultiFileUnionAcrossConcurrentTasks(t *testing.
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(ctx, dataPaths, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(ctx, dataPaths, nil, false))
 	tbl, err = tx.Commit(ctx)
 	require.NoError(t, err)
 
@@ -218,8 +232,15 @@ func TestEqualityDeleteReadSharesMultiFileUnionAcrossConcurrentTasks(t *testing.
 	require.NoError(t, err)
 	require.Len(t, tasks, 2)
 	for _, task := range tasks {
-		require.Len(t, task.EqualityDeleteFiles, 2,
-			"each task must use the same multi-file equality-delete union")
+		require.Len(t, task.EqualityDeleteFiles, 1)
+		switch {
+		case strings.HasSuffix(task.File.FilePath(), "/data-001.parquet"):
+			assert.Equal(t, deleteTwoFiles[0].FilePath(), task.EqualityDeleteFiles[0].FilePath())
+		case strings.HasSuffix(task.File.FilePath(), "/data-002.parquet"):
+			assert.Equal(t, deleteThreeFiles[0].FilePath(), task.EqualityDeleteFiles[0].FilePath())
+		default:
+			t.Errorf("unexpected data file %s", task.File.FilePath())
+		}
 	}
 
 	_, records, err := scan.ReadTasks(ctx, tasks)
@@ -255,7 +276,7 @@ func TestEqualityDeleteReadResolvesRenamedDataColumnByFieldID(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -379,7 +400,7 @@ func TestEqualityDeleteReadResolvesLiteralDottedColumnName(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 	tbl, err := tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -426,7 +447,7 @@ func TestEqualityDeleteReadRejectsAmbiguousColumns(t *testing.T) {
 	dataPath := tbl.Location() + "/data/data.parquet"
 	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "one"}]`)
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -465,8 +486,21 @@ func TestEqualityDeleteReadRejectsAmbiguousColumns(t *testing.T) {
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
-	_, _, err = tbl.Scan().ToArrowRecords(t.Context())
-	require.ErrorIs(t, err, table.ErrAmbiguousEqualityColumn)
+	_, records, err := tbl.Scan().ToArrowRecords(t.Context())
+	require.NoError(t, err)
+
+	var scanErr error
+	for record, err := range records {
+		if record != nil {
+			record.Release()
+		}
+		if err != nil {
+			scanErr = err
+
+			break
+		}
+	}
+	require.ErrorIs(t, scanErr, table.ErrAmbiguousEqualityColumn)
 }
 
 func TestEqualityDeleteMatchingAcrossPartitionSpecEvolution(t *testing.T) {
@@ -675,7 +709,7 @@ func TestEqualityDeleteMultiColumnKey(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -777,11 +811,11 @@ func TestEqualityDeleteNullableFastPathKeys(t *testing.T) {
 			keyType: iceberg.PrimitiveTypes.Timestamp,
 			dataJSON: `[
 				{"row_id": 1, "key": null},
-				{"row_id": 2, "key": "1970-01-01T00:00:00.000000Z"},
-				{"row_id": 3, "key": "2024-01-02T03:04:05.000000Z"}
+				{"row_id": 2, "key": "1970-01-01T00:00:00.000000"},
+				{"row_id": 3, "key": "2024-01-02T03:04:05.000000"}
 			]`,
 			nullDeleteJSON: `[{"key": null}]`,
-			zeroDeleteJSON: `[{"key": "1970-01-01T00:00:00.000000Z"}]`,
+			zeroDeleteJSON: `[{"key": "1970-01-01T00:00:00.000000"}]`,
 		},
 	}
 
@@ -803,7 +837,7 @@ func TestEqualityDeleteNullableFastPathKeys(t *testing.T) {
 				writeParquetFile(t, dataPath, arrowSc, tt.dataJSON)
 
 				tx := tbl.NewTransaction()
-				require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+				require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 				tbl, err = tx.Commit(t.Context())
 				require.NoError(t, err)
 
@@ -846,7 +880,7 @@ func TestEqualityDeleteNullableCompositeFastPathKey(t *testing.T) {
 			name: "partially null key",
 			dataJSON: `[
 				{"row_id": 1, "id": 7, "deleted_at": null},
-				{"row_id": 2, "id": 7, "deleted_at": "1970-01-01T00:00:00.000000Z"},
+				{"row_id": 2, "id": 7, "deleted_at": "1970-01-01T00:00:00.000000"},
 				{"row_id": 3, "id": 8, "deleted_at": null},
 				{"row_id": 4, "id": null, "deleted_at": null}
 			]`,
@@ -857,7 +891,7 @@ func TestEqualityDeleteNullableCompositeFastPathKey(t *testing.T) {
 			name: "all-null key",
 			dataJSON: `[
 				{"row_id": 1, "id": null, "deleted_at": null},
-				{"row_id": 2, "id": null, "deleted_at": "1970-01-01T00:00:00.000000Z"},
+				{"row_id": 2, "id": null, "deleted_at": "1970-01-01T00:00:00.000000"},
 				{"row_id": 3, "id": 7, "deleted_at": null}
 			]`,
 			deleteJSON: `[{"id": null, "deleted_at": null}]`,
@@ -894,7 +928,7 @@ func TestEqualityDeleteNullableCompositeFastPathKey(t *testing.T) {
 			writeParquetFile(t, dataPath, arrowSc, tt.dataJSON)
 
 			tx := tbl.NewTransaction()
-			require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+			require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
 			tbl, err = tx.Commit(t.Context())
 			require.NoError(t, err)
 

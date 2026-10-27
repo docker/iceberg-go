@@ -21,11 +21,15 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/google/uuid"
 )
 
 var (
 	removeSnapshotsBenchmarkSink int
 	metadataBuilderBenchmarkSink int
+	bulkRemovalBenchmarkSink     int
 )
 
 var removeSnapshotsBenchmarkCases = []struct {
@@ -40,6 +44,76 @@ var removeSnapshotsBenchmarkCases = []struct {
 	{snapshotCount: 10_000, removedCount: 8},
 	{snapshotCount: 10_000, removedCount: 64},
 	{snapshotCount: 10_000, removedCount: 5_000},
+}
+
+var bulkRemovalBenchmarkCases = []struct {
+	entryCount   int
+	removedCount int
+}{
+	{entryCount: 8, removedCount: 1},
+	{entryCount: 8, removedCount: 2},
+	{entryCount: 8, removedCount: 4},
+	{entryCount: 32, removedCount: 8},
+	{entryCount: 32, removedCount: 9},
+	{entryCount: 32, removedCount: 16},
+	{entryCount: 128, removedCount: 16},
+	{entryCount: 128, removedCount: 17},
+	{entryCount: 128, removedCount: 32},
+	{entryCount: 128, removedCount: 64},
+	{entryCount: 1_024, removedCount: 512},
+	{entryCount: 8_192, removedCount: 4_096},
+}
+
+func BenchmarkRemovePartitionSpecs(b *testing.B) {
+	for _, tc := range bulkRemovalBenchmarkCases {
+		b.Run(fmt.Sprintf("specs=%d/removed=%d", tc.entryCount, tc.removedCount), func(b *testing.B) {
+			template := benchmarkPartitionSpecBuilder(tc.entryCount)
+			removed := benchmarkRemovedIDs(tc.removedCount)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.ReportMetric(float64(tc.entryCount), "spec_entries")
+			b.ReportMetric(float64(len(removed)), "removed_specs")
+
+			for range b.N {
+				b.StopTimer()
+				builder := template
+				builder.specs = slices.Clone(template.specs)
+				b.StartTimer()
+
+				if err := builder.RemovePartitionSpecs(removed); err != nil {
+					b.Fatal(err)
+				}
+				bulkRemovalBenchmarkSink = len(builder.specs)
+			}
+		})
+	}
+}
+
+func BenchmarkRemoveSchemas(b *testing.B) {
+	for _, tc := range bulkRemovalBenchmarkCases {
+		b.Run(fmt.Sprintf("schemas=%d/removed=%d", tc.entryCount, tc.removedCount), func(b *testing.B) {
+			template := benchmarkSchemaBuilder(tc.entryCount)
+			removed := benchmarkRemovedIDs(tc.removedCount)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.ReportMetric(float64(tc.entryCount), "schema_entries")
+			b.ReportMetric(float64(len(removed)), "removed_schemas")
+
+			for range b.N {
+				b.StopTimer()
+				builder := template
+				builder.schemaList = slices.Clone(template.schemaList)
+				b.StartTimer()
+
+				if err := builder.RemoveSchemas(removed); err != nil {
+					b.Fatal(err)
+				}
+				bulkRemovalBenchmarkSink = len(builder.schemaList)
+			}
+		})
+	}
 }
 
 func BenchmarkRemoveSnapshots(b *testing.B) {
@@ -124,6 +198,75 @@ func BenchmarkMetadataBuilderCloneAndBuild(b *testing.B) {
 	}
 }
 
+func BenchmarkTransactionApplyNoRequirements(b *testing.B) {
+	for _, snapshotCount := range []int{1, 100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("snapshots=%d", snapshotCount), func(b *testing.B) {
+			template := benchmarkSnapshotBuilder(snapshotCount)
+			template.ensureSnapshotIndex()
+			txn := &Transaction{meta: template.clone()}
+
+			b.ReportAllocs()
+			b.ReportMetric(float64(snapshotCount), "snapshot_entries")
+			b.ResetTimer()
+
+			for b.Loop() {
+				if err := txn.apply(nil, nil); err != nil {
+					b.Fatal(err)
+				}
+				metadataBuilderBenchmarkSink = len(txn.meta.snapshotList)
+			}
+		})
+	}
+}
+
+func BenchmarkTransactionApplyDuplicateRequirement(b *testing.B) {
+	for _, snapshotCount := range []int{1, 100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("snapshots=%d", snapshotCount), func(b *testing.B) {
+			template := benchmarkSnapshotBuilder(snapshotCount)
+			template.ensureSnapshotIndex()
+			requirement := AssertCurrentSchemaID(0)
+			txn := &Transaction{
+				meta: template.clone(),
+				reqs: []Requirement{requirement},
+			}
+
+			b.ReportAllocs()
+			b.ReportMetric(float64(snapshotCount), "snapshot_entries")
+			b.ResetTimer()
+
+			for b.Loop() {
+				if err := txn.apply(nil, []Requirement{requirement}); err != nil {
+					b.Fatal(err)
+				}
+				metadataBuilderBenchmarkSink = len(txn.meta.snapshotList)
+			}
+		})
+	}
+}
+
+func BenchmarkTransactionApplyNewRequirement(b *testing.B) {
+	for _, snapshotCount := range []int{1, 100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("snapshots=%d", snapshotCount), func(b *testing.B) {
+			template := benchmarkSnapshotBuilder(snapshotCount)
+			template.ensureSnapshotIndex()
+			txn := &Transaction{meta: template.clone()}
+			requirement := AssertCurrentSchemaID(0)
+
+			b.ReportAllocs()
+			b.ReportMetric(float64(snapshotCount), "snapshot_entries")
+			b.ResetTimer()
+
+			for b.Loop() {
+				txn.reqs = nil
+				if err := txn.apply(nil, []Requirement{requirement}); err != nil {
+					b.Fatal(err)
+				}
+				metadataBuilderBenchmarkSink = len(txn.meta.snapshotList)
+			}
+		})
+	}
+}
+
 func BenchmarkMetadataBuilderFromBase(b *testing.B) {
 	for _, snapshotCount := range []int{1_000, 10_000} {
 		b.Run(fmt.Sprintf("snapshots=%d", snapshotCount), func(b *testing.B) {
@@ -146,6 +289,116 @@ func BenchmarkMetadataBuilderFromBase(b *testing.B) {
 				metadataBuilderBenchmarkSink = len(builder.snapshotIndex.positions)
 			}
 		})
+	}
+}
+
+func BenchmarkMetadataBuilderFromBaseCollections(b *testing.B) {
+	cases := []struct {
+		name           string
+		schemaCount    int
+		specCount      int
+		snapshotCount  int
+		sortOrderCount int
+		propertyCount  int
+	}{
+		{name: "schemas=1", schemaCount: 1, specCount: 1, snapshotCount: 1, sortOrderCount: 1},
+		{name: "schemas=16", schemaCount: 16, specCount: 1, snapshotCount: 1, sortOrderCount: 1},
+		{name: "schemas=128", schemaCount: 128, specCount: 1, snapshotCount: 1, sortOrderCount: 1},
+		{name: "schemas=1024", schemaCount: 1024, specCount: 1, snapshotCount: 1, sortOrderCount: 1},
+		{name: "partition-specs=16", schemaCount: 1, specCount: 16, snapshotCount: 1, sortOrderCount: 1},
+		{name: "partition-specs=128", schemaCount: 1, specCount: 128, snapshotCount: 1, sortOrderCount: 1},
+		{name: "snapshots=1000", schemaCount: 1, specCount: 1, snapshotCount: 1000, sortOrderCount: 1},
+		{name: "sort-orders=32", schemaCount: 1, specCount: 1, snapshotCount: 1, sortOrderCount: 32},
+		{name: "properties=32", schemaCount: 1, specCount: 1, snapshotCount: 1, sortOrderCount: 1, propertyCount: 32},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			metadata := benchmarkMetadataBuilderBase(tc.schemaCount, tc.specCount, tc.snapshotCount, tc.sortOrderCount, tc.propertyCount)
+
+			b.ReportAllocs()
+			b.ReportMetric(float64(tc.schemaCount), "schemas")
+			b.ReportMetric(float64(tc.specCount), "partition_specs")
+			b.ReportMetric(float64(tc.snapshotCount), "snapshots")
+			b.ReportMetric(float64(tc.sortOrderCount), "sort_orders")
+			b.ReportMetric(float64(tc.propertyCount), "properties")
+			b.ResetTimer()
+
+			for range b.N {
+				builder, err := MetadataBuilderFromBase(metadata, "")
+				if err != nil {
+					b.Fatal(err)
+				}
+				metadataBuilderBenchmarkSink = len(builder.schemaList) + len(builder.specs) +
+					len(builder.snapshotList) + len(builder.sortOrderList) + len(builder.props)
+			}
+		})
+	}
+}
+
+func benchmarkMetadataBuilderBase(schemaCount, specCount, snapshotCount, sortOrderCount, propertyCount int) Metadata {
+	schemas := make([]*iceberg.Schema, schemaCount)
+	schemas[0] = iceberg.NewSchema(0, iceberg.NestedField{
+		ID:       1,
+		Name:     "id",
+		Type:     iceberg.PrimitiveTypes.Int64,
+		Required: true,
+	})
+	for i := 1; i < schemaCount; i++ {
+		schemas[i] = iceberg.NewSchema(i)
+	}
+
+	specs := make([]iceberg.PartitionSpec, specCount)
+	for i := range specs {
+		specs[i] = iceberg.NewPartitionSpecID(i)
+	}
+
+	sortOrders := make([]SortOrder, sortOrderCount)
+	sortOrders[0] = UnsortedSortOrder
+	for i := 1; i < sortOrderCount; i++ {
+		order, err := NewSortOrder(i, []SortField{{
+			SourceIDs: []int{1},
+			Transform: iceberg.IdentityTransform{},
+			Direction: SortASC,
+			NullOrder: NullsFirst,
+		}})
+		if err != nil {
+			panic(err)
+		}
+		sortOrders[i] = order
+	}
+
+	snapshots := benchmarkSnapshots(snapshotCount)
+	currentSnapshotID := int64(snapshotCount - 1)
+	lastPartitionID := 0
+	properties := make(iceberg.Properties, propertyCount)
+	for i := range propertyCount {
+		properties[fmt.Sprintf("property-%d", i)] = "value"
+	}
+
+	return &metadataV2{
+		LastSeqNum: int64(snapshotCount),
+		commonMetadata: commonMetadata{
+			FormatVersion:      2,
+			UUID:               uuid.New(),
+			Loc:                "s3://bucket/test/location",
+			LastColumnId:       1,
+			SchemaList:         schemas,
+			CurrentSchemaID:    0,
+			Specs:              specs,
+			DefaultSpecID:      0,
+			LastPartitionID:    &lastPartitionID,
+			Props:              properties,
+			SnapshotList:       snapshots,
+			snapshotIndex:      buildSnapshotIndex(snapshots),
+			CurrentSnapshotID:  &currentSnapshotID,
+			SnapshotLog:        benchmarkSnapshotLog(snapshotCount),
+			SortOrderList:      sortOrders,
+			DefaultSortOrderID: 0,
+			SnapshotRefs: map[string]SnapshotRef{
+				MainBranch: {SnapshotID: currentSnapshotID, Type: BranchRef},
+			},
+		},
 	}
 }
 
@@ -174,7 +427,7 @@ func benchmarkSnapshotBuilder(snapshotCount int) *MetadataBuilder {
 	currentID := int64(snapshotCount - 1)
 	builder.currentSnapshotID = &currentID
 	builder.refs = map[string]SnapshotRef{
-		MainBranch: {SnapshotID: currentID, SnapshotRefType: BranchRef},
+		MainBranch: {SnapshotID: currentID, Type: BranchRef},
 	}
 
 	return &builder
@@ -187,4 +440,31 @@ func benchmarkSnapshots(snapshotCount int) []Snapshot {
 	}
 
 	return snapshots
+}
+
+func benchmarkPartitionSpecBuilder(entryCount int) MetadataBuilder {
+	specs := make([]iceberg.PartitionSpec, entryCount)
+	for i := range specs {
+		specs[i] = iceberg.NewPartitionSpecID(i)
+	}
+
+	return MetadataBuilder{specs: specs, defaultSpecID: -1}
+}
+
+func benchmarkSchemaBuilder(entryCount int) MetadataBuilder {
+	schemas := make([]*iceberg.Schema, entryCount)
+	for i := range schemas {
+		schemas[i] = iceberg.NewSchema(i)
+	}
+
+	return MetadataBuilder{schemaList: schemas, currentSchemaID: -1}
+}
+
+func benchmarkRemovedIDs(removedCount int) []int {
+	removed := make([]int, removedCount)
+	for i := range removed {
+		removed[i] = i * 2
+	}
+
+	return removed
 }

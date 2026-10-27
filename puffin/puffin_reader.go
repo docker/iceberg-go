@@ -18,20 +18,25 @@
 package puffin
 
 import (
-	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"math"
 	"slices"
-	"sort"
-
-	"github.com/pierrec/lz4/v4"
 )
+
+// ErrNotPuffinFile is returned by NewReader when the input does not carry a
+// Puffin container: the file is too short to hold the header magic, or its
+// leading bytes are not the Puffin magic. A file that starts with the magic
+// but is truncated or has a broken footer is a damaged Puffin file and does
+// NOT wrap this error. Callers that can still consume the payload by other
+// means (e.g. a deletion vector addressed by content_offset) may test for it
+// with errors.Is.
+var ErrNotPuffinFile = errors.New("puffin: not a puffin file")
 
 // ReaderAtSeeker combines io.ReaderAt and io.Seeker for reading Puffin files.
 // This interface is implemented by *os.File, *bytes.Reader, and similar types.
@@ -105,20 +110,25 @@ func NewReader(r ReaderAtSeeker, opts ...ReaderOption) (*Reader, error) {
 		return nil, fmt.Errorf("puffin: detect file size: %w", err)
 	}
 
-	// Minimum size: header magic + footer magic + footer trailer
-	// [Magic] + zero for blob + [Magic] + [FooterPayloadSize (assuming ~0)] + [Flags] + [Magic]
-	minSize := int64(MagicSize + MagicSize + footerTrailerSize)
-	if size < minSize {
-		return nil, fmt.Errorf("puffin: file too small (%d bytes, minimum %d)", size, minSize)
+	// Validate header magic first: only a file that cannot show the Puffin
+	// magic is "not a Puffin file". A file that starts with the magic but is
+	// truncated is a damaged Puffin file and must not be mistaken for one.
+	if size < int64(MagicSize) {
+		return nil, fmt.Errorf("%w: file too small to hold header magic (%d bytes)", ErrNotPuffinFile, size)
 	}
-
-	// Validate header magic
 	var headerMagic [MagicSize]byte
 	if _, err := r.ReadAt(headerMagic[:], 0); err != nil {
 		return nil, fmt.Errorf("puffin: read header magic: %w", err)
 	}
 	if !bytes.Equal(headerMagic[:], magic[:]) {
-		return nil, errors.New("puffin: invalid header magic")
+		return nil, fmt.Errorf("%w: invalid header magic", ErrNotPuffinFile)
+	}
+
+	// Minimum size: header magic + footer magic + footer trailer
+	// [Magic] + zero for blob + [Magic] + [FooterPayloadSize (assuming ~0)] + [Flags] + [Magic]
+	minSize := int64(MagicSize + MagicSize + footerTrailerSize)
+	if size < minSize {
+		return nil, fmt.Errorf("puffin: file too small (%d bytes, minimum %d)", size, minSize)
 	}
 
 	pr := &Reader{
@@ -174,201 +184,6 @@ func cloneBlobMetadata(blob BlobMetadata) BlobMetadata {
 // We read more than strictly needed to hopefully get the entire footer
 // in one read, reducing round-trips on cloud object storage.
 const defaultFooterReadSize = 8 * 1024 // 8 KB
-
-const (
-	lz4FrameMagic                 uint32 = 0x184d2204
-	lz4FrameHeaderPrefixSize             = 6 // magic (4) + FLG (1) + BD (1)
-	lz4FrameHeaderSize                   = 7 // prefix + header checksum
-	lz4FrameHeaderSizeWithContent        = 15
-	lz4FrameContentSizeFlag       byte   = 1 << 3
-	lz4FrameContentChecksumFlag   byte   = 1 << 2
-	lz4FrameBlockChecksumFlag     byte   = 1 << 4
-	lz4FrameVersionMask           byte   = 0xc0
-	lz4FrameVersionOne            byte   = 0x40
-	lz4FrameReservedFLGFlag       byte   = 1 << 1
-	lz4FrameDictionaryIDFlag      byte   = 1
-	lz4FrameReservedBDFlags       byte   = 0x8f
-	lz4FrameBlockSizeMask         uint32 = 0x7fffffff
-	lz4FrameReadBufferSize               = 4 << 20 // LZ4 maximum block size.
-)
-
-type countingReader struct {
-	reader io.Reader
-	count  int64
-	err    error
-}
-
-func (r *countingReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	r.count += int64(n)
-	if err != nil && !errors.Is(err, io.EOF) {
-		r.err = err
-	}
-
-	return n, err
-}
-
-type lz4FrameHeader struct {
-	flags          byte
-	headerSize     int
-	contentSize    uint64
-	blockMaxSize   int64
-	hasContentSize bool
-}
-
-func lz4BlockMaxSize(bd byte) (int64, error) {
-	switch (bd >> 4) & 0x7 {
-	case 4:
-		return 64 << 10, nil
-	case 5:
-		return 256 << 10, nil
-	case 6:
-		return 1 << 20, nil
-	case 7:
-		return 4 << 20, nil
-	default:
-		return 0, errors.New("invalid LZ4 frame block maximum size")
-	}
-}
-
-// readLZ4FrameHeader reads and validates the LZ4 frame descriptor without
-// consuming the payload. The content size is required by the Puffin format
-// for compressed footer payloads.
-func readLZ4FrameHeader(r io.ReaderAt) (lz4FrameHeader, error) {
-	var header [lz4FrameHeaderSizeWithContent]byte
-	if _, err := r.ReadAt(header[:lz4FrameHeaderSize], 0); err != nil {
-		return lz4FrameHeader{}, err
-	}
-
-	if binary.LittleEndian.Uint32(header[:4]) != lz4FrameMagic {
-		return lz4FrameHeader{}, errors.New("invalid LZ4 frame magic")
-	}
-
-	hasContentSize := header[4]&lz4FrameContentSizeFlag != 0
-	if header[4]&lz4FrameVersionMask != lz4FrameVersionOne {
-		return lz4FrameHeader{}, errors.New("invalid LZ4 frame version")
-	}
-	if header[4]&lz4FrameReservedFLGFlag != 0 {
-		return lz4FrameHeader{}, errors.New("invalid LZ4 frame reserved flag")
-	}
-	if header[4]&lz4FrameDictionaryIDFlag != 0 {
-		return lz4FrameHeader{}, errors.New("LZ4 frame dictionary ID is not supported")
-	}
-	if header[5]&lz4FrameReservedBDFlags != 0 {
-		return lz4FrameHeader{}, errors.New("invalid LZ4 frame reserved block descriptor flags")
-	}
-	blockMaxSize, err := lz4BlockMaxSize(header[5])
-	if err != nil {
-		return lz4FrameHeader{}, err
-	}
-	if hasContentSize {
-		if _, err := r.ReadAt(header[lz4FrameHeaderSize:], lz4FrameHeaderSize); err != nil {
-			return lz4FrameHeader{}, err
-		}
-	}
-
-	headerSize := lz4FrameHeaderSize
-	if hasContentSize {
-		headerSize = lz4FrameHeaderSizeWithContent
-	}
-	valid, err := lz4.ValidFrameHeader(header[:headerSize])
-	if err != nil {
-		return lz4FrameHeader{}, err
-	}
-	if !valid {
-		return lz4FrameHeader{}, errors.New("invalid frame header")
-	}
-
-	frameHeader := lz4FrameHeader{
-		flags:          header[4],
-		headerSize:     headerSize,
-		blockMaxSize:   blockMaxSize,
-		hasContentSize: hasContentSize,
-	}
-	if hasContentSize {
-		frameHeader.contentSize = binary.LittleEndian.Uint64(header[lz4FrameHeaderPrefixSize : lz4FrameHeaderPrefixSize+8])
-	}
-
-	return frameHeader, nil
-}
-
-func validateLZ4FrameEnvelope(
-	r io.ReaderAt,
-	payloadSize int64,
-	flags byte,
-	headerSize int,
-	blockMaxSize int64,
-) error {
-	if payloadSize < int64(headerSize) {
-		return errors.New("LZ4 frame is shorter than its header")
-	}
-	if payloadSize-int64(headerSize) < 4 {
-		return errors.New("LZ4 frame is missing its end mark")
-	}
-
-	firstBlock := make([]byte, headerSize+4)
-	if _, err := r.ReadAt(firstBlock, 0); err != nil {
-		return fmt.Errorf("read LZ4 frame header and block header: %w", err)
-	}
-
-	blockSize := binary.LittleEndian.Uint32(firstBlock[headerSize:])
-	offset := int64(headerSize + 4)
-	reader := bufio.NewReaderSize(
-		io.NewSectionReader(r, offset, payloadSize-offset),
-		lz4FrameReadBufferSize,
-	)
-	var blockHeader [4]byte
-
-	for blockSize != 0 {
-		dataSize := int64(blockSize & lz4FrameBlockSizeMask)
-		if dataSize > blockMaxSize {
-			return errors.New("LZ4 frame block exceeds declared maximum")
-		}
-		if dataSize > payloadSize-offset {
-			return errors.New("LZ4 frame block exceeds its payload")
-		}
-		if _, err := io.CopyN(io.Discard, reader, dataSize); err != nil {
-			return fmt.Errorf("read LZ4 frame block: %w", err)
-		}
-		offset += dataSize
-
-		if flags&lz4FrameBlockChecksumFlag != 0 {
-			if payloadSize-offset < 4 {
-				return errors.New("LZ4 frame block checksum is truncated")
-			}
-			if _, err := io.CopyN(io.Discard, reader, 4); err != nil {
-				return fmt.Errorf("read LZ4 frame block checksum: %w", err)
-			}
-			offset += 4
-		}
-
-		if payloadSize-offset < int64(len(blockHeader)) {
-			return errors.New("LZ4 frame is missing its end mark")
-		}
-		if _, err := io.ReadFull(reader, blockHeader[:]); err != nil {
-			return fmt.Errorf("read LZ4 frame block header: %w", err)
-		}
-		offset += int64(len(blockHeader))
-
-		blockSize = binary.LittleEndian.Uint32(blockHeader[:])
-	}
-
-	if flags&lz4FrameContentChecksumFlag != 0 {
-		if payloadSize-offset < 4 {
-			return errors.New("LZ4 frame content checksum is truncated")
-		}
-		if _, err := io.CopyN(io.Discard, reader, 4); err != nil {
-			return fmt.Errorf("read LZ4 frame content checksum: %w", err)
-		}
-		offset += 4
-	}
-
-	if offset != payloadSize {
-		return errors.New("LZ4 frame has trailing data")
-	}
-
-	return nil
-}
 
 // readFooter reads and parses the footer from the Puffin file.
 func (r *Reader) readFooter() error {
@@ -452,42 +267,14 @@ func (r *Reader) readFooter() error {
 	var compressedContentSize uint64
 	var limitedFooter *io.LimitedReader
 	if flags&FooterFlagCompressed != 0 {
-		// Java, PyIceberg, and Rust currently reject compressed Puffin footers;
-		// keep this flag reader-only until those implementations catch up.
-
-		frameHeader, err := readLZ4FrameHeader(payloadReader)
-		if err != nil {
-			return fmt.Errorf("puffin: inspect compressed footer LZ4 frame: %w", err)
-		}
-		if !frameHeader.hasContentSize {
-			return errors.New("puffin: compressed footer LZ4 frame is missing content size")
-		}
-		if frameHeader.contentSize > uint64(r.maxFooterSize) {
-			return fmt.Errorf("puffin: footer exceeds maximum size %d", r.maxFooterSize)
-		}
-		if err := validateLZ4FrameEnvelope(
-			payloadReader,
-			payloadSize,
-			frameHeader.flags,
-			frameHeader.headerSize,
-			frameHeader.blockMaxSize,
-		); err != nil {
-			return fmt.Errorf("puffin: inspect compressed footer LZ4 frame: %w", err)
-		}
-
-		compressedContentSize = frameHeader.contentSize
-		compressedPayloadReader := bufio.NewReaderSize(
-			io.NewSectionReader(payloadReader, 0, payloadSize),
-			lz4FrameReadBufferSize,
+		var err error
+		compressedFooter, limitedFooter, compressedContentSize, err = newCompressedFooterReader(
+			payloadReader, payloadSize, r.maxFooterSize,
 		)
-		compressedFooter = &countingReader{reader: lz4.NewReader(compressedPayloadReader)}
-		footerReader = compressedFooter
-
-		limitedFooterSize := r.maxFooterSize
-		if limitedFooterSize < math.MaxInt64 {
-			limitedFooterSize++
+		if err != nil {
+			return err
 		}
-		limitedFooter = &io.LimitedReader{R: footerReader, N: limitedFooterSize}
+
 		footerReader = limitedFooter
 	}
 
@@ -509,15 +296,22 @@ func (r *Reader) readFooter() error {
 	// FooterPayloadSize defines a single JSON footer object. Reject trailing
 	// content deliberately, even though some other Iceberg implementations
 	// accept padding or additional values inside the footer payload.
-	if decoder.More() {
-		return errors.New("puffin: unexpected content after footer JSON")
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+	//
+	// A failed decompression read also stops the decoder here; report that
+	// error rather than trailing content. Since Go 1.27, Decoder.More reports
+	// true on non-EOF read errors, so both checks need it.
+	trailingContentErr := func() error {
 		if compressedFooter != nil && compressedFooter.err != nil {
 			return fmt.Errorf("puffin: read compressed footer: %w", compressedFooter.err)
 		}
 
 		return errors.New("puffin: unexpected content after footer JSON")
+	}
+	if decoder.More() {
+		return trailingContentErr()
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return trailingContentErr()
 	}
 	if limitedFooter != nil && limitedFooter.N == 0 {
 		return fmt.Errorf("puffin: footer exceeds maximum size %d", r.maxFooterSize)
@@ -599,29 +393,36 @@ func (r *Reader) ReadAllBlobs() ([]*BlobData, error) {
 		return nil, nil
 	}
 
-	// Create index mapping to preserve original order
-	type indexedBlob struct {
-		index int
-		meta  BlobMetadata
-	}
-	indexed := make([]indexedBlob, len(footer.Blobs))
-	for i, meta := range footer.Blobs {
-		indexed[i] = indexedBlob{index: i, meta: meta}
-	}
+	// Footer metadata is usually already in offset order. Only allocate
+	// and sort indexes if it is not, keeping reads in physical order.
+	var order []int
+	for i := 1; i < len(footer.Blobs); i++ {
+		if footer.Blobs[i-1].Offset > footer.Blobs[i].Offset {
+			order = make([]int, len(footer.Blobs))
+			for j := range order {
+				order[j] = j
+			}
+			slices.SortFunc(order, func(a, b int) int {
+				return cmp.Compare(footer.Blobs[a].Offset, footer.Blobs[b].Offset)
+			})
 
-	// Sort by offset for sequential I/O
-	sort.Slice(indexed, func(i, j int) bool {
-		return indexed[i].meta.Offset < indexed[j].meta.Offset
-	})
-
-	// Read blobs in offset order, store in original order
-	results := make([]*BlobData, len(footer.Blobs))
-	for _, ib := range indexed {
-		data, err := r.readBlobData(ib.meta)
-		if err != nil {
-			return nil, fmt.Errorf("puffin: read blob %d: %w", ib.index, err)
+			break
 		}
-		results[ib.index] = &BlobData{Metadata: cloneBlobMetadata(ib.meta), Data: data}
+	}
+
+	// Read blobs in offset order, store in original order.
+	results := make([]*BlobData, len(footer.Blobs))
+	for i := range footer.Blobs {
+		index := i
+		if order != nil {
+			index = order[i]
+		}
+		meta := footer.Blobs[index]
+		data, err := r.readBlobData(meta)
+		if err != nil {
+			return nil, fmt.Errorf("puffin: read blob %d: %w", index, err)
+		}
+		results[index] = &BlobData{Metadata: cloneBlobMetadata(meta), Data: data}
 	}
 
 	return results, nil

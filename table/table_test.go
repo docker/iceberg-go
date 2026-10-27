@@ -46,12 +46,11 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/sql"
-	"github.com/apache/iceberg-go/internal"
+	"github.com/apache/iceberg-go/internal/iomock"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	"github.com/pterm/pterm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -113,10 +112,10 @@ func (t *TableWritingTestSuite) mustDataFile(spec iceberg.PartitionSpec, path st
 }
 
 func (t *TableTestSuite) SetupSuite() {
-	var mockfs internal.MockFS
+	var mockfs iomock.MockFS
 	mockfs.Test(t.T())
 	mockfs.On("Open", "s3://bucket/test/location/uuid.metadata.json").
-		Return(&internal.MockFile{Contents: bytes.NewReader([]byte(table.ExampleTableMetadataV2))}, nil)
+		Return(&iomock.MockFile{Contents: bytes.NewReader([]byte(table.ExampleTableMetadataV2))}, nil)
 	defer mockfs.AssertExpectations(t.T())
 
 	tbl, err := table.NewFromLocation(
@@ -139,7 +138,7 @@ func (t *TableTestSuite) SetupSuite() {
 }
 
 func (t *TableTestSuite) TestNewTableFromReadFile() {
-	var mockfsReadFile internal.MockFSReadFile
+	var mockfsReadFile iomock.MockFSReadFile
 	mockfsReadFile.Test(t.T())
 	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.metadata.json").
 		Return([]byte(table.ExampleTableMetadataV2), nil)
@@ -173,7 +172,7 @@ func (t *TableTestSuite) TestNewTableFromReadFileGzipped() {
 		log.Fatalf("Error closing gzip writer: %v", err)
 	}
 
-	var mockfsReadFile internal.MockFSReadFile
+	var mockfsReadFile iomock.MockFSReadFile
 	mockfsReadFile.Test(t.T())
 	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.gz.metadata.json").
 		Return(b.Bytes(), nil)
@@ -203,7 +202,7 @@ func (t *TableTestSuite) TestNewTableFromReadFileZstd() {
 	t.Require().NoError(err)
 	t.Require().NoError(enc.Close())
 
-	var mockfsReadFile internal.MockFSReadFile
+	var mockfsReadFile iomock.MockFSReadFile
 	mockfsReadFile.Test(t.T())
 	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.zstd.metadata.json").
 		Return(b.Bytes(), nil)
@@ -233,7 +232,7 @@ func (t *TableTestSuite) TestNewTableFromReadFileZstdAlternateSuffix() {
 	t.Require().NoError(err)
 	t.Require().NoError(enc.Close())
 
-	var mockfsReadFile internal.MockFSReadFile
+	var mockfsReadFile iomock.MockFSReadFile
 	mockfsReadFile.Test(t.T())
 	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.metadata.json.zstd").
 		Return(b.Bytes(), nil)
@@ -263,10 +262,10 @@ func (t *TableTestSuite) TestNewTableFromOpenZstd() {
 	t.Require().NoError(err)
 	t.Require().NoError(enc.Close())
 
-	var mockfs internal.MockFS
+	var mockfs iomock.MockFS
 	mockfs.Test(t.T())
 	mockfs.On("Open", "s3://bucket/test/location/uuid.zstd.metadata.json").
-		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+		Return(&iomock.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
 	defer mockfs.AssertExpectations(t.T())
 
 	tbl2, err := table.NewFromLocation(
@@ -293,10 +292,10 @@ func (t *TableTestSuite) TestNewTableFromOpenZstdAlternateSuffix() {
 	t.Require().NoError(err)
 	t.Require().NoError(enc.Close())
 
-	var mockfs internal.MockFS
+	var mockfs iomock.MockFS
 	mockfs.Test(t.T())
 	mockfs.On("Open", "s3://bucket/test/location/uuid.metadata.json.zstd").
-		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+		Return(&iomock.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
 	defer mockfs.AssertExpectations(t.T())
 
 	tbl2, err := table.NewFromLocation(
@@ -557,7 +556,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -568,13 +567,13 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":       "5",
-				"added-files-size":       "3070",
+				"added-files-size":       "3080",
 				"added-records":          "5",
 				"iceberg-version":        "Apache Iceberg Go " + iceberg.Version(),
 				"total-data-files":       "5",
 				"total-delete-files":     "0",
 				"total-equality-deletes": "0",
-				"total-files-size":       "3070",
+				"total-files-size":       "3080",
 				"total-position-deletes": "0",
 				"total-records":          "5",
 			},
@@ -606,7 +605,7 @@ func (t *TableWritingTestSuite) TestAddFilesFileNotFound() {
 
 	files = append(files, t.location+"/unpartitioned_file_not_found/unknown.parquet")
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := tx.AddDataFilesByPath(t.ctx, files, nil, false)
 	t.Error(err)
 	t.ErrorIs(err, fs.ErrNotExist)
 }
@@ -625,7 +624,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitionedHasFieldIDs() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -680,7 +679,7 @@ func (t *TableWritingTestSuite) TestAddFilesFieldIDsWithDifferentNames() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -735,18 +734,15 @@ func (t *TableWritingTestSuite) TestAddFilesFailsSchemaMismatch() {
 
 	files := []string{filePath}
 
-	pterm.DisableOutput() // disable error to console
-	defer pterm.EnableOutput()
-
 	tx := tbl.NewTransaction()
-	err = tx.AddFiles(t.ctx, files, nil, false)
+	err = tx.AddDataFilesByPath(t.ctx, files, nil, false)
 	t.Error(err)
 	t.EqualError(err, `error encountered during file conversion: invalid schema: mismatch in fields:
-   | Table Field              | Requested Field         
-✅ | 1: foo: optional boolean | 1: foo: optional boolean
-✅ | 2: bar: optional string  | 2: bar: optional string 
-❌ | 3: baz: optional int     | 3: baz: optional string 
-✅ | 4: qux: optional date    | 4: qux: optional date   
+   Table Field               Requested Field
+✅  1: foo: optional boolean  1: foo: optional boolean
+✅  2: bar: optional string   2: bar: optional string
+❌  3: baz: optional int      3: baz: optional string
+✅  4: qux: optional date     4: qux: optional date
 `)
 }
 
@@ -779,7 +775,7 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -790,14 +786,14 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":        "5",
-				"added-files-size":        "3070",
+				"added-files-size":        "3080",
 				"added-records":           "5",
 				"changed-partition-count": "1",
 				"iceberg-version":         "Apache Iceberg Go " + iceberg.Version(),
 				"total-data-files":        "5",
 				"total-delete-files":      "0",
 				"total-equality-deletes":  "0",
-				"total-files-size":        "3070",
+				"total-files-size":        "3080",
 				"total-position-deletes":  "0",
 				"total-records":           "5",
 			},
@@ -836,7 +832,7 @@ func (t *TableWritingTestSuite) TestAddFilesToBucketPartitionedTableFails() {
 	}
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := tx.AddDataFilesByPath(t.ctx, files, nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot infer partition value from parquet metadata for a non-linear partition field: baz_bucket_3 with transform bucket[3]")
 }
@@ -864,7 +860,7 @@ func (t *TableWritingTestSuite) TestAddFilesToPartitionedTableFailsLowerAndUpper
 	}
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := tx.AddDataFilesByPath(t.ctx, files, nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot infer partition value from parquet metadata as there is more than one value for partition field: baz. (low: 123, high: 124)")
 }
@@ -902,7 +898,7 @@ func (t *TableWritingTestSuite) TestAddFilesWithLargeAndRegular() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePathLarge, arrTableLarge)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath, filePathLarge}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{filePath, filePathLarge}, nil, false))
 
 	scan, err := tx.Scan(table.WithOptions(iceberg.Properties{
 		table.ScanOptionArrowUseLargeTypes: "true",
@@ -925,7 +921,7 @@ func (t *TableWritingTestSuite) TestScanWithOptionsAliasing() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{filePath}, nil, false))
 
 	opts := iceberg.Properties{
 		table.ScanOptionArrowUseLargeTypes: "false",
@@ -950,7 +946,7 @@ func (t *TableWritingTestSuite) TestAddFilesValidUpcast() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTablePromotedTypes)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{filePath}, nil, false))
 
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
@@ -998,7 +994,7 @@ func (t *TableWritingTestSuite) TestAddFilesSubsetOfSchema() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, withoutCol)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{filePath}, nil, false))
 
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
@@ -1033,9 +1029,9 @@ func (t *TableWritingTestSuite) TestAddFilesDuplicateFilesInFilePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, []string{filePath, filePath}, nil, false)
+	err := tx.AddDataFilesByPath(t.ctx, []string{filePath, filePath}, nil, false)
 	t.Error(err)
-	t.ErrorContains(err, "file paths must be unique for AddFiles")
+	t.ErrorContains(err, "file paths must be unique for AddDataFilesByPath")
 }
 
 func (t *TableWritingTestSuite) TestAddFilesReferencedByCurrentSnapshot() {
@@ -1053,9 +1049,9 @@ func (t *TableWritingTestSuite) TestAddFilesReferencedByCurrentSnapshot() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
-	err := tx.AddFiles(t.ctx, files[len(files)-1:], nil, false)
+	err := tx.AddDataFilesByPath(t.ctx, files[len(files)-1:], nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table, files:")
 }
@@ -1075,9 +1071,9 @@ func (t *TableWritingTestSuite) TestAddFilesReferencedCurrentSnapshotIgnoreDupli
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 
-	t.Require().NoError(tx.AddFiles(t.ctx, files[len(files)-1:], nil, true))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files[len(files)-1:], nil, true))
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
 
@@ -1115,7 +1111,7 @@ func (m *mockedCatalog) CommitTable(ctx context.Context, ident table.Identifier,
 	return meta, "", nil
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFiles() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPath() {
 	fs := iceio.LocalFS{}
 
 	files := make([]string, 0)
@@ -1143,7 +1139,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 	)
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -1173,7 +1169,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 	t.writeParquet(fs, combinedFilePath, combined)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.ReplaceDataFiles(ctx, files[:2], []string{combinedFilePath}, nil))
+	t.Require().NoError(tx.ReplaceDataFilesByPath(ctx, files[:2], []string{combinedFilePath}, nil))
 
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -1182,16 +1178,16 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 		Operation: table.OpOverwrite,
 		Properties: iceberg.Properties{
 			"added-data-files":       "1",
-			"added-files-size":       "963",
+			"added-files-size":       "967",
 			"added-records":          "4",
 			"deleted-data-files":     "2",
 			"deleted-records":        "4",
 			"iceberg-version":        "Apache Iceberg Go " + iceberg.Version(),
-			"removed-files-size":     "1816",
+			"removed-files-size":     "1822",
 			"total-data-files":       "4",
 			"total-delete-files":     "0",
 			"total-equality-deletes": "0",
-			"total-files-size":       "3687",
+			"total-files-size":       "3700",
 			"total-position-deletes": "0",
 			"total-records":          "10",
 		},
@@ -1387,7 +1383,7 @@ func (t *TableWritingTestSuite) TestAddDataFilesAutoNameMapping() {
 	}
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAutoNameMapping() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesAutoNameMapping() {
 	for _, tc := range []struct {
 		name      string
 		opts      []table.WriteOption
@@ -1420,7 +1416,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAutoNameMapping
 			addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, replacementPath, nil, 1, mustFileSize(t.T(), replacementPath))
 
 			tx = tbl.NewTransaction()
-			t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil, tc.opts...))
+			t.Require().NoError(tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil, tc.opts...))
 
 			staged, err := tx.StagedTable()
 			t.Require().NoError(err)
@@ -1430,7 +1426,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAutoNameMapping
 	}
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
+func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 	ident := table.Identifier{"default", "replace_data_files_with_datafiles_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1442,7 +1438,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, files, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1456,7 +1452,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
 	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, replacementPath, nil, 1, mustFileSize(t.T(), replacementPath))
 
 	tx = tbl.NewTransaction()
-	t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, deleteFiles, []iceberg.DataFile{addFile}, nil))
+	t.Require().NoError(tx.ReplaceDataFiles(t.ctx, deleteFiles, []iceberg.DataFile{addFile}, nil))
 
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -1465,7 +1461,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
 	t.Equal("2", staged.CurrentSnapshot().Summary.Properties["deleted-data-files"])
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDoesNotCarryEmptyManifests() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesDoesNotCarryEmptyManifests() {
 	ident := table.Identifier{"default", "replace_data_files_drops_empty_manifests_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1486,7 +1482,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDoesNotCarryEmp
 	for i := 1; i <= 5; i++ {
 		next := writeDataFile(fmt.Sprintf("data-%d", i))
 		tx = tbl.NewTransaction()
-		t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{current}, []iceberg.DataFile{next}, nil))
+		t.Require().NoError(tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{current}, []iceberg.DataFile{next}, nil))
 		tbl, err = tx.Commit(t.ctx)
 		t.Require().NoError(err)
 		current = next
@@ -1514,7 +1510,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDoesNotCarryEmp
 	t.Equal(1, emptyCurrentManifests)
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionSpecID() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesValidatesPartitionSpecID() {
 	ident := table.Identifier{"default", "replace_data_files_with_datafiles_spec_validation_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
 		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
@@ -1525,7 +1521,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1539,12 +1535,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 		map[int]any{1000: int32(123)}, 1, 1)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "unregistered partition spec id 999")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionData() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesValidatesPartitionData() {
 	ident := table.Identifier{"default", "replace_data_files_with_datafiles_partition_validation_v" + strconv.Itoa(t.formatVersion)}
 	spec := iceberg.NewPartitionSpec(
 		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
@@ -1555,7 +1551,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1565,7 +1561,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 		map[int]any{}, 1, 1)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "missing partition value")
 }
@@ -1679,10 +1675,10 @@ func (t *TableWritingTestSuite) TestAddDataFilesEmptySlice() {
 }
 
 // ============================================================================
-// ReplaceDataFilesWithDataFiles Error Path Tests
+// ReplaceDataFiles Error Path Tests
 // ============================================================================
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateAddPaths() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
 	ident := table.Identifier{"default", "replace_data_files_dup_add_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1690,7 +1686,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateAddPat
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1699,12 +1695,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateAddPat
 		fmt.Sprintf("%s/replace_data_files_dup_add_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile, addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile, addFile}, nil)
 	t.Error(err)
-	t.ErrorContains(err, "add data file paths must be unique for ReplaceDataFilesWithDataFiles")
+	t.ErrorContains(err, "add data file paths must be unique for ReplaceDataFiles")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateDeletePaths() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
 	ident := table.Identifier{"default", "replace_data_files_dup_del_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1712,7 +1708,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateDelete
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1721,12 +1717,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateDelete
 		fmt.Sprintf("%s/replace_data_files_dup_del_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile, deleteFile}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile, deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
-	t.ErrorContains(err, "delete data file paths must be unique for ReplaceDataFilesWithDataFiles")
+	t.ErrorContains(err, "delete data file paths must be unique for ReplaceDataFiles")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAddAlreadyReferenced() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesAddAlreadyReferenced() {
 	ident := table.Identifier{"default", "replace_data_files_add_ref_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1736,7 +1732,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAddAlreadyRefer
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath1, existingPath2}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1744,12 +1740,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAddAlreadyRefer
 	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath2, nil, 1, mustFileSize(t.T(), existingPath2))
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDeleteNotInTable() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
 	ident := table.Identifier{"default", "replace_data_files_del_not_found_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1757,7 +1753,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDeleteNotInTabl
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1767,12 +1763,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDeleteNotInTabl
 		fmt.Sprintf("%s/replace_data_files_del_not_found_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{nonExistentFile}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{nonExistentFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot delete files that do not belong to the table")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilDeleteFile() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesNilDeleteFile() {
 	ident := table.Identifier{"default", "replace_data_files_nil_del_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1780,7 +1776,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilDeleteFile()
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1788,12 +1784,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilDeleteFile()
 		fmt.Sprintf("%s/replace_data_files_nil_del_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{nil}, []iceberg.DataFile{addFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{nil}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "nil data file at index 0")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilAddFile() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesNilAddFile() {
 	ident := table.Identifier{"default", "replace_data_files_nil_add_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1801,19 +1797,19 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilAddFile() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
 	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath, nil, 1, mustFileSize(t.T(), existingPath))
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{nil}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{nil}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "nil data file at index 0")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNoSnapshot() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesNoSnapshot() {
 	ident := table.Identifier{"default", "replace_data_files_no_snapshot_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1823,12 +1819,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNoSnapshot() {
 		fmt.Sprintf("%s/replace_data_files_no_snapshot_v%d/add.parquet", t.location, t.formatVersion), nil, 1, 100)
 
 	tx := tbl.NewTransaction()
-	err := tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	err := tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesInvalidAddContentType() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesInvalidAddContentType() {
 	ident := table.Identifier{"default", "replace_data_files_invalid_add_content_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1836,7 +1832,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesInvalidAddConte
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1849,17 +1845,17 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesInvalidAddConte
 	invalidAddFile := builder.Build()
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{invalidAddFile}, nil)
+	err = tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{invalidAddFile}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "adding files other than data files is not yet implemented")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesEmptyBoth() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesEmptyBoth() {
 	ident := table.Identifier{"default", "replace_data_files_empty_both_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
 	tx := tbl.NewTransaction()
-	err := tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{}, nil)
+	err := tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{}, nil)
 	t.NoError(err)
 
 	staged, err := tx.StagedTable()
@@ -1867,7 +1863,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesEmptyBoth() {
 	t.Nil(staged.CurrentSnapshot())
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDelegatesToAddDataFiles() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesDelegatesToAddDataFiles() {
 	ident := table.Identifier{"default", "replace_data_files_delegate_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1877,7 +1873,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDelegatesToAddD
 	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{addFile}, nil))
+	t.Require().NoError(tx.ReplaceDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{addFile}, nil))
 
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -1886,10 +1882,10 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDelegatesToAddD
 }
 
 // ============================================================================
-// ReplaceDataFiles (string paths) Error Path Tests
+// ReplaceDataFilesByPath (string paths) Error Path Tests
 // ============================================================================
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPathDuplicateDeletePaths() {
 	ident := table.Identifier{"default", "replace_data_files_dup_del_paths_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1897,7 +1893,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1905,12 +1901,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath, existingPath}, []string{newPath}, nil)
+	err = tx.ReplaceDataFilesByPath(t.ctx, []string{existingPath, existingPath}, []string{newPath}, nil)
 	t.Error(err)
-	t.ErrorContains(err, "delete file paths must be unique for ReplaceDataFiles")
+	t.ErrorContains(err, "delete file paths must be unique for ReplaceDataFilesByPath")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPathDuplicateAddPaths() {
 	ident := table.Identifier{"default", "replace_data_files_dup_add_paths_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1918,7 +1914,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1926,12 +1922,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath}, []string{newPath, newPath}, nil)
+	err = tx.ReplaceDataFilesByPath(t.ctx, []string{existingPath}, []string{newPath, newPath}, nil)
 	t.Error(err)
-	t.ErrorContains(err, "add file paths must be unique for ReplaceDataFiles")
+	t.ErrorContains(err, "add file paths must be unique for ReplaceDataFilesByPath")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesAddAlreadyReferenced() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPathAddAlreadyReferenced() {
 	ident := table.Identifier{"default", "replace_data_files_add_already_ref_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1941,17 +1937,17 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesAddAlreadyReferenced() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath1, existingPath2}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath1}, []string{existingPath2}, nil)
+	err = tx.ReplaceDataFilesByPath(t.ctx, []string{existingPath1}, []string{existingPath2}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPathDeleteNotInTable() {
 	ident := table.Identifier{"default", "replace_data_files_del_not_in_table_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
@@ -1959,7 +1955,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(tx.AddDataFilesByPath(t.ctx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1969,17 +1965,17 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
 	nonExistentPath := fmt.Sprintf("%s/replace_data_files_del_not_in_table_v%d/nonexistent.parquet", t.location, t.formatVersion)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{nonExistentPath}, []string{newPath}, nil)
+	err = tx.ReplaceDataFilesByPath(t.ctx, []string{nonExistentPath}, []string{newPath}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot delete files that do not belong to the table")
 }
 
-func (t *TableWritingTestSuite) TestReplaceDataFilesNoSnapshot() {
+func (t *TableWritingTestSuite) TestReplaceDataFilesByPathNoSnapshot() {
 	ident := table.Identifier{"default", "replace_data_files_no_snapshot_paths_v" + strconv.Itoa(t.formatVersion)}
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
 	tx := tbl.NewTransaction()
-	err := tx.ReplaceDataFiles(t.ctx, []string{"delete.parquet"}, []string{"add.parquet"}, nil)
+	err := tx.ReplaceDataFilesByPath(t.ctx, []string{"delete.parquet"}, []string{"add.parquet"}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
 }
@@ -2017,7 +2013,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshots() {
 
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2068,7 +2064,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsNoOpWhenNothingToExpire() {
 	// Create 3 snapshots
 	for i := range 3 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2134,7 +2130,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsUsesTableProperties() {
 
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2186,7 +2182,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsWithMissingParent() {
 	// Create 5 snapshots, each one with a parent pointing to the previous
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2306,7 +2302,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefRollback() {
 	// Create 5 snapshots
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2376,7 +2372,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefUpdate() {
 	// Create 3 snapshots
 	for i := range 3 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(tx.AddDataFilesByPath(ctx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2541,10 +2537,10 @@ func tableSchema() *iceberg.Schema {
 		iceberg.NestedField{ID: 11, Name: "date", Type: iceberg.PrimitiveTypes.Date},
 		iceberg.NestedField{ID: 12, Name: "uuid", Type: iceberg.PrimitiveTypes.UUID},
 		iceberg.NestedField{ID: 13, Name: "binary", Type: iceberg.PrimitiveTypes.Binary},
-		iceberg.NestedField{ID: 14, Name: "fixed", Type: iceberg.FixedTypeOf(16)},
-		iceberg.NestedField{ID: 15, Name: "small_dec", Type: iceberg.DecimalTypeOf(8, 2)},
-		iceberg.NestedField{ID: 16, Name: "med_dec", Type: iceberg.DecimalTypeOf(16, 2)},
-		iceberg.NestedField{ID: 17, Name: "large_dec", Type: iceberg.DecimalTypeOf(24, 2)},
+		iceberg.NestedField{ID: 14, Name: "fixed", Type: iceberg.MustFixedTypeOf(16)},
+		iceberg.NestedField{ID: 15, Name: "small_dec", Type: iceberg.MustDecimalTypeOf(8, 2)},
+		iceberg.NestedField{ID: 16, Name: "med_dec", Type: iceberg.MustDecimalTypeOf(16, 2)},
+		iceberg.NestedField{ID: 17, Name: "large_dec", Type: iceberg.MustDecimalTypeOf(24, 2)},
 	)
 }
 
@@ -2565,7 +2561,7 @@ func arrowTableWithNull() arrow.Table {
 				"float": 0.0,
 				"double": 0.0,
 				"time": "00:00:01.000000",
-				"timestamp": "2023-01-01T19:25:00.000000+08:00",
+				"timestamp": "2023-01-01T11:25:00.000000",
 				"timestamptz": "2023-01-01T19:25:00.000000Z",
 				"date": "2023-01-01",
 				"uuid": "00000000-0000-0000-0000-000000000000",
@@ -2603,7 +2599,7 @@ func arrowTableWithNull() arrow.Table {
 				"float": 0.9,
 				"double": 0.9,
 				"time": "00:00:03.000000",
-				"timestamp": "2023-03-01T19:25:00.000000+08:00",
+				"timestamp": "2023-03-01T11:25:00.000000",
 				"timestamptz": "2023-03-01T19:25:00.000000Z",
 				"date": "2023-03-01",
 				"uuid": "11111111-1111-1111-1111-111111111111",
@@ -2623,7 +2619,7 @@ func arrowTableWithNull() arrow.Table {
 }
 
 func (t *TableWritingTestSuite) validateManifestFileLength(fs iceio.IO, m iceberg.ManifestFile) {
-	f, err := fs.Open(m.FilePath())
+	f, err := fs.Open(context.Background(), m.FilePath())
 	t.Require().NoError(err)
 	defer f.Close()
 
@@ -2704,7 +2700,7 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 	for i, entry := range entries {
 		t.Equal(snapshotList[i].SnapshotID, entry.SnapshotID())
 		if t.formatVersion > 1 {
-			t.EqualValues(3-i, entry.SequenceNum())
+			t.EqualValues(3-i, entry.DataSequenceNumber())
 		}
 	}
 
@@ -3156,13 +3152,13 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
 
 	// transaction 1 to create metadata file
 	tx := tbl.NewTransaction()
-	tx.AddFiles(ctx, files[0:1], nil, false)
+	tx.AddDataFilesByPath(ctx, files[0:1], nil, false)
 	tbl_new, err := tx.Commit(ctx)
 	t.Require().NoError(err)
 
 	// transaction 2 to add files
 	tx_new := tbl_new.NewTransaction()
-	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	tx_new.AddDataFilesByPath(ctx, files[1:2], nil, false)
 
 	_, err = tx_new.Commit(ctx)
 	t.Require().NoError(err)
@@ -3209,7 +3205,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 
 	// transaction 1 to create metadata file
 	tx := tbl.NewTransaction()
-	tx.AddFiles(ctx, files[0:1], nil, false)
+	tx.AddDataFilesByPath(ctx, files[0:1], nil, false)
 	tbl_new, err := tx.Commit(ctx)
 	t.Require().NoError(err)
 
@@ -3221,7 +3217,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 
 	// transaction 2 to add files
 	tx_new := tbl_new.NewTransaction()
-	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	tx_new.AddDataFilesByPath(ctx, files[1:2], nil, false)
 	_, err = tx_new.Commit(ctx)
 	t.Require().NoError(err)
 
@@ -3420,7 +3416,7 @@ func (t *TableTestSuite) TestMetadataCompressionRoundTrip() {
 	t.Require().NoError(err)
 
 	// Read the metadata file and verify it's gzipped
-	file, err := fs.Open(metadataLoc)
+	file, err := fs.Open(context.Background(), metadataLoc)
 	t.Require().NoError(err)
 	defer file.Close()
 
@@ -3479,7 +3475,7 @@ func (t *TableTestSuite) TestMetadataCompressionRoundTripZstd() {
 	fs, err := tbl.FS(context.Background())
 	t.Require().NoError(err)
 
-	file, err := fs.Open(metadataLoc)
+	file, err := fs.Open(context.Background(), metadataLoc)
 	t.Require().NoError(err)
 	defer file.Close()
 
@@ -3606,7 +3602,7 @@ func TestWritesToUnknownTransformSpecFail(t *testing.T) {
 			location := filepath.ToSlash(strings.ReplaceAll(t.TempDir(), "#", ""))
 			ctx := context.Background()
 
-			t.Run("AddFiles", func(t *testing.T) {
+			t.Run("AddDataFilesByPath", func(t *testing.T) {
 				tbl := newTable(t, location, formatVersion, unknownSpec)
 				arrTable, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{
 					`[{"foo": true, "bar": "bar_string", "baz": 1, "qux": "2024-03-07"}]`,
@@ -3619,7 +3615,7 @@ func TestWritesToUnknownTransformSpecFail(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, pqarrow.WriteTable(arrTable, fo, arrTable.NumRows(), nil, pqarrow.DefaultWriterProps()))
 
-				err = tbl.NewTransaction().AddFiles(ctx, []string{filePath}, nil, false)
+				err = tbl.NewTransaction().AddDataFilesByPath(ctx, []string{filePath}, nil, false)
 				require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
 				assert.ErrorContains(t, err, "custom_transform[42]")
 			})

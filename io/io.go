@@ -24,9 +24,9 @@
 //
 //	import _ "github.com/apache/iceberg-go/io/gocloud"
 //
-// Will register cloud storage implementations for S3, GCS, Azure, and in-memory
-// blob storage. The local filesystem (file:// and empty scheme) is registered
-// by default.
+// Will register S3, GCS and Azure, and link all three cloud SDKs.
+// Importing io/gocloud/s3, io/gocloud/gcs or io/gocloud/azure instead registers only that backend.
+// The local filesystem (file:// and empty scheme) is always registered.
 package io
 
 import (
@@ -47,6 +47,10 @@ import (
 type IO interface {
 	// Open opens the named file.
 	//
+	// Implementations may use ctx to bound the open; those backed by a
+	// plain io/fs.FS ignore it since fs.FS.Open takes no context. Reads on
+	// the returned File are not bound by ctx.
+	//
 	// When Open returns an error, it should be of type *PathError
 	// with the Op field set to "open", the Path field set to name,
 	// and the Err field describing the problem.
@@ -54,12 +58,14 @@ type IO interface {
 	// Open should reject attempts to open names that do not satisfy
 	// fs.ValidPath(name), returning a *PathError with Err set to
 	// ErrInvalid or ErrNotExist.
-	Open(name string) (File, error)
+	Open(ctx context.Context, name string) (File, error)
 
-	// Remove removes the named file or (empty) directory.
+	// Remove removes the named file or (empty) directory. The context bounds
+	// the delete; local filesystem implementations ignore it.
 	//
 	// If there is an error, it will be of type *PathError.
-	Remove(name string) error
+	// Implementations must be safe for concurrent use by multiple goroutines.
+	Remove(ctx context.Context, name string) error
 }
 
 // ReadFileIO is the interface implemented by a file system that
@@ -216,24 +222,35 @@ type MkdirAllIO interface {
 	MkdirAll(path string) error
 }
 
-// FS wraps an io/fs.FS as an IO interface.
-func FS(fsys fs.FS) IO {
-	if _, ok := fsys.(fs.ReadFileFS); ok {
-		return readFileFS{ioFS{fsys, nil}}
+// FS wraps an io/fs.FS as an IO interface. It implements ReadFileIO only
+// if the underlying fsys supports fs.ReadFileFS. Options can configure name
+// processing; see WithNamePreprocessor.
+func FS(fsys fs.FS, opts ...FSOption) IO {
+	adapter := ioFS{fsys: fsys}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&adapter)
+		}
 	}
 
-	return ioFS{fsys, nil}
+	if _, ok := fsys.(fs.ReadFileFS); ok {
+		return readFileFS{adapter}
+	}
+
+	return adapter
 }
 
-// FSPreProcName wraps an io/fs.FS like FS, only if fn is non-nil then
-// it is called to preprocess any filenames before they are passed to
-// the underlying fsys.
-func FSPreProcName(fsys fs.FS, fn func(string) string) IO {
-	if _, ok := fsys.(fs.ReadFileFS); ok {
-		return readFileFS{ioFS{fsys, fn}}
-	}
+// FSOption configures an IO adapter created by FS.
+type FSOption func(*ioFS)
 
-	return ioFS{fsys, fn}
+// WithNamePreprocessor transforms filenames before FS normalizes leading
+// slashes and passes them to the underlying fs.FS. It applies to Open, Remove,
+// and ReadFile when available. A nil preprocessor leaves names unchanged.
+// fn must be safe for concurrent use by multiple goroutines.
+func WithNamePreprocessor(fn func(string) string) FSOption {
+	return func(adapter *ioFS) {
+		adapter.preProcessName = fn
+	}
 }
 
 type readFileFS struct {
@@ -255,7 +272,9 @@ type ioFS struct {
 	preProcessName func(string) string
 }
 
-func (f ioFS) Open(name string) (File, error) {
+func (f ioFS) Open(_ context.Context, name string) (File, error) {
+	// The wrapped io/fs.FS has no context-aware Open, so ctx cannot be
+	// forwarded; it only bounds context-aware implementations.
 	name = f.processName(name)
 	file, err := f.fsys.Open(name)
 	if err != nil {
@@ -279,7 +298,15 @@ func (f ioFS) processName(name string) string {
 	return name
 }
 
-func (f ioFS) Remove(name string) error {
+func (f ioFS) Remove(ctx context.Context, name string) error {
+	// Prefer a context-aware Remove when the wrapped fsys offers one, and fall
+	// back to the plain io/fs-style Remove otherwise.
+	if r, ok := f.fsys.(interface {
+		Remove(context.Context, string) error
+	}); ok {
+		return r.Remove(ctx, f.processName(name))
+	}
+
 	r, ok := f.fsys.(interface{ Remove(name string) error })
 	if !ok {
 		return errMissingRemove
@@ -341,9 +368,9 @@ func (f ioFile) ReadDir(count int) ([]fs.DirEntry, error) {
 // (file:// or empty scheme) is registered by default.
 //
 // Additional schemes can be registered by importing subpackages.
-// For S3, GCS, Azure and in-memory support, import:
+// Import the backend for each cloud in use, or io/gocloud for all of them:
 //
-//	import _ "github.com/apache/iceberg-go/io/gocloud"
+//	import _ "github.com/apache/iceberg-go/io/gocloud/s3"
 func LoadFS(ctx context.Context, props map[string]string, location string) (IO, error) {
 	if location == "" {
 		location = props["warehouse"]

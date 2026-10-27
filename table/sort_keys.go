@@ -47,12 +47,13 @@ func resolveSortKeys(order SortOrder, fileSchema *iceberg.Schema) ([]compute.Sor
 		return nil, nil
 	}
 
+	fields := fileSchema.Fields()
 	keys := make([]compute.SortKey, 0, order.Len())
 	for _, field := range order.fields {
-		idx, ok := topLevelFieldIndex(fileSchema, field.SourceID())
+		idx, ok := topLevelFieldIndex(fields, field.FirstSourceID())
 		if !ok {
 			return nil, fmt.Errorf("sort order %d: source id %d is not a top-level column in schema",
-				order.OrderID(), field.SourceID())
+				order.OrderID(), field.FirstSourceID())
 		}
 
 		key := compute.SortKey{ColumnIndex: idx, Order: compute.SortOrderAscending, NullPlacement: compute.SortNullsAtEnd}
@@ -68,8 +69,8 @@ func resolveSortKeys(order SortOrder, fileSchema *iceberg.Schema) ([]compute.Sor
 	return keys, nil
 }
 
-func topLevelFieldIndex(schema *iceberg.Schema, sourceID int) (int, bool) {
-	for i, f := range schema.Fields() {
+func topLevelFieldIndex(fields []iceberg.NestedField, sourceID int) (int, bool) {
+	for i, f := range fields {
 		if f.ID == sourceID {
 			return i, true
 		}

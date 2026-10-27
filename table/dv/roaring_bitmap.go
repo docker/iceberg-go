@@ -299,10 +299,7 @@ func (b *RoaringPositionBitmap) KeepMaskBytes(length int64) []byte {
 		if bucketBitBase >= uint64(length) {
 			continue
 		}
-		bucketBits := uint64(length) - bucketBitBase
-		if bucketBits > 1<<32 {
-			bucketBits = 1 << 32
-		}
+		bucketBits := min(uint64(length)-bucketBitBase, 1<<32)
 		if bm.CardinalityInRange(0, bucketBits) < bm.DenseSize() {
 			it := bm.Iterator()
 			for it.HasNext() {
@@ -322,10 +319,7 @@ func (b *RoaringPositionBitmap) KeepMaskBytes(length int64) []byte {
 			continue
 		}
 		// Cap the bucket's bit range to what fits in `length`.
-		bucketBits = uint64(len(dense)) * 64
-		if bucketBits > uint64(length)-bucketBitBase {
-			bucketBits = uint64(length) - bucketBitBase
-		}
+		bucketBits = min(uint64(len(dense))*64, uint64(length)-bucketBitBase)
 		// bucketBitBase = key << 32 is always 8-byte-aligned, so the
 		// BitmapWordWriter runs with offset=0 internally. The trailing-byte
 		// loop below relies on that alignment — PutNextTrailingByte's
@@ -350,6 +344,60 @@ func (b *RoaringPositionBitmap) KeepMaskBytes(length int64) []byte {
 	// happen after all bucket writes complete.
 	if pad := int64(len(out))*8 - length; pad > 0 {
 		bitutil.SetBitsTo(out, length, pad, false)
+	}
+
+	return out
+}
+
+// KeepMaskForRange returns a bit-packed Arrow Boolean keep-mask for [start, end).
+// A nil result means the range contains no deletes. Only an affected range
+// allocates a mask, so a scan does not need one bit for every row in the file.
+// The mask is indexed relative to start, including across 32-bit buckets.
+func (b *RoaringPositionBitmap) KeepMaskForRange(start, end uint64) []byte {
+	if start >= end {
+		return nil
+	}
+
+	var out []byte
+	for key, bm := range b.bitmaps {
+		base := uint64(key) << 32
+		if end <= base {
+			continue
+		}
+
+		lo := uint64(0)
+		if start > base {
+			lo = start - base
+			if lo >= 1<<32 {
+				continue
+			}
+		}
+		hi := min(end-base, uint64(1)<<32)
+		if lo >= hi || bm.CardinalityInRange(lo, hi) == 0 {
+			continue
+		}
+
+		if out == nil {
+			out = make([]byte, bitutil.BytesForBits(int64(end-start)))
+			memory.Set(out, 0xFF)
+		}
+
+		it := bm.Iterator()
+		it.AdvanceIfNeeded(uint32(lo))
+		for it.HasNext() {
+			pos := uint64(it.Next())
+			if pos >= hi {
+				break
+			}
+			offset := base + pos - start
+			out[offset>>3] &^= byte(1 << (offset & 7))
+		}
+	}
+
+	if out != nil {
+		if pad := int64(len(out))*8 - int64(end-start); pad > 0 {
+			bitutil.SetBitsTo(out, int64(end-start), pad, false)
+		}
 	}
 
 	return out

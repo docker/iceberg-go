@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/apache/iceberg-go"
 	"github.com/google/uuid"
@@ -250,11 +251,11 @@ func TestRefTypes(t *testing.T) {
 		iceberg.NestedField{ID: 6, Name: "f", Type: iceberg.PrimitiveTypes.Date},
 		iceberg.NestedField{ID: 7, Name: "g", Type: iceberg.PrimitiveTypes.Time},
 		iceberg.NestedField{ID: 8, Name: "h", Type: iceberg.PrimitiveTypes.Timestamp},
-		iceberg.NestedField{ID: 9, Name: "i", Type: iceberg.DecimalTypeOf(9, 2)},
+		iceberg.NestedField{ID: 9, Name: "i", Type: iceberg.MustDecimalTypeOf(9, 2)},
 		iceberg.NestedField{ID: 10, Name: "j", Type: iceberg.PrimitiveTypes.String},
 		iceberg.NestedField{ID: 11, Name: "k", Type: iceberg.PrimitiveTypes.Binary},
 		iceberg.NestedField{ID: 12, Name: "l", Type: iceberg.PrimitiveTypes.UUID},
-		iceberg.NestedField{ID: 13, Name: "m", Type: iceberg.FixedTypeOf(5)},
+		iceberg.NestedField{ID: 13, Name: "m", Type: iceberg.MustFixedTypeOf(5)},
 		iceberg.NestedField{ID: 14, Name: "n", Type: iceberg.VariantType{}},
 		iceberg.NestedField{ID: 15, Name: "o", Type: iceberg.PrimitiveTypes.TimestampNs},
 		iceberg.NestedField{ID: 16, Name: "p", Type: iceberg.PrimitiveTypes.TimestampTzNs})
@@ -333,7 +334,7 @@ func TestRefTypes(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, iceberg.OpEQ, fx.Op())
-			assert.True(t, fx.(iceberg.BoundLiteralPredicate).Literal().Type().Equals(iceberg.FixedTypeOf(5)))
+			assert.True(t, fx.(iceberg.BoundLiteralPredicate).Literal().Type().Equals(iceberg.MustFixedTypeOf(5)))
 		})
 
 		t.Run("uuid", func(t *testing.T) {
@@ -411,9 +412,9 @@ func TestRefTypes(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, iceberg.OpIn, fx.Op())
-			assert.True(t, fx.(iceberg.BoundSetPredicate).Ref().Type().Equals(iceberg.FixedTypeOf(5)))
+			assert.True(t, fx.(iceberg.BoundSetPredicate).Ref().Type().Equals(iceberg.MustFixedTypeOf(5)))
 			for _, v := range fx.(iceberg.BoundSetPredicate).Literals().Members() {
-				assert.True(t, v.Type().Equals(iceberg.FixedTypeOf(5)))
+				assert.True(t, v.Type().Equals(iceberg.MustFixedTypeOf(5)))
 			}
 		})
 
@@ -543,7 +544,7 @@ func TestInNotInSimplifications(t *testing.T) {
 			},
 			{
 				name: "fixed",
-				typ:  iceberg.FixedTypeOf(16),
+				typ:  iceberg.MustFixedTypeOf(16),
 				lits: func(first, second []byte) []iceberg.Literal {
 					return []iceberg.Literal{iceberg.NewLiteral(first), iceberg.NewLiteral(second)}
 				},
@@ -847,7 +848,7 @@ func TestToString(t *testing.T) {
 		iceberg.NestedField{ID: 5, Name: "e", Type: iceberg.PrimitiveTypes.Int32},
 		iceberg.NestedField{ID: 6, Name: "f", Type: iceberg.PrimitiveTypes.Int32},
 		iceberg.NestedField{ID: 7, Name: "g", Type: iceberg.PrimitiveTypes.Float32},
-		iceberg.NestedField{ID: 8, Name: "h", Type: iceberg.DecimalTypeOf(8, 4)},
+		iceberg.NestedField{ID: 8, Name: "h", Type: iceberg.MustDecimalTypeOf(8, 4)},
 		iceberg.NestedField{ID: 9, Name: "i", Type: iceberg.PrimitiveTypes.UUID},
 		iceberg.NestedField{ID: 10, Name: "j", Type: iceberg.PrimitiveTypes.Bool},
 		iceberg.NestedField{ID: 11, Name: "k", Type: iceberg.PrimitiveTypes.Bool},
@@ -1083,6 +1084,36 @@ func TestBindOutOfRangeDate(t *testing.T) {
 	}
 }
 
+func TestBindDecimalToIntRespectsScale(t *testing.T) {
+	sc := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "qty", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "total", Type: iceberg.PrimitiveTypes.Int64},
+	)
+
+	fractional := iceberg.Decimal{Val: decimal128.FromI64(1234), Scale: 2} // 12.34
+	whole := iceberg.Decimal{Val: decimal128.FromI64(1200), Scale: 2}      // 12.00
+
+	for _, name := range []string{"qty", "total"} {
+		t.Run(name, func(t *testing.T) {
+			ref := iceberg.Reference(name)
+
+			// Binding 12.34 must not produce qty == 1234, and rounding would
+			// turn qty < 12.34 into qty < 12, so both are rejected.
+			_, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, fractional), true)
+			require.ErrorIs(t, err, iceberg.ErrBadCast)
+
+			_, err = iceberg.BindExpr(sc, iceberg.LessThan(ref, fractional), true)
+			require.ErrorIs(t, err, iceberg.ErrBadCast)
+
+			bound, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, whole), true)
+			require.NoError(t, err)
+			want, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, int64(12)), true)
+			require.NoError(t, err)
+			assert.True(t, want.Equals(bound), "expected %s, got %s", want, bound)
+		})
+	}
+}
+
 func TestVariantBoundLiteralRejectionMessage(t *testing.T) {
 	sc := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}, Required: false},
@@ -1098,6 +1129,55 @@ func TestVariantBoundLiteralRejectionMessage(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
 	assert.ErrorContains(t, err, "ordered predicates are not supported on variant fields")
+}
+
+func TestVariantSetPredicate(t *testing.T) {
+	one := variant.Value(variantLiteralOf(t, int64(1)))
+	two := variant.Value(variantLiteralOf(t, int64(2)))
+	ref := iceberg.Reference("payload")
+
+	t.Run("in", func(t *testing.T) {
+		pred := iceberg.IsIn(ref, one, two, variant.Value(variantLiteralOf(t, int64(1))))
+		require.Implements(t, (*iceberg.UnboundPredicate)(nil), pred)
+		assert.Equal(t, iceberg.OpIn, pred.Op())
+		// The duplicate is a separate buffer, so this only holds if the set dedups by content.
+		assert.True(t, pred.Equals(iceberg.IsIn(ref, one, two)))
+	})
+
+	t.Run("not in", func(t *testing.T) {
+		pred := iceberg.NotIn(ref, one, two)
+		require.Implements(t, (*iceberg.UnboundPredicate)(nil), pred)
+		assert.Equal(t, iceberg.OpNotIn, pred.Op())
+		assert.True(t, pred.Negate().Equals(iceberg.IsIn(ref, one, two)))
+	})
+
+	t.Run("bind to variant column keeps distinct members", func(t *testing.T) {
+		sc := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}, Required: false},
+		)
+
+		// Set predicates on variant columns are not supported yet, so binding
+		// falls through to the set-predicate ErrType. That error is only
+		// reachable if the bind-time set still holds both members: had they
+		// collapsed to one, binding would take the single-literal path and
+		// fail with ErrInvalidArgument instead.
+		_, err := iceberg.BindExpr(sc, iceberg.IsIn(ref, one, two), true)
+		require.ErrorIs(t, err, iceberg.ErrType)
+	})
+
+	t.Run("bind to primitive column", func(t *testing.T) {
+		sc := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.PrimitiveTypes.Int64, Required: false},
+		)
+
+		bound, err := iceberg.BindExpr(sc, iceberg.IsIn(ref, one, two), true)
+		require.NoError(t, err)
+		require.Implements(t, (*iceberg.BoundSetPredicate)(nil), bound)
+		lits := bound.(iceberg.BoundSetPredicate).Literals()
+		assert.Equal(t, 2, lits.Len())
+		assert.True(t, lits.Contains(iceberg.Int64Literal(1)))
+		assert.True(t, lits.Contains(iceberg.Int64Literal(2)))
+	})
 }
 
 func TestUnknownTransformCannotBindAsPredicate(t *testing.T) {

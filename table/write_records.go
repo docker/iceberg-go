@@ -34,12 +34,14 @@ import (
 type WriteRecordOption func(*writeRecordConfig)
 
 type writeRecordConfig struct {
-	targetFileSize     int64
-	writeUUID          *uuid.UUID
-	maxWriteWorkers    int
-	clustered          bool
-	fileSchema         *iceberg.Schema
-	preserveRowLineage bool
+	targetFileSize        int64
+	writeUUID             *uuid.UUID
+	maxWriteWorkers       int
+	clustered             bool
+	fileSchema            *iceberg.Schema
+	preserveRowLineage    bool
+	recordBatchBufferSize int
+	parquetRowGroupLimit  int
 }
 
 // WithTargetFileSize overrides the table's default target file size.
@@ -95,6 +97,32 @@ func WithClusteredWrite() WriteRecordOption {
 	}
 }
 
+// WithRecordBatchBufferSize sets the capacity, in record batches, of
+// each rolling data writer's input channel. Every buffered batch is
+// retained in memory until its writer consumes it, so this bound times
+// the batch row count caps the memory a stalled writer can hold. The
+// default is 64 batches. A non-positive value is ignored.
+func WithRecordBatchBufferSize(n int) WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		if n > 0 {
+			c.recordBatchBufferSize = n
+		}
+	}
+}
+
+// WithParquetRowGroupLimit overrides the table's
+// write.parquet.row-group-limit property for this write, capping the
+// number of rows per Parquet row group in the output files. Smaller row
+// groups bound the writer's buffered memory before each flush. A
+// non-positive value is ignored.
+func WithParquetRowGroupLimit(n int) WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		if n > 0 {
+			c.parquetRowGroupLimit = n
+		}
+	}
+}
+
 // WithPreserveRowLineage sets the output file schema to include the v3 row-
 // lineage metadata columns (_row_id, _last_updated_sequence_number) so that
 // row identity is preserved through rewrites and compactions. The input
@@ -143,7 +171,7 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	}
 
 	if cfg.preserveRowLineage {
-		if v := tbl.metadata.Version(); v < 3 {
+		if v := tbl.metadata.FormatVersion(); v < 3 {
 			return internal.SingleErrorIter[iceberg.DataFile](
 				fmt.Errorf("WithPreserveRowLineage requires a v3+ table, got v%d", v))
 		}
@@ -194,6 +222,13 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		meta.props[WriteTargetFileSizeBytesKey] = strconv.FormatInt(cfg.targetFileSize, 10)
 	}
 
+	if cfg.parquetRowGroupLimit > 0 {
+		if meta.props == nil {
+			meta.props = make(iceberg.Properties)
+		}
+		meta.props[ParquetRowGroupLimitKey] = strconv.Itoa(cfg.parquetRowGroupLimit)
+	}
+
 	releasing := func(yield func(arrow.RecordBatch, error) bool) {
 		for rec, err := range records {
 			if err != nil {
@@ -211,12 +246,13 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	}
 
 	args := recordWritingArgs{
-		sc:              schema,
-		itr:             releasing,
-		fs:              writeFS,
-		writeUUID:       cfg.writeUUID,
-		maxWriteWorkers: cfg.maxWriteWorkers,
-		clustered:       cfg.clustered,
+		sc:                    schema,
+		itr:                   releasing,
+		fs:                    writeFS,
+		writeUUID:             cfg.writeUUID,
+		maxWriteWorkers:       cfg.maxWriteWorkers,
+		clustered:             cfg.clustered,
+		recordBatchBufferSize: cfg.recordBatchBufferSize,
 	}
 
 	if cfg.fileSchema != nil {

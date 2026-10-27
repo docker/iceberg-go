@@ -82,6 +82,66 @@ func BenchmarkPartitionExtraction(b *testing.B) {
 	}
 }
 
+func BenchmarkPartitionMapCollection(b *testing.B) {
+	for _, test := range []struct {
+		fieldCount     int
+		partitionCount int
+	}{
+		{fieldCount: 2, partitionCount: 64},
+		{fieldCount: 2, partitionCount: 1_024},
+		{fieldCount: 2, partitionCount: 16_384},
+		{fieldCount: 4, partitionCount: 64},
+		{fieldCount: 4, partitionCount: 1_024},
+		{fieldCount: 4, partitionCount: 16_384},
+	} {
+		b.Run(fmt.Sprintf("fields_%d/partitions_%d", test.fieldCount, test.partitionCount), func(b *testing.B) {
+			tree := benchmarkPartitionMap(b, test.fieldCount, test.partitionCount)
+			b.ReportAllocs()
+			b.ReportMetric(float64(test.partitionCount), "partitions/op")
+			b.ResetTimer()
+			for b.Loop() {
+				partitionCollectionBenchmarkSink = len(tree.collectPartitions())
+			}
+		})
+	}
+}
+
+var partitionCollectionBenchmarkSink int
+
+func benchmarkPartitionMap(b *testing.B, fieldCount, partitionCount int) *partitionMapNode {
+	b.Helper()
+
+	base := 1
+	for {
+		combinations := 1
+		for range fieldCount {
+			combinations *= base
+		}
+		if combinations >= partitionCount {
+			break
+		}
+		base++
+	}
+
+	fieldInfo := make([]partitionFieldInfo, fieldCount)
+	for field := range fieldCount {
+		fieldInfo[field].fieldID = 1000 + field
+	}
+
+	tree := newPartitionMapNode()
+	for partition := range partitionCount {
+		record := make(partitionRecord, fieldCount)
+		value := partition
+		for field := range fieldCount {
+			record[field] = int32(value % base)
+			value /= base
+		}
+		tree.getOrCreate(record, fieldInfo, int64(partitionCount))
+	}
+
+	return tree
+}
+
 func BenchmarkPartitionTransforms(b *testing.B) {
 	const rows = 65_536
 
@@ -195,6 +255,50 @@ func BenchmarkPartitionTransforms(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+		})
+	}
+}
+
+func BenchmarkPartitionPathFormatting(b *testing.B) {
+	for _, fieldCount := range []int{1, 4, 16, 64} {
+		b.Run(fmt.Sprintf("fields_%d", fieldCount), func(b *testing.B) {
+			arrowFields := make([]arrow.Field, fieldCount)
+			icebergFields := make([]iceberg.NestedField, fieldCount)
+			specFields := make([]iceberg.PartitionField, fieldCount)
+			values := make(partitionRecord, fieldCount)
+			for i := range fieldCount {
+				name := fmt.Sprintf("part #%d", i)
+				arrowFields[i] = arrow.Field{Name: name, Type: arrow.BinaryTypes.String}
+				icebergFields[i] = iceberg.NestedField{ID: i + 1, Name: name, Type: iceberg.PrimitiveTypes.String}
+				specFields[i] = iceberg.PartitionField{
+					SourceIDs: []int{i + 1}, FieldID: 1000 + i,
+					Transform: iceberg.IdentityTransform{}, Name: name,
+				}
+				values[i] = fmt.Sprintf("value/%d", i)
+			}
+
+			schema := iceberg.NewSchema(0, icebergFields...)
+			spec := iceberg.NewPartitionSpec(specFields...)
+			arrowSchema := arrow.NewSchema(arrowFields, nil)
+			plan, err := newPartitionExtractionPlan(spec, schema, arrowSchema)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			b.Run("partition_to_path", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					_ = spec.PartitionToPath(values, schema)
+				}
+			})
+			b.Run("reused_plan", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					_ = plan.pathPlan.format(values)
+				}
+			})
 		})
 	}
 }

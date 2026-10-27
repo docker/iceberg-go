@@ -57,8 +57,8 @@ type Schema struct {
 	lazyNameMapping func() NameMapping
 }
 
-// NewSchemaFromJsonFields constructs a new schema with the provided ID and fields in json form
-func NewSchemaFromJsonFields(id int, jsonFieldsStr string) (*Schema, error) {
+// NewSchemaFromJSONFields constructs a new schema with the provided ID and fields in JSON form.
+func NewSchemaFromJSONFields(id int, jsonFieldsStr string) (*Schema, error) {
 	var fields []NestedField
 	err := json.Unmarshal([]byte(jsonFieldsStr), &fields)
 	if err != nil {
@@ -278,6 +278,12 @@ func (s *Schema) asStructRef() StructType { return StructType{FieldList: s.field
 func (s *Schema) NumFields() int          { return len(s.fields) }
 func (s *Schema) Field(i int) NestedField { return cloneField(s.fields[i]) }
 func (s *Schema) Fields() []NestedField   { return cloneFields(s.fields) }
+
+// FieldsRef returns the schema-owned fields for trusted internal callers.
+// The returned slice and everything reachable through the fields must be
+// treated as read-only.
+func (s *Schema) FieldsRef(_ internal.SchemaRef) []NestedField { return s.fields }
+
 func (s *Schema) FieldIDs() []int {
 	idx, _ := s.lazyNameToID()
 
@@ -346,8 +352,9 @@ func (s *Schema) MarshalJSON() ([]byte, error) {
 
 	type Alias Schema
 
-	aliasCopy := *(*Alias)(s)
-	aliasCopy.IdentifierFieldIDs = ids
+	// Keep this literal in sync with every JSON-marshaled Schema field. Copying
+	// the whole Schema would also copy its lazy atomic caches after they are used.
+	aliasCopy := Alias{ID: s.ID, IdentifierFieldIDs: ids}
 
 	return json.Marshal(struct {
 		Type   string        `json:"type"`
@@ -519,6 +526,35 @@ func (s *Schema) accessorForField(id int) (accessor, bool) {
 	return acc, ok
 }
 
+// columnPathSegments returns the own-name path segments from the top-level column down to id, so a name containing '.' stays one segment.
+func (s *Schema) columnPathSegments(id int) []string {
+	idToField, err := s.lazyIDToField()
+	if err != nil {
+		return nil
+	}
+	parents, err := s.lazyIDToParent()
+	if err != nil {
+		return nil
+	}
+	var segs []string
+	for cur := id; ; {
+		f, ok := idToField[cur]
+		if !ok {
+			return nil
+		}
+		segs = append(segs, f.Name)
+		p, ok := parents[cur]
+		if !ok {
+			break
+		}
+		cur = p
+	}
+
+	slices.Reverse(segs)
+
+	return segs
+}
+
 // Equals compares the fields and identifierIDs, but does not compare
 // the schema ID itself.
 func (s *Schema) Equals(other *Schema) bool {
@@ -546,9 +582,40 @@ func (s *Schema) Equals(other *Schema) bool {
 // HighestFieldID returns the value of the numerically highest field ID
 // in this schema.
 func (s *Schema) HighestFieldID() int {
-	id, _ := Visit(s, findLastFieldID{})
+	if s == nil {
+		return 0
+	}
 
-	return id
+	return highestFieldIDFields(s.fields)
+}
+
+func highestFieldIDFields(fields []NestedField) int {
+	highest := 0
+	for i := range fields {
+		highest = max(highest, fields[i].ID, highestFieldIDType(fields[i].Type))
+	}
+
+	return highest
+}
+
+func highestFieldIDType(typ Type) int {
+	switch typ := typ.(type) {
+	case *StructType:
+		if typ != nil {
+			return highestFieldIDFields(typ.FieldList)
+		}
+	case *ListType:
+		if typ != nil {
+			return max(typ.ElementID, highestFieldIDType(typ.Element))
+		}
+	case *MapType:
+		if typ != nil {
+			return max(typ.KeyID, typ.ValueID, highestFieldIDType(typ.KeyType), highestFieldIDType(typ.ValueType))
+		}
+	}
+
+	// New types with nested field IDs must be included in the traversal above.
+	return 0
 }
 
 type Void = struct{}
@@ -979,10 +1046,8 @@ func IndexByName(schema *Schema) (map[string]int, error) {
 
 	if len(schema.fields) > 0 {
 		indexer := &indexByName{
-			index:           make(map[string]int),
-			shortNameId:     make(map[string]int),
-			fieldNames:      make([]string, 0),
-			shortFieldNames: make([]string, 0),
+			index:       make(map[string]int),
+			shortNameId: make(map[string]int),
 		}
 		if _, err := Visit(schema, indexer); err != nil {
 			return nil, err
@@ -998,10 +1063,7 @@ func IndexByName(schema *Schema) (map[string]int, error) {
 // a mapping from field ID to field name.
 func IndexNameByID(schema *Schema) (map[int]string, error) {
 	indexer := &indexByName{
-		index:           make(map[string]int),
-		shortNameId:     make(map[string]int),
-		fieldNames:      make([]string, 0),
-		shortFieldNames: make([]string, 0),
+		index: make(map[string]int),
 	}
 	if _, err := Visit(schema, indexer); err != nil {
 		return nil, err
@@ -1011,11 +1073,49 @@ func IndexNameByID(schema *Schema) (map[int]string, error) {
 }
 
 type indexByName struct {
-	index           map[string]int
-	shortNameId     map[string]int
-	combinedIndex   map[string]int
-	fieldNames      []string
-	shortFieldNames []string
+	index         map[string]int
+	shortNameId   map[string]int
+	combinedIndex map[string]int
+
+	fullPath  nameIndexPath
+	shortPath nameIndexPath
+}
+
+// nameIndexPath retains a mutable prefix across the schema traversal. Fields
+// at the same level share the prefix instead of repeatedly joining ancestors.
+// Checkpoints also preserve empty path segments, including their separators.
+type nameIndexPath struct {
+	buf         []byte
+	checkpoints []int
+}
+
+func (p *nameIndexPath) push(name string) {
+	depth := len(p.checkpoints)
+	p.checkpoints = append(p.checkpoints, len(p.buf))
+	if depth > 0 {
+		p.buf = append(p.buf, '.')
+	}
+	p.buf = append(p.buf, name...)
+}
+
+func (p *nameIndexPath) pop() {
+	last := len(p.checkpoints) - 1
+	p.buf = p.buf[:p.checkpoints[last]]
+	p.checkpoints = p.checkpoints[:last]
+}
+
+func (p *nameIndexPath) prefixedName(name string) string {
+	if len(p.checkpoints) == 0 {
+		return name
+	}
+
+	var b strings.Builder
+	b.Grow(len(p.buf) + 1 + len(name))
+	b.Write(p.buf)
+	b.WriteByte('.')
+	b.WriteString(name)
+
+	return b.String()
 }
 
 func (i *indexByName) ByID() map[int]string {
@@ -1037,19 +1137,20 @@ func (i *indexByName) ByName() map[string]int {
 func (i *indexByName) Primitive(PrimitiveType) map[string]int { return i.index }
 func (i *indexByName) Variant(VariantType) map[string]int     { return i.index }
 func (i *indexByName) addField(name string, fieldID int) {
-	fullName := name
-	if len(i.fieldNames) > 0 {
-		fullName = strings.Join(i.fieldNames, ".") + "." + name
-	}
-
+	fullName := i.fullPath.prefixedName(name)
 	if _, ok := i.index[fullName]; ok {
 		panic(fmt.Errorf("%w: multiple fields for name %s: %d and %d",
 			ErrInvalidSchema, fullName, i.index[fullName], fieldID))
 	}
 
 	i.index[fullName] = fieldID
-	if len(i.shortFieldNames) > 0 {
-		shortName := strings.Join(i.shortFieldNames, ".") + "." + name
+	if len(i.shortPath.checkpoints) > 0 {
+		// A regular struct path is the same in both indexes. Reuse the
+		// immutable full-name string rather than formatting it twice.
+		shortName := fullName
+		if len(i.fullPath.checkpoints) == 0 || !bytes.Equal(i.fullPath.buf, i.shortPath.buf) {
+			shortName = i.shortPath.prefixedName(name)
+		}
 		i.shortNameId[shortName] = fieldID
 	}
 }
@@ -1082,27 +1183,31 @@ func (i *indexByName) Map(mapType MapType, _, _ map[string]int) map[string]int {
 }
 
 func (i *indexByName) BeforeListElement(elem NestedField) {
-	if _, ok := elem.Type.(*StructType); !ok {
-		i.shortFieldNames = append(i.shortFieldNames, elem.Name)
+	if _, ok := elem.Type.(*StructType); !ok && i.shortNameId != nil {
+		i.shortPath.push(elem.Name)
 	}
-	i.fieldNames = append(i.fieldNames, elem.Name)
+	i.fullPath.push(elem.Name)
 }
 
 func (i *indexByName) AfterListElement(elem NestedField) {
-	if _, ok := elem.Type.(*StructType); !ok {
-		i.shortFieldNames = i.shortFieldNames[:len(i.shortFieldNames)-1]
+	if _, ok := elem.Type.(*StructType); !ok && i.shortNameId != nil {
+		i.shortPath.pop()
 	}
-	i.fieldNames = i.fieldNames[:len(i.fieldNames)-1]
+	i.fullPath.pop()
 }
 
 func (i *indexByName) BeforeField(field NestedField) {
-	i.fieldNames = append(i.fieldNames, field.Name)
-	i.shortFieldNames = append(i.shortFieldNames, field.Name)
+	i.fullPath.push(field.Name)
+	if i.shortNameId != nil {
+		i.shortPath.push(field.Name)
+	}
 }
 
-func (i *indexByName) AfterField(field NestedField) {
-	i.fieldNames = i.fieldNames[:len(i.fieldNames)-1]
-	i.shortFieldNames = i.shortFieldNames[:len(i.shortFieldNames)-1]
+func (i *indexByName) AfterField(NestedField) {
+	i.fullPath.pop()
+	if i.shortNameId != nil {
+		i.shortPath.pop()
+	}
 }
 
 // PruneColumns visits a schema pruning any columns which do not exist in the
@@ -1312,31 +1417,6 @@ func (*pruneColVisitor) projectMap(mapType *MapType, valueResult Type) *MapType 
 	}
 }
 
-type findLastFieldID struct{}
-
-func (findLastFieldID) Schema(_ *Schema, result int) int {
-	return result
-}
-
-func (findLastFieldID) Struct(_ StructType, fieldResults []int) int {
-	return slices.Max(fieldResults)
-}
-
-func (findLastFieldID) Field(field NestedField, fieldResult int) int {
-	return max(field.ID, fieldResult)
-}
-
-func (findLastFieldID) List(field ListType, elemResult int) int {
-	return max(field.ElementID, elemResult)
-}
-
-func (findLastFieldID) Map(field MapType, keyResult, valueResult int) int {
-	return max(field.KeyID, field.ValueID, keyResult, valueResult)
-}
-
-func (findLastFieldID) Primitive(PrimitiveType) int { return 0 }
-func (findLastFieldID) Variant(VariantType) int     { return 0 }
-
 // IndexParents generates an index of field IDs to their parent field
 // IDs. Root fields are not indexed
 func IndexParents(schema *Schema) (map[int]int, error) {
@@ -1452,13 +1532,27 @@ func buildAccessors(schema *Schema) (map[int]accessor, error) {
 type setFreshIDs struct {
 	oldIdToNew map[int]int
 	nextIDFunc func() int
+	source     *Schema
+	base       *Schema
 }
 
 func (s *setFreshIDs) getAndInc(currentID int) int {
-	next := s.nextIDFunc()
+	next := s.idFor(currentID)
 	s.oldIdToNew[currentID] = next
 
 	return next
+}
+
+func (s *setFreshIDs) idFor(currentID int) int {
+	if s.base != nil {
+		if name, ok := s.source.FindColumnName(currentID); ok {
+			if f, ok := s.base.FindFieldByName(name); ok {
+				return f.ID
+			}
+		}
+	}
+
+	return s.nextIDFunc()
 }
 
 func (s *setFreshIDs) Schema(_ *Schema, structResult func() Type) Type {
@@ -1466,10 +1560,16 @@ func (s *setFreshIDs) Schema(_ *Schema, structResult func() Type) Type {
 }
 
 func (s *setFreshIDs) Struct(st StructType, fieldResults []func() Type) Type {
+	// Assign all sibling IDs before recursing, matching Java.
+	newIDs := make([]int, len(st.FieldList))
+	for idx, f := range st.FieldList {
+		newIDs[idx] = s.getAndInc(f.ID)
+	}
+
 	newFields := make([]NestedField, len(st.FieldList))
 	for idx, f := range st.FieldList {
 		newFields[idx] = NestedField{
-			ID:             s.getAndInc(f.ID),
+			ID:             newIDs[idx],
 			Name:           f.Name,
 			Type:           fieldResults[idx](),
 			Doc:            f.Doc,
@@ -1521,15 +1621,29 @@ func (s *setFreshIDs) Variant(v VariantType) Type {
 // fields in it. The nextID function is used to iteratively generate the ids, if
 // it is nil then a simple incrementing counter is used starting at 1.
 func AssignFreshSchemaIDs(sc *Schema, nextID func() int) (*Schema, error) {
+	return AssignFreshSchemaIDsWithBase(sc, nil, nextID)
+}
+
+// AssignFreshSchemaIDsWithBase is like AssignFreshSchemaIDs, but fields whose
+// full name exists in base reuse the ID from base. Only fields not found in
+// base get fresh IDs from nextID. Name matching is case-sensitive.
+//
+// nextID must return IDs greater than base.HighestFieldID(), otherwise an
+// error is returned for the duplicate. If nextID is nil, the counter starts
+// after base's highest field ID.
+func AssignFreshSchemaIDsWithBase(sc, base *Schema, nextID func() int) (*Schema, error) {
 	if nextID == nil {
 		id := 0
+		if base != nil {
+			id = base.HighestFieldID()
+		}
 		nextID = func() int {
 			id++
 
 			return id
 		}
 	}
-	visitor := &setFreshIDs{oldIdToNew: make(map[int]int), nextIDFunc: nextID}
+	visitor := &setFreshIDs{oldIdToNew: make(map[int]int), nextIDFunc: nextID, source: sc, base: base}
 	outType, err := PreOrderVisit(sc, visitor)
 	if err != nil {
 		return nil, err
@@ -1540,8 +1654,16 @@ func AssignFreshSchemaIDs(sc *Schema, nextID func() int) (*Schema, error) {
 	if len(sc.IdentifierFieldIDs) != 0 {
 		newIdentifierIDs = make([]int, len(sc.IdentifierFieldIDs))
 		for i, id := range sc.IdentifierFieldIDs {
-			newIdentifierIDs[i] = visitor.oldIdToNew[id]
+			newID, ok := visitor.oldIdToNew[id]
+			if !ok {
+				return nil, fmt.Errorf("%w: cannot find field for identifier field id %d", ErrInvalidSchema, id)
+			}
+			newIdentifierIDs[i] = newID
 		}
+	}
+
+	if err := checkDuplicateFieldIDs(nil, fields); err != nil {
+		return nil, err
 	}
 
 	return NewSchemaWithIdentifiers(0, newIdentifierIDs, fields...), nil

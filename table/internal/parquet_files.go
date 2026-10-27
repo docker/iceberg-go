@@ -19,12 +19,14 @@ package internal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"maps"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -103,7 +105,7 @@ const (
 type parquetFormat struct{}
 
 func (parquetFormat) Open(ctx context.Context, fs iceio.IO, path string) (_ FileReader, err error) {
-	inputfile, err := fs.Open(path)
+	inputfile, err := fs.Open(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +129,11 @@ func (parquetFormat) Open(ctx context.Context, fs iceio.IO, path string) (_ File
 		return nil, err
 	}
 
-	return wrapPqArrowReader{arrRdr}, nil
+	return wrapPqArrowReader{
+		FileReader:       arrRdr,
+		dictionarySource: inputfile,
+		dictionaryMem:    alloc,
+	}, nil
 }
 
 func (parquetFormat) PathToIDMapping(sc *iceberg.Schema) (map[string]int, error) {
@@ -507,6 +513,7 @@ type ParquetFileWriter struct {
 	info             WriteFileInfo
 	partition        map[int]any
 	colMapping       map[string]int
+	variantFieldIDs  map[int]struct{}
 	geoCols          []geoColumn
 	geoNormalizeCols []int
 	geoAccs          map[int]*geoBoundsAccumulator
@@ -514,28 +521,52 @@ type ParquetFileWriter struct {
 	rowGroupBytes    int64
 }
 
-// geoColumn locates a top-level geometry/geography column: its position in the
-// Arrow record batch and the Iceberg field ID its bounds are recorded under.
+// geoColumn locates a geometry/geography leaf: the position of its top-level
+// column in the Arrow record batch, the struct child index taken at each
+// struct (including a map's key/value entries) on the way down to the leaf,
+// and the Iceberg field ID its bounds are recorded under.
 type geoColumn struct {
 	colIdx  int
+	path    []int
 	fieldID int
 }
 
-// collectGeoColumns finds top-level WKB-encoded geo columns in the Arrow schema
-// and pairs each with its Iceberg field ID. Geo bounds for columns nested inside
-// structs/lists/maps are not yet computed, which diverges from Java/PyIceberg.
-// TODO(#992): compute geo bounds for geo columns nested in structs/lists/maps.
+// collectGeoColumns finds WKB-encoded geo leaves in the Arrow schema, including
+// those nested in structs/lists/maps, and pairs each with its Iceberg field ID.
+//
+// Parquet drops the Statistics block (min, max, null count) for GEOMETRY and
+// GEOGRAPHY columns because their sort order is undefined, so these metrics are
+// computed from the Arrow data instead. Geo files imported via
+// DataFileStatsFromMeta alone (e.g. AddDataFilesByPath) get no geo null counts
+// or bounds, which costs pruning but never gives a wrong answer.
 func collectGeoColumns(sc *arrow.Schema, colMapping map[string]int) []geoColumn {
 	var result []geoColumn
 	for i, f := range sc.Fields() {
-		if _, ok := f.Type.(*geoarrow.WKBType); !ok {
-			continue
+		result = appendGeoColumns(result, f.Type, f.Name, i, nil, colMapping)
+	}
+
+	return result
+}
+
+// appendGeoColumns walks dt and appends a geoColumn for each WKB leaf. name is
+// the Parquet column path used as the colMapping key.
+func appendGeoColumns(result []geoColumn, dt arrow.DataType, name string, colIdx int, path []int, colMapping map[string]int) []geoColumn {
+	switch t := dt.(type) {
+	case *geoarrow.WKBType:
+		if fieldID, ok := colMapping[name]; ok {
+			result = append(result, geoColumn{colIdx: colIdx, path: slices.Clone(path), fieldID: fieldID})
 		}
-		fieldID, ok := colMapping[f.Name]
-		if !ok {
-			continue
+	case *arrow.StructType:
+		for i, f := range t.Fields() {
+			result = appendGeoColumns(result, f.Type, name+"."+f.Name, colIdx, append(path, i), colMapping)
 		}
-		result = append(result, geoColumn{colIdx: i, fieldID: fieldID})
+	case *arrow.MapType:
+		kv := name + ".key_value."
+		result = appendGeoColumns(result, t.KeyType(), kv+t.KeyField().Name, colIdx, append(path, 0), colMapping)
+		result = appendGeoColumns(result, t.ItemType(), kv+t.ItemField().Name, colIdx, append(path, 1), colMapping)
+	case *arrow.ListType, *arrow.LargeListType, *arrow.FixedSizeListType:
+		elem := dt.(arrow.ListLikeType).ElemField()
+		result = appendGeoColumns(result, elem.Type, name+".list."+elem.Name, colIdx, path, colMapping)
 	}
 
 	return result
@@ -595,22 +626,30 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 		return nil, err
 	}
 
-	colMapping, err := p.PathToIDMapping(info.FileSchema)
-	if err != nil {
-		fw.Close()
+	colMapping := info.ColMapping
+	if colMapping == nil {
+		colMapping, err = p.PathToIDMapping(info.FileSchema)
+		if err != nil {
+			fw.Close()
 
-		return nil, err
+			return nil, err
+		}
+	}
+
+	variantFieldIDs := info.VariantFieldIDs
+	if variantFieldIDs == nil {
+		variantFieldIDs = VariantFieldIDsFromSchema(info.FileSchema)
 	}
 
 	counter := &internal.CountingWriter{W: fw}
 	mem := compute.GetAllocator(ctx)
-	writerProps, err := getWriteProperties(info.WriteProps, arrowSchema)
+	arrProps := writeArrowProps(mem)
+	writerProps, err := getWriteProperties(info.WriteProps, arrowSchema, arrProps)
 	if err != nil {
 		fw.Close()
 
 		return nil, err
 	}
-	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 
 	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, writerProps, arrProps)
 	if err != nil {
@@ -642,6 +681,7 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 		info:             info,
 		partition:        partitionValues,
 		colMapping:       colMapping,
+		variantFieldIDs:  variantFieldIDs,
 		geoCols:          geoCols,
 		geoNormalizeCols: geoNormalizeCols,
 		geoAccs:          geoAccs,
@@ -681,9 +721,13 @@ func typeHasDecimal128(dt arrow.DataType) bool {
 	return false
 }
 
+func writeArrowProps(mem memory.Allocator) pqarrow.ArrowWriterProperties {
+	return pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
+}
+
 // getWriteProperties requires explicit write properties so misconfigured writer
 // plumbing fails fast instead of silently defaulting Parquet settings.
-func getWriteProperties(writeProps any, arrowSchema *arrow.Schema) (*parquet.WriterProperties, error) {
+func getWriteProperties(writeProps any, arrowSchema *arrow.Schema, arrProps pqarrow.ArrowWriterProperties) (*parquet.WriterProperties, error) {
 	if writeProps == nil {
 		return nil, fmt.Errorf("%w: write properties are required", iceberg.ErrInvalidArgument)
 	}
@@ -701,7 +745,101 @@ func getWriteProperties(writeProps any, arrowSchema *arrow.Schema) (*parquet.Wri
 		wp = append(wp, parquet.WithStoreDecimalAsInteger(true))
 	}
 
+	// Match Iceberg Java: apply parquet-mr's cost-based dictionary fallback to every leaf
+	// column so high-cardinality columns fall back to PLAIN rather than keeping a dictionary.
+	// arrow-go otherwise enables it only for uncompressed columns, so zstd (our default) would
+	// retain dictionaries on all-distinct columns and roughly double their size.
+	costFallback, err := dictCostFallbackProps(arrowSchema, wp, arrProps)
+	if err != nil {
+		return nil, err
+	}
+	wp = append(wp, costFallback...)
+
 	return parquet.NewWriterProperties(wp...), nil
+}
+
+// dictCostFallbackProps returns a WithDictionaryCostFallbackFor(true) property per leaf, walking the arrow schema directly (extensions unwrapped) and falling back to pqarrow.ToParquet for list/map schemas.
+func dictCostFallbackProps(arrowSchema *arrow.Schema, base []parquet.WriterProperty, arrProps pqarrow.ArrowWriterProperties) ([]parquet.WriterProperty, error) {
+	if schemaHasListOrMap(arrowSchema) {
+		return dictCostFallbackViaParquet(arrowSchema, base, arrProps)
+	}
+
+	var props []parquet.WriterProperty
+	var walk func(prefix string, dt arrow.DataType)
+	walk = func(prefix string, dt arrow.DataType) {
+		if ext, ok := dt.(arrow.ExtensionType); ok {
+			dt = ext.StorageType()
+		}
+		if d, ok := dt.(*arrow.DictionaryType); ok {
+			dt = d.ValueType
+		}
+		if r, ok := dt.(*arrow.RunEndEncodedType); ok {
+			dt = r.Encoded()
+		}
+		if st, ok := dt.(*arrow.StructType); ok {
+			for _, f := range st.Fields() {
+				walk(prefix+"."+f.Name, f.Type)
+			}
+
+			return
+		}
+		props = append(props, parquet.WithDictionaryCostFallbackFor(prefix, true))
+	}
+	for _, f := range arrowSchema.Fields() {
+		walk(f.Name, f.Type)
+	}
+
+	return props, nil
+}
+
+// dictCostFallbackViaParquet is the authoritative path for list/map schemas, whose parquet leaf naming the direct walk does not reproduce.
+func dictCostFallbackViaParquet(arrowSchema *arrow.Schema, base []parquet.WriterProperty, arrProps pqarrow.ArrowWriterProperties) ([]parquet.WriterProperty, error) {
+	parquetSchema, err := pqarrow.ToParquet(arrowSchema, parquet.NewWriterProperties(base...), arrProps)
+	if err != nil {
+		return nil, err
+	}
+
+	props := make([]parquet.WriterProperty, 0, parquetSchema.NumColumns())
+	for i := range parquetSchema.NumColumns() {
+		props = append(props, parquet.WithDictionaryCostFallbackFor(parquetSchema.Column(i).Path(), true))
+	}
+
+	return props, nil
+}
+
+func schemaHasListOrMap(sc *arrow.Schema) bool {
+	var has func(dt arrow.DataType) bool
+	has = func(dt arrow.DataType) bool {
+		if ext, ok := dt.(arrow.ExtensionType); ok {
+			dt = ext.StorageType()
+		}
+		if d, ok := dt.(*arrow.DictionaryType); ok {
+			dt = d.ValueType
+		}
+		if r, ok := dt.(*arrow.RunEndEncodedType); ok {
+			dt = r.Encoded()
+		}
+		switch t := dt.(type) {
+		case *arrow.ListType, *arrow.LargeListType, *arrow.FixedSizeListType,
+			*arrow.ListViewType, *arrow.LargeListViewType, *arrow.MapType:
+			return true
+		case *arrow.StructType:
+			for _, f := range t.Fields() {
+				if has(f.Type) {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+	for _, f := range sc.Fields() {
+		if has(f.Type) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Write appends a record batch to the Parquet file.
@@ -1074,32 +1212,94 @@ func normalizeWKBArrayReachable(ext array.ExtensionArray, active []bool, mem mem
 }
 
 // accumulateGeoBounds extends the per-field bounding boxes with the WKB values
-// in this batch. Null rows are skipped; a malformed WKB value fails the write.
+// in this batch and tallies their null counts. Null rows are skipped; a
+// malformed WKB value fails the write.
+//
+// Every geoCols entry comes from a *geoarrow.WKBType leaf of the writer's
+// schema, so a batch whose column does not match is an error rather than a
+// skip: skipping would leave a partial null count that under-reports nulls.
 func (w *ParquetFileWriter) accumulateGeoBounds(batch arrow.RecordBatch) error {
 	for _, gc := range w.geoCols {
 		if gc.colIdx >= int(batch.NumCols()) {
-			continue
-		}
-		ext, ok := batch.Column(gc.colIdx).(array.ExtensionArray)
-		if !ok {
-			continue
-		}
-		storage, ok := ext.Storage().(wkbStorage)
-		if !ok {
-			continue
+			return fmt.Errorf("geo field %d: column %d missing from batch with %d columns",
+				gc.fieldID, gc.colIdx, batch.NumCols())
 		}
 
 		acc, ok := w.geoAccs[gc.fieldID]
 		if !ok {
-			continue
+			return fmt.Errorf("geo field %d: no bounds accumulator", gc.fieldID)
 		}
-		for i := range storage.Len() {
-			if storage.IsNull(i) {
+		col := batch.Column(gc.colIdx)
+		if err := accumulateGeoValues(acc, col, gc.path, 0, col.Len()); err != nil {
+			return fmt.Errorf("geo field %d: %w", gc.fieldID, err)
+		}
+	}
+
+	return nil
+}
+
+// accumulateGeoValues feeds the WKB values in arr[lo:hi] to acc, following path
+// down to the geo leaf. Nulls are counted the way Parquet's leaf null_count
+// does: a null leaf, a null parent, and an empty list or map each count once.
+// Values under a null parent are never decoded.
+func accumulateGeoValues(acc *geoBoundsAccumulator, arr arrow.Array, path []int, lo, hi int) error {
+	switch arr := arr.(type) {
+	case *array.Struct:
+		if len(path) == 0 || path[0] >= arr.NumField() {
+			return fmt.Errorf("struct array %s does not match the geo column path", arr.DataType())
+		}
+		child := arr.Field(path[0])
+		for i := lo; i < hi; i++ {
+			if arr.IsNull(i) {
+				acc.nulls++
+
 				continue
 			}
-			if err := acc.AddWKB(storage.Value(i)); err != nil {
-				return fmt.Errorf("computing geo bounds for field %d: %w", gc.fieldID, err)
+			if err := accumulateGeoValues(acc, child, path[1:], i, i+1); err != nil {
+				return err
 			}
+		}
+	case array.ListLike:
+		for i := lo; i < hi; i++ {
+			start, end := arr.ValueOffsets(i)
+			if arr.IsNull(i) || start == end {
+				acc.nulls++
+
+				continue
+			}
+			if err := accumulateGeoValues(acc, arr.ListValues(), path, int(start), int(end)); err != nil {
+				return err
+			}
+		}
+	default:
+		if len(path) != 0 {
+			return fmt.Errorf("%s array does not match the geo column path", arr.DataType())
+		}
+
+		return accumulateWKBValues(acc, arr, lo, hi)
+	}
+
+	return nil
+}
+
+func accumulateWKBValues(acc *geoBoundsAccumulator, arr arrow.Array, lo, hi int) error {
+	ext, ok := arr.(array.ExtensionArray)
+	if !ok {
+		return fmt.Errorf("expected a WKB extension array, got %s", arr.DataType())
+	}
+	storage, ok := ext.Storage().(wkbStorage)
+	if !ok {
+		return fmt.Errorf("unsupported WKB storage type %s", ext.Storage().DataType())
+	}
+
+	for i := lo; i < hi; i++ {
+		if storage.IsNull(i) {
+			acc.nulls++
+
+			continue
+		}
+		if err := acc.AddWKB(storage.Value(i)); err != nil {
+			return fmt.Errorf("computing geo bounds: %w", err)
 		}
 	}
 
@@ -1125,14 +1325,14 @@ func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 		return nil, err
 	}
 
-	stats := w.format.DataFileStatsFromMeta(filemeta, w.info.StatsCols, w.colMapping, VariantFieldIDsFromSchema(w.info.FileSchema), w.arrowSchema)
+	stats := w.format.DataFileStatsFromMeta(filemeta, w.info.StatsCols, w.colMapping, w.variantFieldIDs, w.arrowSchema)
 	stats.EqualityFieldIDs = w.info.EqualityFieldIDs
 
 	if err = w.applyGeoBounds(stats); err != nil {
 		return nil, err
 	}
 
-	return stats.ToDataFile(DataFileOpts{
+	opts := DataFileOpts{
 		Schema:          w.info.FileSchema,
 		Spec:            w.info.Spec,
 		Path:            w.info.FileName,
@@ -1141,12 +1341,44 @@ func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 		FileSize:        w.counter.Count,
 		PartitionValues: w.partition,
 		SortOrderID:     w.info.SortOrderID,
-	}), nil
+	}
+	if w.info.Content == iceberg.EntryContentPosDeletes {
+		opts.ReferencedDataFile = singleReferencedDataFile(stats)
+	}
+
+	return stats.ToDataFile(opts), nil
+}
+
+// singleReferencedDataFile returns the data file path when every delete in a
+// position delete file targets that one file, or nil otherwise. It compares
+// the untruncated file_path min and max, which position delete writers always
+// collect (see table.positionDeleteMetricsProps). Java's v2
+// PositionDeleteWriter leaves the field unset; the spec allows it on position
+// delete files with a single target.
+func singleReferencedDataFile(stats *DataFileStatistics) *string {
+	agg, ok := stats.ColAggs[iceberg.DeleteFilePathFieldID]
+	if !ok {
+		return nil
+	}
+
+	lower, ok := agg.Min().(iceberg.StringLiteral)
+	if !ok || lower == "" {
+		return nil
+	}
+	upper, ok := agg.Max().(iceberg.StringLiteral)
+	if !ok || lower != upper {
+		return nil
+	}
+
+	path := string(lower)
+
+	return &path
 }
 
 func (w *ParquetFileWriter) Abort() error {
 	closeErr := w.fileCloser.Close()
-	removeErr := w.fs.Remove(w.info.FileName)
+	// Abort is a best-effort cleanup with no caller context to thread.
+	removeErr := w.fs.Remove(context.Background(), w.info.FileName)
 	if errors.Is(removeErr, fs.ErrNotExist) || os.IsNotExist(removeErr) {
 		removeErr = nil
 	}
@@ -1154,17 +1386,30 @@ func (w *ParquetFileWriter) Abort() error {
 	return errors.Join(closeErr, removeErr)
 }
 
-// applyGeoBounds injects the WKB single-point bounds accumulated during the
-// write into the file statistics, so they flow through ToDataFile into the
-// manifest entry like any other typed bound.
+// applyGeoBounds injects the WKB single-point bounds and null counts
+// accumulated during the write into the file statistics, so they flow through
+// ToDataFile into the manifest entry like any other typed bound.
+//
+// Parquet GEOMETRY/GEOGRAPHY columns have an undefined sort order, so the
+// Parquet writer omits the standard Statistics block (min, max, null count)
+// from their column chunks and DataFileStatsFromMeta cannot recover null
+// counts for them.
 func (w *ParquetFileWriter) applyGeoBounds(stats *DataFileStatistics) error {
 	for fieldID, acc := range w.geoAccs {
 		// Honor the column's metrics mode: a column the caller never registered
-		// (missing key) or one set to counts/none does not record bounds. Check
-		// presence first — a missing key yields a zero-value mode of "" that would
-		// otherwise fall through and write bounds the caller asked to skip.
+		// (missing key) or one set to none records nothing, and counts records
+		// no bounds. Check presence first — a missing key yields a zero-value
+		// mode of "" that would otherwise fall through and write bounds the
+		// caller asked to skip.
 		sc, ok := w.info.StatsCols[fieldID]
-		if !ok || sc.Mode.Typ == MetricModeNone || sc.Mode.Typ == MetricModeCounts {
+		if !ok || sc.Mode.Typ == MetricModeNone {
+			continue
+		}
+		if stats.NullValueCounts == nil {
+			stats.NullValueCounts = make(map[int]int64)
+		}
+		stats.NullValueCounts[fieldID] = acc.nulls
+		if sc.Mode.Typ == MetricModeCounts {
 			continue
 		}
 
@@ -1488,12 +1733,14 @@ func (p parquetFormat) DataFileStatsFromMeta(meta Metadata, statsCols map[int]St
 				panic(err)
 			}
 
+			// These metrics come from column chunk metadata, so keep totaling them even when stats are invalid.
+			// This deliberately diverges from Java, which drops value_counts for a column once any row group lacks stats.
+			colSizes[fieldID] += colChunk.TotalCompressedSize()
+			valueCounts[fieldID] += colChunk.NumValues()
 			if _, invalid := invalidateCol[fieldID]; invalid {
 				continue
 			}
 
-			colSizes[fieldID] += colChunk.TotalCompressedSize()
-			valueCounts[fieldID] += colChunk.NumValues()
 			set, err := colChunk.StatsSet()
 			if err != nil {
 				panic(err)
@@ -1784,11 +2031,41 @@ type RowGroupBloomPred struct {
 	PhysBytes [][]byte // one entry for EqualTo; one per value for In
 }
 
-// ParquetRowGroupTester combines stats-based and bloom filter row group pruning.
+// RowGroupDictionaryPred holds the physical-encoded bytes for each literal in
+// a dictionary-prunable predicate on one field. A row group can be skipped
+// when NONE of the bytes occur in its complete dictionary. It intentionally
+// mirrors RowGroupBloomPred because both predicates use the same physical
+// literal encoding.
+type RowGroupDictionaryPred struct {
+	FieldID   int
+	PhysBytes [][]byte // one entry for EqualTo; one per value for In
+}
+
+// ParquetRowGroupTester combines stats-based, dictionary, and bloom filter row
+// group pruning.
 // Pass it as the tester argument to wrapPqArrowReader.GetRecords.
 type ParquetRowGroupTester struct {
-	StatsFn    func(*metadata.RowGroupMetaData, []int) (bool, error)
-	BloomPreds []RowGroupBloomPred // nil = no bloom filter pass
+	StatsFn func(*metadata.RowGroupMetaData, []int) (bool, error)
+	// StatsFieldIDs limits StatsFn to Parquet columns referenced by the pruning
+	// expression. Nil preserves the historical behavior of using all read columns.
+	// A non-nil empty slice requests no column statistics.
+	StatsFieldIDs   []int
+	BloomPreds      []RowGroupBloomPred      // nil = no bloom filter pass
+	DictionaryPreds []RowGroupDictionaryPred // nil = no dictionary filter pass
+	// RangeSet indicates that Start and Length came from an explicit scan task.
+	// Without it, the zero value keeps the historical full-file behavior for
+	// callers that construct a tester only for row-group pruning.
+	RangeSet bool
+	// When RangeSet is true, Start and Length select row groups whose absolute
+	// Parquet row-group offset falls in [Start, Start+Length).
+	Start, Length int64
+	// PlanningSplitOffsets contains the split offsets used when the scan task
+	// was planned. It may be a borrowed view of DataFile state and must be
+	// treated as read-only for the lifetime of this tester. When it contains one
+	// valid offset per row group, range selection uses these offsets instead of
+	// re-deriving them from the opened Parquet footer. Sparse split-offset lists
+	// fall back to the footer offsets.
+	PlanningSplitOffsets []int64
 	// Survivors, if non-nil, is reset and then filled with one span per row group
 	// that survives pruning, in file order, with positions relative to the full
 	// file. It lets callers reconstruct each emitted row's original position even
@@ -1805,6 +2082,11 @@ type RowGroupSpan struct {
 
 type wrapPqArrowReader struct {
 	*pqarrow.FileReader
+	rowGroupInfos []parquetRowGroupInfo
+	// dictionarySource is shared with FileReader. The temporary reader created
+	// from it wraps the source so it cannot close the main reader's input.
+	dictionarySource parquet.ReaderAtSeeker
+	dictionaryMem    memory.Allocator
 }
 
 func (w wrapPqArrowReader) Metadata() Metadata {
@@ -1823,6 +2105,66 @@ func (w wrapPqArrowReader) PrunedSchema(projectedIDs map[int]struct{}, mapping i
 	return pruneParquetColumns(w.Manifest, projectedIDs, false, mapping)
 }
 
+// parquetRowGroupSplitOffset returns the same first-page offset used when
+// DataFileStatistics.SplitOffsets is built. RowGroup.file_offset is optional
+// in Parquet and Arrow returns zero when it is absent, so relying on it can
+// discard every row group in a split task from an otherwise valid file.
+func parquetRowGroupSplitOffset(rgMeta *metadata.RowGroupMetaData) int64 {
+	if rgMeta.NumColumns() > 0 {
+		if firstColumn, err := rgMeta.ColumnChunk(0); err == nil {
+			dataOffset := firstColumn.DataPageOffset()
+			if firstColumn.HasDictionaryPage() {
+				dictOffset := firstColumn.DictionaryPageOffset()
+				if dictOffset >= 0 && (dataOffset < 0 || dictOffset < dataOffset) {
+					return dictOffset
+				}
+			}
+			if dataOffset >= 0 {
+				return dataOffset
+			}
+		}
+	}
+
+	return rgMeta.FileOffset()
+}
+
+func parquetRowGroupInfos(rdr *file.Reader) []parquetRowGroupInfo {
+	result := make([]parquetRowGroupInfo, rdr.NumRowGroups())
+	for i := range result {
+		rgMeta := rdr.MetaData().RowGroup(i)
+		result[i] = parquetRowGroupInfo{
+			splitOffset: parquetRowGroupSplitOffset(rgMeta),
+			numRows:     rgMeta.NumRows(),
+		}
+	}
+
+	return result
+}
+
+func validateParquetRowGroupRange(fileSize, start, length int64) error {
+	if start < 0 || length <= 0 || start > fileSize || length > fileSize-start {
+		return fmt.Errorf(
+			"%w: invalid parquet row-group range: start=%d, length=%d, file size=%d",
+			iceberg.ErrInvalidArgument, start, length, fileSize)
+	}
+
+	return nil
+}
+
+func validParquetRowGroupOffsets(offsets []int64, numRowGroups int, fileSize int64) bool {
+	if len(offsets) != numRowGroups {
+		return false
+	}
+
+	for i, offset := range offsets {
+		if offset < 0 || offset >= fileSize || (i > 0 && offset <= offsets[i-1]) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester any) (array.RecordReader, error) {
 	var rowGroupTester *ParquetRowGroupTester
 
@@ -1834,18 +2176,65 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 		}
 	}
 
+	rangeSet := rowGroupTester != nil && rowGroupTester.RangeSet
+	if rangeSet {
+		if err := validateParquetRowGroupRange(
+			w.SourceFileSize(), rowGroupTester.Start, rowGroupTester.Length); err != nil {
+			return nil, err
+		}
+	}
+
 	var rgList []int
-	if rowGroupTester != nil && (rowGroupTester.StatsFn != nil || len(rowGroupTester.BloomPreds) > 0) {
+	if rowGroupTester != nil && (rangeSet ||
+		rowGroupTester.StatsFn != nil || len(rowGroupTester.DictionaryPreds) > 0 ||
+		len(rowGroupTester.BloomPreds) > 0) {
 		fileMeta := w.ParquetReader().MetaData()
 		numRg := w.ParquetReader().NumRowGroups()
+		planningOffsets := rowGroupTester.PlanningSplitOffsets
+		if !validParquetRowGroupOffsets(planningOffsets, numRg, w.SourceFileSize()) {
+			planningOffsets = nil
+		}
 
 		var (
-			fieldIDToColIdx map[int]int
-			bfReader        *metadata.BloomFilterReader
+			fieldIDToColIdx  map[int]int
+			bfReader         *metadata.BloomFilterReader
+			dictionaryReader *file.Reader
 		)
 
-		if len(rowGroupTester.BloomPreds) > 0 {
+		if (rowGroupTester.StatsFn != nil && len(rowGroupTester.StatsFieldIDs) > 0) ||
+			len(rowGroupTester.BloomPreds) > 0 || len(rowGroupTester.DictionaryPreds) > 0 {
 			fieldIDToColIdx = buildFieldIDToColIdx(fileMeta)
+		}
+		statsCols := cols
+		if rowGroupTester.StatsFn != nil && rowGroupTester.StatsFieldIDs != nil {
+			statsCols = make([]int, 0, len(rowGroupTester.StatsFieldIDs))
+			for _, fieldID := range rowGroupTester.StatsFieldIDs {
+				if colIdx, ok := fieldIDToColIdx[fieldID]; ok {
+					statsCols = append(statsCols, colIdx)
+				}
+			}
+		}
+		var dictionaryPredsByColumn map[int][]int
+		if len(rowGroupTester.DictionaryPreds) > 0 {
+			dictionaryPredsByColumn = groupRowGroupDictionaryPredicates(
+				fieldIDToColIdx, rowGroupTester.DictionaryPreds)
+			if len(dictionaryPredsByColumn) > 0 && w.dictionarySource != nil {
+				// Dictionary inspection is an optional optimisation. If the
+				// section-read reader cannot be created, use the main reader and
+				// keep the existing conservative behaviour.
+				dictionaryReader, _ = newParquetDictionaryReader(
+					w.dictionarySource, fileMeta, w.dictionaryMem)
+				if dictionaryReader != nil {
+					// The temporary reader owns only its buffers. Its source is
+					// wrapped so this cannot close the main reader's input.
+					defer dictionaryReader.Close()
+				}
+			}
+			if len(dictionaryPredsByColumn) > 0 && dictionaryReader == nil {
+				dictionaryReader = w.ParquetReader()
+			}
+		}
+		if len(rowGroupTester.BloomPreds) > 0 {
 			bfReader = w.ParquetReader().GetBloomFilterReader()
 		}
 
@@ -1853,21 +2242,54 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 			*rowGroupTester.Survivors = (*rowGroupTester.Survivors)[:0]
 		}
 
+		rangeStart := rowGroupTester.Start
+		rangeEnd := rangeStart + rowGroupTester.Length
 		rgList = make([]int, 0)
 		var firstRowPos int64
 		for rg := range numRg {
-			rgMeta := fileMeta.RowGroup(rg)
-			numRows := rgMeta.NumRows()
 			pos := firstRowPos
+			var (
+				rgMeta  *metadata.RowGroupMetaData
+				numRows int64
+				offset  int64
+			)
+			if len(w.rowGroupInfos) == numRg {
+				info := w.rowGroupInfos[rg]
+				numRows = info.numRows
+				offset = info.splitOffset
+			} else {
+				rgMeta = fileMeta.RowGroup(rg)
+				numRows = rgMeta.NumRows()
+			}
 			firstRowPos += numRows
 
 			use := true
-			if rowGroupTester.StatsFn != nil {
+			if rangeSet {
+				if planningOffsets != nil {
+					offset = planningOffsets[rg]
+				} else if len(w.rowGroupInfos) != numRg {
+					offset = parquetRowGroupSplitOffset(rgMeta)
+				}
+				use = offset >= rangeStart && offset < rangeEnd
+			}
+			if use && (rowGroupTester.StatsFn != nil || bfReader != nil) && rgMeta == nil {
+				rgMeta = fileMeta.RowGroup(rg)
+			}
+			if use && rowGroupTester.StatsFn != nil {
 				var err error
-				use, err = rowGroupTester.StatsFn(rgMeta, cols)
+				use, err = rowGroupTester.StatsFn(rgMeta, statsCols)
 				if err != nil {
 					return nil, err
 				}
+			}
+
+			if use && len(dictionaryPredsByColumn) > 0 {
+				if rgMeta == nil {
+					rgMeta = fileMeta.RowGroup(rg)
+				}
+				use = checkRowGroupDictionaries(
+					dictionaryReader, fileMeta, rgMeta, rg,
+					dictionaryPredsByColumn, rowGroupTester.DictionaryPreds)
 			}
 
 			if use && bfReader != nil {
@@ -1897,6 +2319,389 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 	}
 
 	return w.GetRecordReader(ctx, cols, rgList)
+}
+
+// nonClosingReaderAtSeeker gives a temporary Parquet reader access to a shared
+// source without allowing that reader's Close method to close the source owned
+// by the main Arrow reader.
+type nonClosingReaderAtSeeker struct {
+	parquet.ReaderAtSeeker
+}
+
+func (nonClosingReaderAtSeeker) Close() error {
+	return nil
+}
+
+func newParquetDictionaryReader(
+	source parquet.ReaderAtSeeker, fileMeta *metadata.FileMetaData, mem memory.Allocator,
+) (*file.Reader, error) {
+	readProps := parquet.NewReaderProperties(mem)
+	readProps.BufferedStreamEnabled = true
+
+	return file.NewParquetReader(nonClosingReaderAtSeeker{ReaderAtSeeker: source},
+		file.WithMetadata(fileMeta), file.WithReadProps(readProps))
+}
+
+func groupRowGroupDictionaryPredicates(
+	fieldIDToColIdx map[int]int,
+	preds []RowGroupDictionaryPred,
+) map[int][]int {
+	predsByColumn := make(map[int][]int)
+	for i, pred := range preds {
+		if len(pred.PhysBytes) == 0 {
+			continue
+		}
+
+		colIdx, ok := fieldIDToColIdx[pred.FieldID]
+		if ok {
+			predsByColumn[colIdx] = append(predsByColumn[colIdx], i)
+		}
+	}
+
+	return predsByColumn
+}
+
+// checkRowGroupDictionaries checks each dictionary predicate against the
+// complete dictionary for its column in row group rg. It returns false only
+// when the column metadata proves that every data page is dictionary encoded
+// and none of the predicate values occur in the dictionary. Missing encoding
+// metadata, dictionary pages, unsupported physical types, malformed pages, or
+// reader errors keep the row group so this optimisation cannot drop data.
+func checkRowGroupDictionaries(
+	rdr *file.Reader,
+	fileMeta *metadata.FileMetaData,
+	rgMeta *metadata.RowGroupMetaData,
+	rg int,
+	predsByColumn map[int][]int,
+	preds []RowGroupDictionaryPred,
+) bool {
+	if len(preds) == 0 || len(predsByColumn) == 0 {
+		return true
+	}
+
+	rgReader := rdr.RowGroup(rg)
+	for colIdx, predIndexes := range predsByColumn {
+		chunk, err := rgMeta.ColumnChunk(colIdx)
+		if err != nil || chunk == nil || !parquetColumnUsesOnlyDictionaryData(chunk) {
+			continue
+		}
+
+		column := fileMeta.Schema.Column(colIdx)
+		pageRdr, err := rgReader.GetColumnPageReader(colIdx)
+		if err != nil {
+			continue
+		}
+
+		dictPage, dictErr := pageRdr.GetDictionaryPage()
+		if dictErr != nil || dictPage == nil {
+			if dictPage != nil {
+				dictPage.Release()
+			}
+			_ = pageRdr.Close()
+
+			continue
+		}
+
+		matches, known := dictionaryMatchesPredicates(
+			dictPage, column.PhysicalType(), column.TypeLength(), preds, predIndexes)
+		dictPage.Release()
+		closeErr := pageRdr.Close()
+		if !known {
+			continue
+		}
+		if closeErr != nil {
+			// A close error makes an otherwise conclusive dictionary result
+			// unusable, so keep the row group conservatively.
+			slog.Warn("dictionary row-group pruning skipped after page reader close error",
+				"rowGroup", rg, "err", closeErr)
+
+			continue
+		}
+
+		if !matches {
+			return false
+		}
+	}
+
+	return true
+}
+
+// parquetColumnUsesOnlyDictionaryData verifies that the optional encoding
+// statistics identify a dictionary page and dictionary-encoded data pages,
+// with no PLAIN fallback pages. EncodingStats is deliberately required: the
+// column encoding list cannot distinguish the PLAIN dictionary page itself
+// from a later PLAIN data page in older files.
+func parquetColumnUsesOnlyDictionaryData(chunk *metadata.ColumnChunkMetaData) bool {
+	if !chunk.HasDictionaryPage() {
+		return false
+	}
+
+	stats := chunk.EncodingStats()
+	if len(stats) == 0 {
+		return false
+	}
+
+	var hasDictionaryPage, hasDictionaryData bool
+	for _, stat := range stats {
+		switch stat.PageType {
+		case file.PageTypeDictionaryPage:
+			if stat.Encoding != parquet.Encodings.Plain && stat.Encoding != parquet.Encodings.PlainDict {
+				return false
+			}
+			hasDictionaryPage = true
+		case file.PageTypeDataPage, file.PageTypeDataPageV2:
+			if stat.Encoding != parquet.Encodings.RLEDict && stat.Encoding != parquet.Encodings.PlainDict {
+				return false
+			}
+			hasDictionaryData = true
+		default:
+			return false
+		}
+	}
+
+	return hasDictionaryPage && hasDictionaryData
+}
+
+// dictionaryMatchesPredicates decodes a PLAIN dictionary page and reports
+// whether every requested predicate has at least one matching value. The
+// returned known flag is false for unsupported or malformed input that
+// prevents a pruning decision, which means the caller must retain the row
+// group.
+func dictionaryMatchesPredicates(
+	page *file.DictionaryPage,
+	physicalType parquet.Type,
+	typeLen int,
+	preds []RowGroupDictionaryPred,
+	predIndexes []int,
+) (bool, bool) {
+	pageEncoding := parquet.Encoding(page.Encoding())
+	if pageEncoding != parquet.Encodings.Plain && pageEncoding != parquet.Encodings.PlainDict {
+		return false, false
+	}
+
+	width, variableWidth, ok := parquetDictionaryValueLayout(physicalType, typeLen)
+	if !ok {
+		return false, false
+	}
+
+	for _, predIndex := range predIndexes {
+		usable := false
+		for _, candidate := range preds[predIndex].PhysBytes {
+			if variableWidth || len(candidate) == width {
+				usable = true
+
+				break
+			}
+		}
+		if !usable {
+			return false, false
+		}
+	}
+
+	data := page.Data()
+	offset := 0
+	numValues := page.NumValues()
+	if numValues < 0 {
+		return false, false
+	}
+	if numValues == 0 {
+		return false, len(data) == 0
+	}
+
+	if len(predIndexes) == 1 {
+		pred := preds[predIndexes[0]]
+		candidateSet := parquetDictionaryCandidateSet(
+			physicalType, width, variableWidth, numValues, pred.PhysBytes)
+		for range numValues {
+			value, next, ok := nextParquetDictionaryValue(data, offset, physicalType, width)
+			if !ok {
+				return false, false
+			}
+			offset = next
+
+			if candidateSet != nil {
+				if _, ok := candidateSet[string(value)]; ok {
+					return true, true
+				}
+			} else {
+				for _, candidate := range pred.PhysBytes {
+					if parquetDictionaryValueEqual(physicalType, value, candidate) {
+						return true, true
+					}
+				}
+			}
+		}
+
+		if offset != len(data) {
+			return false, false
+		}
+
+		return false, true
+	}
+
+	// predIndexes contains indexes into the full preds slice. Keep matches
+	// aligned with predIndexes so columns with a small predicate subset do not
+	// allocate a slice for predicates belonging to other columns.
+	matches := make([]bool, len(predIndexes))
+	candidateSets := make([]map[string]struct{}, len(predIndexes))
+	for matchIndex, predIndex := range predIndexes {
+		candidateSets[matchIndex] = parquetDictionaryCandidateSet(
+			physicalType, width, variableWidth, numValues, preds[predIndex].PhysBytes)
+	}
+	remaining := len(predIndexes)
+	for range numValues {
+		if remaining == 0 {
+			break
+		}
+
+		value, next, ok := nextParquetDictionaryValue(data, offset, physicalType, width)
+		if !ok {
+			return false, false
+		}
+		offset = next
+
+		for matchIndex, predIndex := range predIndexes {
+			if matches[matchIndex] {
+				continue
+			}
+
+			if candidateSets[matchIndex] != nil {
+				if _, ok := candidateSets[matchIndex][string(value)]; ok {
+					matches[matchIndex] = true
+					remaining--
+				}
+			} else {
+				for _, candidate := range preds[predIndex].PhysBytes {
+					if parquetDictionaryValueEqual(physicalType, value, candidate) {
+						matches[matchIndex] = true
+						remaining--
+
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if remaining == 0 {
+		// All predicates already match, so trailing dictionary entries cannot
+		// change the decision and do not need to be decoded or validated.
+		return true, true
+	}
+
+	if offset != len(data) {
+		return false, false
+	}
+
+	return false, true
+}
+
+const (
+	parquetDictionaryCandidateSetLimit     = 8
+	parquetDictionaryCandidateSetMinValues = 16
+)
+
+func parquetDictionaryCandidateSet(
+	physicalType parquet.Type,
+	width int,
+	variableWidth bool,
+	numValues int32,
+	candidates [][]byte,
+) map[string]struct{} {
+	if len(candidates) < parquetDictionaryCandidateSetLimit ||
+		numValues < parquetDictionaryCandidateSetMinValues {
+		return nil
+	}
+
+	switch physicalType {
+	case parquet.Types.Int32, parquet.Types.Int64,
+		parquet.Types.ByteArray, parquet.Types.FixedLenByteArray:
+	default:
+		// Float and Double need numeric comparison for signed zero and NaN.
+		return nil
+	}
+
+	result := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if variableWidth || len(candidate) == width {
+			result[string(candidate)] = struct{}{}
+		}
+	}
+
+	return result
+}
+
+func parquetDictionaryValueLayout(physicalType parquet.Type, typeLen int) (width int, variableWidth, ok bool) {
+	switch physicalType {
+	case parquet.Types.Int32, parquet.Types.Float:
+		return 4, false, true
+	case parquet.Types.Int64, parquet.Types.Double:
+		return 8, false, true
+	case parquet.Types.ByteArray:
+		return 0, true, true
+	case parquet.Types.FixedLenByteArray:
+		if typeLen > 0 {
+			return typeLen, false, true
+		}
+	}
+
+	return 0, false, false
+}
+
+func nextParquetDictionaryValue(data []byte, offset int, physicalType parquet.Type, width int) ([]byte, int, bool) {
+	if physicalType == parquet.Types.ByteArray {
+		if offset < 0 || offset > len(data) || len(data)-offset < 4 {
+			return nil, 0, false
+		}
+
+		valueLen := int(binary.LittleEndian.Uint32(data[offset:]))
+		valueStart := offset + 4
+		if valueLen > len(data)-valueStart {
+			return nil, 0, false
+		}
+
+		return data[valueStart : valueStart+valueLen], valueStart + valueLen, true
+	}
+
+	if offset < 0 || width < 0 || width > len(data)-offset {
+		return nil, 0, false
+	}
+
+	return data[offset : offset+width], offset + width, true
+}
+
+func parquetDictionaryValueEqual(physicalType parquet.Type, value, candidate []byte) bool {
+	if physicalType == parquet.Types.Float && len(value) == 4 && len(candidate) == 4 {
+		left := math.Float32frombits(binary.LittleEndian.Uint32(value))
+		right := math.Float32frombits(binary.LittleEndian.Uint32(candidate))
+		if math.IsNaN(float64(right)) {
+			// Keep groups for NaN literals because reader equality semantics
+			// can differ.
+			return true
+		}
+		if math.IsNaN(float64(left)) {
+			return false
+		}
+
+		return left == right
+	}
+
+	if physicalType == parquet.Types.Double && len(value) == 8 && len(candidate) == 8 {
+		left := math.Float64frombits(binary.LittleEndian.Uint64(value))
+		right := math.Float64frombits(binary.LittleEndian.Uint64(candidate))
+		if math.IsNaN(right) {
+			// Keep groups for NaN literals because reader equality semantics
+			// can differ.
+			return true
+		}
+		if math.IsNaN(left) {
+			return false
+		}
+
+		return left == right
+	}
+
+	return slices.Equal(value, candidate)
 }
 
 // buildFieldIDToColIdx maps each Iceberg field ID to its 0-based column index in
@@ -1963,7 +2768,7 @@ func checkRowGroupBloomFilters(
 }
 
 func (pfs *ParquetFileSource) GetReader(ctx context.Context) (result FileReader, err error) {
-	pf, err := pfs.fs.Open(pfs.file.FilePath())
+	pf, err := pfs.fs.Open(ctx, pfs.file.FilePath())
 	if err != nil {
 		return nil, err
 	}
@@ -1976,10 +2781,42 @@ func (pfs *ParquetFileSource) GetReader(ctx context.Context) (result FileReader,
 		}
 	}()
 
-	rdr, err := file.NewParquetReader(pf,
-		file.WithReadProps(parquet.NewReaderProperties(pfs.mem)))
-	if err != nil {
-		return nil, err
+	readProps := parquet.NewReaderProperties(pfs.mem)
+	var rdr *file.Reader
+	var rowGroupInfos []parquetRowGroupInfo
+	if cache := parquetMetadataCacheFromContext(ctx); cache != nil {
+		entry := cache.entry(parquetMetadataCacheKey{
+			path: pfs.file.FilePath(),
+			size: pfs.file.FileSizeBytes(),
+		})
+
+		var parsed *file.Reader
+		entry.once.Do(func() {
+			parsed, entry.err = file.NewParquetReader(pf, file.WithReadProps(readProps))
+			if entry.err == nil {
+				entry.fileMetadata = parsed.MetaData()
+				entry.rowGroupInfos = parquetRowGroupInfos(parsed)
+			}
+		})
+		if entry.err != nil {
+			return nil, entry.err
+		}
+		rowGroupInfos = entry.rowGroupInfos
+
+		if parsed != nil {
+			rdr = parsed
+		} else {
+			rdr, err = file.NewParquetReader(pf,
+				file.WithMetadata(entry.fileMetadata), file.WithReadProps(readProps))
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		rdr, err = file.NewParquetReader(pf, file.WithReadProps(readProps))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	props := TablePropertiesFromContext(ctx)
@@ -1998,7 +2835,12 @@ func (pfs *ParquetFileSource) GetReader(ctx context.Context) (result FileReader,
 		return nil, err
 	}
 
-	result = wrapPqArrowReader{fr}
+	result = wrapPqArrowReader{
+		FileReader:       fr,
+		rowGroupInfos:    rowGroupInfos,
+		dictionarySource: pf,
+		dictionaryMem:    pfs.mem,
+	}
 
 	return result, nil
 }
@@ -2219,7 +3061,7 @@ func (p *pruneParquetSchema) Field(field pqarrow.SchemaField, result arrow.Field
 
 	// Variant is an extension type wrapping a struct (metadata + value).
 	// Select the entire field including all children.
-	if ext, ok := field.Field.Type.(arrow.ExtensionType); ok && ext.ExtensionName() == "parquet.variant" {
+	if ext, ok := field.Field.Type.(arrow.ExtensionType); ok && extensions.IsVariantExtensionName(ext.ExtensionName()) {
 		return p.projectVariant(field)
 	}
 

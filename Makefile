@@ -15,9 +15,9 @@
 # limitations under the License.
 
 # golangci-lint version (keep in sync with CI and README)
-GOLANGCI_LINT_VERSION := v2.12.2
+GOLANGCI_LINT_VERSION := v2.14.0
 
-.PHONY: test test-assert test-race lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-spark integration-hadoop integration-down integration-logs docs-gen
+.PHONY: test test-assert test-race vet lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-setup-polaris integration-external-rest integration-spark integration-hadoop integration-down integration-logs docs-gen
 
 test:
 	go test -v ./...
@@ -27,6 +27,13 @@ test-assert:
 
 test-race:
 	go test -race -v ./...
+
+# vet also type-checks the //go:build integration files, which the default
+# toolchain skips. Without the tagged pass, code behind that tag (for example
+# table/maintenance's integration test) can break without any target noticing.
+vet:
+	go vet ./...
+	go vet -tags=integration ./...
 
 docs-gen:
 	go run ./website/gen
@@ -39,7 +46,7 @@ lint-install:
 
 integration-setup:
 	mkdir -p /tmp/iceberg-hadoop-warehouse
-	docker compose -f internal/recipe/docker-compose.yml up -d --wait
+	docker compose -f internal/recipe/docker-compose.yml up -d --build --wait
 	docker compose -f internal/recipe/docker-compose.yml exec -T spark-iceberg ipython ./provision.py
 
 integration-setup-spark4:
@@ -55,7 +62,7 @@ integration-logs:
 	docker compose -f internal/recipe/docker-compose.yml logs
 
 integration-env:
-	@echo "export AWS_S3_ENDPOINT=http://$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minio):9000"
+	@echo "export AWS_S3_ENDPOINT=http://$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' object-store):9000"
 	@echo "export AWS_REGION=us-east-1"
 	@echo "export SPARK_CONTAINER_ID=$$(docker ps -qf 'name=spark-iceberg')"
 	@echo "export DOCKER_API_VERSION=$$(docker version -f '{{.Server.APIVersion}}')"
@@ -75,6 +82,23 @@ integration-rest:
 
 integration-rest-scan-planning:
 	RUN_INTEGRATION_TESTS=1 go test -tags=integration -v -run="^TestRestIntegration/TestScanPlanningJava" ./catalog/rest
+
+# integration-external-rest runs the catalog conformance suite against an
+# external REST catalog server. The defaults match the Polaris server that
+# integration-setup-polaris starts. Set REST_CATALOG_* in the environment to
+# point it at another catalog; set one to an empty value to leave it unset.
+REST_CATALOG_URI ?= http://localhost:8191/api/catalog
+REST_CATALOG_CREDENTIAL ?= root:s3cr3t
+REST_CATALOG_SCOPE ?= PRINCIPAL_ROLE:ALL
+REST_CATALOG_WAREHOUSE ?= conformance
+
+integration-setup-polaris:
+	internal/recipe/setup-polaris.sh
+
+integration-external-rest:
+	REST_CATALOG_URI='$(REST_CATALOG_URI)' REST_CATALOG_CREDENTIAL='$(REST_CATALOG_CREDENTIAL)' \
+	REST_CATALOG_SCOPE='$(REST_CATALOG_SCOPE)' REST_CATALOG_WAREHOUSE='$(REST_CATALOG_WAREHOUSE)' \
+	go test -tags=integration -v -run="^TestExternalRestCatalogConformance$$" ./catalog/rest
 
 integration-spark:
 	go test -tags=integration -v -run="^TestSparkIntegration" ./table

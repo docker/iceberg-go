@@ -48,13 +48,16 @@ package table
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	iceberginternal "github.com/apache/iceberg-go/internal"
@@ -152,9 +155,11 @@ var (
 	// writing or replacing.
 	ErrConflictingDeleteFiles = fmt.Errorf("%w: concurrent delete files added", ErrCommitFailed)
 
-	// ErrDataFilesMissing is returned when a concurrent commit deleted
-	// data files the committer explicitly references (e.g. a position
-	// delete pointing at a file that is no longer reachable).
+	// ErrDataFilesMissing is returned when data files the committer
+	// explicitly references (e.g. the target of a position delete) are
+	// not live: a concurrent commit removed them, or, when RowDelta.Commit
+	// stages the delete, an operation staged earlier in the same
+	// transaction did. A refresh does not help in the second case.
 	ErrDataFilesMissing = fmt.Errorf("%w: referenced data files missing", ErrCommitFailed)
 )
 
@@ -168,11 +173,11 @@ var (
 // concurrent commits and validators return nil without reading
 // manifests.
 //
-// conflictContext is immutable once constructed — do NOT reuse the
-// same context across retry attempts that re-fetch catalog state,
-// because the cached concurrent-snapshot walk becomes stale. There
-// is deliberately no Refresh or mutator method; a refresh must flow
-// as a fresh call to newConflictContext(newBase, newCurrent, ...).
+// The metadata and concurrent-snapshot walk are fixed once constructed — do
+// NOT reuse the same context across retry attempts that re-fetch catalog
+// state, because both the walk and its read caches would become stale. There
+// is deliberately no Refresh or mutator method; a refresh must flow as a
+// fresh call to newConflictContext(newBase, newCurrent, ...).
 type conflictContext struct {
 	current       Metadata
 	branch        string
@@ -181,6 +186,223 @@ type conflictContext struct {
 
 	// Resolved once; subsequent validator calls reuse the walk.
 	concurrent []Snapshot
+
+	// Lazily caches raw manifest bytes for this validation attempt. The
+	// cache is intentionally scoped to the context because all validators
+	// inspect the same immutable metadata snapshot, while ManifestFile.Entries
+	// still performs descriptor-specific inheritance for each logical read.
+	manifestIO *conflictManifestIO
+
+	// Parsed manifest-list descriptors are also shared across validators.
+	manifestLists map[int64]conflictManifestList
+}
+
+type conflictManifestList struct {
+	manifests []iceberg.ManifestFile
+	err       error
+}
+
+const maxConflictManifestCacheBytes = 64 << 20
+
+var errConflictManifestIOReadOnly = errors.New("conflict manifest IO is read-only")
+
+// conflictManifestIO is a read-through cache used only while conflict
+// validators inspect one conflictContext. Manifest files are immutable after
+// they are committed, so the same path can be safely served from the cached
+// bytes to later validators without reopening the backing object store.
+//
+// The cache stores raw bytes instead of decoded entries. The first read still
+// streams from the backing IO and is recorded only when it has consumed the
+// size reported by Stat, so an early validator exit does not cache a partial
+// manifest. The cache is bounded per validation attempt; reads after the
+// bound fall through to the backing IO. Later reads stream decoded entries
+// from completed bytes and let each ManifestFile descriptor apply its own
+// inheritance metadata.
+type conflictManifestIO struct {
+	base        iceio.IO
+	files       map[string][]byte
+	cachedBytes int64
+}
+
+func newConflictManifestIO(base iceio.IO) *conflictManifestIO {
+	return &conflictManifestIO{
+		base:  base,
+		files: make(map[string][]byte),
+	}
+}
+
+func (c *conflictManifestIO) Open(ctx context.Context, name string) (iceio.File, error) {
+	if data, ok := c.files[name]; ok {
+		return newConflictManifestFile(name, data), nil
+	}
+
+	f, err := c.base.Open(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if c.cachedBytes >= maxConflictManifestCacheBytes {
+		return f, nil
+	}
+
+	info, statErr := f.Stat()
+	if statErr != nil || info == nil || info.Size() < 0 {
+		if statIO, ok := c.base.(iceio.StatIO); ok {
+			info, statErr = statIO.Stat(name)
+		}
+	}
+	if statErr != nil || info == nil || info.Size() < 0 {
+		return f, nil
+	}
+
+	return &conflictManifestRecordingFile{
+		base:         f,
+		cache:        c,
+		name:         name,
+		expectedSize: info.Size(),
+		cacheLimit:   maxConflictManifestCacheBytes - c.cachedBytes,
+		cacheable:    true,
+		complete:     info.Size() == 0,
+	}, nil
+}
+
+func (c *conflictManifestIO) Remove(context.Context, string) error {
+	return errConflictManifestIOReadOnly
+}
+
+func (c *conflictManifestIO) Stat(name string) (fs.FileInfo, error) {
+	if data, ok := c.files[name]; ok {
+		return conflictManifestFileInfo{name: name, size: int64(len(data))}, nil
+	}
+
+	if statIO, ok := c.base.(iceio.StatIO); ok {
+		return statIO.Stat(name)
+	}
+
+	f, err := c.Open(context.Background(), name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return f.Stat()
+}
+
+type conflictManifestFile struct {
+	*bytes.Reader
+	name string
+	size int64
+}
+
+func newConflictManifestFile(name string, data []byte) *conflictManifestFile {
+	return &conflictManifestFile{
+		Reader: bytes.NewReader(data),
+		name:   name,
+		size:   int64(len(data)),
+	}
+}
+
+func (f *conflictManifestFile) Close() error { return nil }
+
+func (f *conflictManifestFile) Stat() (fs.FileInfo, error) {
+	return conflictManifestFileInfo{name: f.name, size: f.size}, nil
+}
+
+type conflictManifestRecordingFile struct {
+	base         iceio.File
+	cache        *conflictManifestIO
+	name         string
+	expectedSize int64
+	cacheLimit   int64
+	data         []byte
+	cacheable    bool
+	complete     bool
+}
+
+func (f *conflictManifestRecordingFile) Read(p []byte) (int, error) {
+	n, err := f.base.Read(p)
+	if f.cacheable && n > 0 {
+		if int64(len(f.data))+int64(n) > f.cacheLimit {
+			f.cacheable = false
+			f.data = nil
+		} else {
+			f.data = append(f.data, p[:n]...)
+			f.complete = int64(len(f.data)) == f.expectedSize
+		}
+	}
+
+	return n, err
+}
+
+func (f *conflictManifestRecordingFile) ReadAt(p []byte, offset int64) (int, error) {
+	f.disableCaching()
+
+	return f.base.ReadAt(p, offset)
+}
+
+func (f *conflictManifestRecordingFile) Seek(offset int64, whence int) (int64, error) {
+	f.disableCaching()
+
+	return f.base.Seek(offset, whence)
+}
+
+func (f *conflictManifestRecordingFile) Stat() (fs.FileInfo, error) {
+	return f.base.Stat()
+}
+
+func (f *conflictManifestRecordingFile) Close() error {
+	err := f.base.Close()
+	if err == nil && f.cacheable && f.complete && int64(len(f.data)) == f.expectedSize {
+		f.cache.files[f.name] = f.data
+		f.cache.cachedBytes += int64(len(f.data))
+	}
+
+	return err
+}
+
+func (f *conflictManifestRecordingFile) disableCaching() {
+	f.cacheable = false
+	f.complete = false
+	f.data = nil
+}
+
+var (
+	_ iceio.IO   = (*conflictManifestIO)(nil)
+	_ iceio.File = (*conflictManifestFile)(nil)
+	_ iceio.File = (*conflictManifestRecordingFile)(nil)
+)
+
+type conflictManifestFileInfo struct {
+	name string
+	size int64
+}
+
+func (f conflictManifestFileInfo) Name() string       { return f.name }
+func (f conflictManifestFileInfo) Size() int64        { return f.size }
+func (f conflictManifestFileInfo) Mode() fs.FileMode  { return 0 }
+func (f conflictManifestFileInfo) ModTime() time.Time { return time.Time{} }
+func (f conflictManifestFileInfo) IsDir() bool        { return false }
+func (f conflictManifestFileInfo) Sys() any           { return nil }
+
+func (c *conflictContext) manifestReadIO() *conflictManifestIO {
+	if c.manifestIO == nil {
+		c.manifestIO = newConflictManifestIO(c.fs)
+	}
+
+	return c.manifestIO
+}
+
+func (c *conflictContext) manifestsFor(snap Snapshot) ([]iceberg.ManifestFile, error) {
+	if c.manifestLists == nil {
+		c.manifestLists = make(map[int64]conflictManifestList)
+	}
+	if cached, ok := c.manifestLists[snap.SnapshotID]; ok {
+		return cached.manifests, cached.err
+	}
+
+	manifests, err := snap.Manifests(c.fs)
+	c.manifestLists[snap.SnapshotID] = conflictManifestList{manifests: manifests, err: err}
+
+	return manifests, err
 }
 
 // newConflictContext builds a validation context for the given
@@ -192,8 +414,9 @@ type conflictContext struct {
 // partition-spec projection resolves the same column identifiers.
 //
 // When base and current point at the same snapshot on the branch, the
-// returned context has no concurrent snapshots and validators
-// short-circuit to nil. When the base snapshot is no longer on the
+// returned context has no concurrent snapshots and validators that
+// inspect them short-circuit to nil; validateDataFilesExist still reads
+// the branch head. When the base snapshot is no longer on the
 // branch (divergent commit, expired base), newConflictContext returns
 // ErrCommitDiverged; the commit cannot be safely revalidated without
 // a refresh-and-rebuild.
@@ -259,20 +482,30 @@ func newConflictContext(base, current Metadata, branch string, fs iceio.IO, case
 // The visitor returns early if the callback returns a non-nil error.
 func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, visit func(Snapshot, iceberg.ManifestEntry) error) error {
 	for _, snap := range c.concurrent {
-		for entry, err := range snap.entries(c.fs, content) {
-			if err != nil {
-				return fmt.Errorf("loading entries for concurrent snapshot %d: %w", snap.SnapshotID, err)
-			}
-			if entry.Status() != iceberg.EntryStatusADDED {
+		manifests, err := c.manifestsFor(snap)
+		if err != nil {
+			return fmt.Errorf("loading entries for concurrent snapshot %d: %w", snap.SnapshotID, err)
+		}
+		for _, mf := range manifests {
+			if content >= 0 && mf.ManifestContent() != content {
 				continue
 			}
-			if entry.SnapshotID() != snap.SnapshotID {
-				// Entry was inherited from a prior snapshot and is
-				// not attributable to this concurrent commit.
-				continue
-			}
-			if err := visit(snap, entry); err != nil {
-				return err
+
+			for entry, err := range mf.Entries(c.manifestReadIO(), false) {
+				if err != nil {
+					return fmt.Errorf("loading entries for concurrent snapshot %d: %w", snap.SnapshotID, err)
+				}
+				if entry.Status() != iceberg.EntryStatusADDED {
+					continue
+				}
+				if entry.SnapshotID() != snap.SnapshotID {
+					// Entry was inherited from a prior snapshot and is
+					// not attributable to this concurrent commit.
+					continue
+				}
+				if err := visit(snap, entry); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -282,6 +515,8 @@ func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, vis
 
 // validateDataFilesExist verifies that every file path in
 // referencedPaths is still a live data file on the current branch head.
+// Files the transaction stages are not on the head yet, so callers pass
+// only the paths Transaction.headDataFiles returns when the delete is staged.
 // This is the check a position-delete commit performs to prove the
 // files it references have not been removed by a concurrent commit
 // (at which point the pos-delete would apply to rewritten data and
@@ -317,22 +552,29 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 		return fmt.Errorf("%w: branch %q missing on current metadata", ErrCommitDiverged, ctx.branch)
 	}
 
-	for entry, err := range head.entries(ctx.fs, iceberg.ManifestContentData) {
-		if err != nil {
-			return fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
-		}
-		// A DELETED entry means the file was removed (e.g. rewritten by a
-		// concurrent compaction); it is no longer live data a pos-delete can
-		// apply to, so it does not satisfy existence.
-		if entry.Status() == iceberg.EntryStatusDELETED {
+	manifests, err := ctx.manifestsFor(*head)
+	if err != nil {
+		return fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
+	}
+	for _, mf := range manifests {
+		if mf.ManifestContent() != iceberg.ManifestContentData {
 			continue
 		}
-		path := entry.DataFile().FilePath()
-		if _, ok := needed[path]; ok {
-			delete(needed, path)
-			if len(needed) == 0 {
-				return nil
+		for entry, err := range mf.Entries(ctx.manifestReadIO(), false) {
+			if err != nil {
+				return fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
 			}
+			// A DELETED entry means the file was removed (e.g. rewritten by a
+			// concurrent compaction); it is no longer live data a pos-delete can
+			// apply to, so it does not satisfy existence.
+			if entry.Status() == iceberg.EntryStatusDELETED {
+				continue
+			}
+			path := entry.DataFile().FilePath()
+			delete(needed, path)
+		}
+		if len(needed) == 0 {
+			return nil
 		}
 	}
 
@@ -344,13 +586,127 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 	for p := range needed {
 		missing = append(missing, p)
 	}
+
+	return dataFilesMissingError(missing, "missing")
+}
+
+// headDataFiles returns the paths in referenced that a delete staged next must still
+// find live on the branch head when the transaction commits (validateDataFilesExist).
+// It replays, oldest first, the data files added and removed by the staged snapshots
+// the delete is layered on (its parent and the parent's staged ancestors, a chain a
+// rollback can shorten), then sorts each referenced file into one case:
+//   - added by those snapshots or in added (the delete's own data files), and not
+//     removed since: left out, as no concurrent commit can remove an uncommitted file;
+//   - removed by those snapshots: rejected with ErrDataFilesMissing, as it would be
+//     across separate commits;
+//   - anything else: returned for the head check, which also rejects a file that only
+//     a later snapshot adds, since the delete would carry the lower sequence number.
+//
+// A retry sees the same changes: it reuses the staged snapshots' added manifests and
+// fails if a file one of them removes is gone from the fresh parent (checkRemovedFiles).
+func (t *Transaction) headDataFiles(fs iceio.IO, referenced []string, added []iceberg.DataFile) ([]string, error) {
+	if len(referenced) == 0 {
+		return nil, nil
+	}
+	meta, err := t.txnMeta()
+	if err != nil {
+		return nil, err
+	}
+
+	staged := make(map[int64]*addSnapshotUpdate)
+	for _, u := range meta.updates {
+		if su, ok := u.(*addSnapshotUpdate); ok {
+			staged[su.Snapshot.SnapshotID] = su
+		}
+	}
+	// A parent is always added before its child, so the walk ends at the first
+	// snapshot this transaction did not stage.
+	var chain []*addSnapshotUpdate
+	if parent := t.planningSnapshot(meta); parent != nil {
+		for su, ok := staged[parent.SnapshotID]; ok; {
+			chain = append(chain, su)
+			if su.Snapshot.ParentSnapshotID == nil {
+				break
+			}
+			su, ok = staged[*su.Snapshot.ParentSnapshotID]
+		}
+	}
+	slices.Reverse(chain)
+
+	live := make(map[string]struct{}, len(added))
+	removed := make(map[string]struct{})
+	for _, su := range chain {
+		id := su.Snapshot.SnapshotID
+		manifests, err := su.Snapshot.Manifests(fs)
+		if err != nil {
+			return nil, fmt.Errorf("iterating data files removed by staged snapshot %d: %w", id, err)
+		}
+		for _, mf := range manifests {
+			// Only data manifests this snapshot wrote can hold its tombstones; inherited
+			// ones restate the head (re-read at commit) and the snapshots replayed before it.
+			if mf.ManifestContent() != iceberg.ManifestContentData || mf.SnapshotID() != id || mf.DeletedDataFiles() == 0 {
+				continue
+			}
+			for entry, err := range mf.Entries(fs, false) {
+				if err != nil {
+					return nil, fmt.Errorf("iterating data files removed by staged snapshot %d: %w", id, err)
+				}
+				if entry.Status() == iceberg.EntryStatusDELETED && entry.SnapshotID() == id {
+					path := entry.DataFile().FilePath()
+					delete(live, path)
+					removed[path] = struct{}{}
+				}
+			}
+		}
+
+		for _, mf := range su.ownManifests {
+			if mf.ManifestContent() != iceberg.ManifestContentData {
+				continue
+			}
+			for entry, err := range mf.Entries(fs, true) {
+				if err != nil {
+					return nil, fmt.Errorf("iterating data files added by staged snapshot %d: %w", id, err)
+				}
+				path := entry.DataFile().FilePath()
+				live[path] = struct{}{}
+			}
+		}
+	}
+	for _, df := range added {
+		live[df.FilePath()] = struct{}{}
+	}
+
+	head := make([]string, 0, len(referenced))
+	var missing []string
+	for _, path := range referenced {
+		// Not committed yet, so no concurrent commit can remove it.
+		if _, ok := live[path]; ok {
+			continue
+		}
+		if _, ok := removed[path]; ok {
+			missing = append(missing, path)
+
+			continue
+		}
+		head = append(head, path)
+	}
+	if len(missing) > 0 {
+		return nil, dataFilesMissingError(missing, "removed earlier in this transaction")
+	}
+
+	return head, nil
+}
+
+// dataFilesMissingError reports the referenced data files a delete cannot apply to,
+// naming the first few in path order; state says what became of them.
+func dataFilesMissingError(missing []string, state string) error {
 	sort.Strings(missing)
 	sample := missing
 	if len(sample) > 5 {
 		sample = sample[:5]
 	}
 
-	return fmt.Errorf("%w: %d files missing, e.g. %v", ErrDataFilesMissing, len(missing), sample)
+	return fmt.Errorf("%w: %d files %s, e.g. %v", ErrDataFilesMissing, len(missing), state, sample)
 }
 
 // validateAddedDataFilesMatchingFilter returns an error if any
@@ -403,7 +759,7 @@ func validateAddedDataFilesMatchingFilter(ctx *conflictContext, filter iceberg.B
 	}
 
 	for _, snap := range ctx.concurrent {
-		manifests, err := snap.Manifests(ctx.fs)
+		manifests, err := ctx.manifestsFor(snap)
 		if err != nil {
 			return fmt.Errorf("loading manifests for concurrent snapshot %d: %w", snap.SnapshotID, err)
 		}
@@ -428,7 +784,7 @@ func validateAddedDataFilesMatchingFilter(ctx *conflictContext, filter iceberg.B
 			if err != nil {
 				return fmt.Errorf("failed to build partition evaluator for spec %d: %w", mf.PartitionSpecID(), err)
 			}
-			for e, err := range mf.Entries(ctx.fs, false) {
+			for e, err := range mf.Entries(ctx.manifestReadIO(), false) {
 				if err != nil {
 					return fmt.Errorf("reading entries from manifest %s: %w", mf.FilePath(), err)
 				}
@@ -619,12 +975,12 @@ func eqDeletePartitionsToFilter(files []iceberg.DataFile, meta Metadata) (iceber
 				if currentSchema == nil {
 					currentSchema = meta.CurrentSchema()
 				}
-				field, found := currentSchema.FindFieldByID(pf.SourceID())
+				field, found := currentSchema.FindFieldByID(pf.FirstSourceID())
 				sourceField = equalityDeleteSourceFieldInfo{name: field.Name, found: found}
 				specInfo.sourceFields[partFieldID] = sourceField
 			}
 			if !sourceField.found {
-				return nil, fmt.Errorf("source field ID %d (partition field %q) not found in schema", pf.SourceID(), pf.Name)
+				return nil, fmt.Errorf("source field ID %d (partition field %q) not found in schema", pf.FirstSourceID(), pf.Name)
 			}
 
 			value := p[partFieldID]

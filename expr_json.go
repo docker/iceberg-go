@@ -282,13 +282,19 @@ func marshalSetPredicate(op Operation, term Term, lits []Literal) ([]byte, error
 
 func (r Reference) MarshalJSON() ([]byte, error) { return json.Marshal(string(r)) }
 
-func (b *boundRef[T]) MarshalJSON() ([]byte, error) { return json.Marshal(b.field.Name) }
+func (b *boundRef[T]) MarshalJSON() ([]byte, error) { return json.Marshal(b.fullName) }
 
 func (b *BoundTransform) MarshalJSON() ([]byte, error) {
+	ref := b.term.Ref()
+	name := ref.Field().Name
+	if named, ok := ref.(interface{ referenceName() string }); ok {
+		name = named.referenceName()
+	}
+
 	return json.Marshal(transformNode{
 		Type:      exprKeyTransform,
 		Transform: b.transform.String(),
-		Term:      b.term.Ref().Field().Name,
+		Term:      name,
 	})
 }
 
@@ -544,7 +550,7 @@ func decodePredicate(op Operation, node exprNode, schema *Schema, caseSensitive 
 		if node.Values != nil {
 			return nil, fmt.Errorf("%w: predicate %s must not have values", ErrInvalidArgument, node.Type)
 		}
-		lit, err := decodeValue(node.Value, typ)
+		lit, err := decodePredicateValue(node.Value, typ)
 		if err != nil {
 			return nil, err
 		}
@@ -559,7 +565,7 @@ func decodePredicate(op Operation, node exprNode, schema *Schema, caseSensitive 
 		}
 		lits := make([]Literal, 0, len(node.Values))
 		for _, v := range node.Values {
-			lit, err := decodeValue(v, typ)
+			lit, err := decodePredicateValue(v, typ)
 			if err != nil {
 				return nil, err
 			}
@@ -613,7 +619,33 @@ func decodeTerm(raw json.RawMessage) (UnboundTerm, error) {
 	}
 }
 
-// decodeValue parses one literal value and converts it to typ.
+// decodePredicateValue parses one predicate value and converts it to typ. The
+// value is either bare or wrapped as {"type":"literal","value":...}. As in Java,
+// the wrapper's optional data-type is ignored: the field type decides. Only the
+// expression grammar has the wrapper form; field defaults use decodeValue.
+func decodePredicateValue(raw json.RawMessage, typ Type) (Literal, error) {
+	if tok, err := firstToken(raw); err == nil && tok == json.Delim('{') {
+		var wrapper struct {
+			Type  string          `json:"type"`
+			Value json.RawMessage `json:"value"`
+		}
+		if err := json.Unmarshal(raw, &wrapper); err != nil {
+			return nil, fmt.Errorf("%w: cannot parse literal: %s", ErrInvalidArgument, err)
+		}
+		if wrapper.Type != "literal" {
+			return nil, fmt.Errorf("%w: cannot parse type %q as a literal", ErrInvalidArgument, wrapper.Type)
+		}
+		if len(wrapper.Value) == 0 {
+			return nil, fmt.Errorf("%w: literal is missing a value", ErrInvalidArgument)
+		}
+		// A null or nested object value is rejected by decodeValue.
+		raw = wrapper.Value
+	}
+
+	return decodeValue(raw, typ)
+}
+
+// decodeValue parses one bare single-value JSON literal and converts it to typ.
 func decodeValue(raw json.RawMessage, typ Type) (Literal, error) {
 	v := literalValue{typ: typ}
 	if err := json.Unmarshal(raw, &v); err != nil {

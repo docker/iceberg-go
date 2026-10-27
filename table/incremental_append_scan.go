@@ -47,8 +47,9 @@ type IncrementalAppendScan struct {
 // sensitivity, concurrency, planning mode, and reporting. Projection and row
 // limits are not applied to the returned file tasks; callers can read planned
 // tasks with a separately configured [Scan.ReadTasks]. Auto planning falls back
-// to local planning. Remote planning returns ErrInvalidOperation until
-// incremental remote planning is implemented.
+// to local planning. Remote planning, including a catalog `server`
+// scan-planning-mode directive, returns ErrInvalidOperation until incremental
+// remote planning is implemented.
 func (t Table) NewIncrementalAppendScan(opts ...ScanOption) *IncrementalAppendScan {
 	return &IncrementalAppendScan{scan: t.Scan(opts...)}
 }
@@ -86,12 +87,8 @@ func (s *IncrementalAppendScan) ToSnapshot(snapshotID int64) *IncrementalAppendS
 // through the configured reporter on successful planning. Delete files are not
 // applied because appended files are not present before the append snapshot.
 func (s *IncrementalAppendScan) PlanFiles(ctx context.Context) ([]FileScanTask, error) {
-	switch s.scan.planningMode {
-	case ScanPlanningLocal, ScanPlanningAuto:
-	case ScanPlanningRemote:
-		return nil, fmt.Errorf("%w: incremental append scans do not support remote planning", ErrInvalidOperation)
-	default:
-		return nil, fmt.Errorf("%w: unknown scan planning mode %q", iceberg.ErrInvalidArgument, s.scan.planningMode)
+	if err := s.scan.checkLocalOnlyPlanning("incremental append"); err != nil {
+		return nil, err
 	}
 	start := time.Now()
 
@@ -123,7 +120,7 @@ func (s *IncrementalAppendScan) PlanFiles(ctx context.Context) ([]FileScanTask, 
 	if err != nil {
 		return nil, err
 	}
-	residual, err := bindTaskFilter(schema, planningScan.rowFilter, planningScan.caseSensitive)
+	residual, _, err := bindTaskFilter(schema, planningScan.rowFilter, planningScan.caseSensitive)
 	if err != nil {
 		return nil, fmt.Errorf("bind incremental scan residual: %w", err)
 	}
@@ -159,27 +156,21 @@ func (s *IncrementalAppendScan) PlanFiles(ctx context.Context) ([]FileScanTask, 
 	if s.scan.ioF == nil {
 		return nil, fmt.Errorf("%w: table file IO is not configured", ErrInvalidOperation)
 	}
-	fs, err := s.scan.ioF(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	// An inherited manifest can occur in every later snapshot's manifest list.
 	// Read each manifest path once, just as the Java incremental append scan
 	// collects the selected manifests into a set before opening them.
 	manifestsByPath := make(map[string]iceberg.ManifestFile)
+	manifestFS := sharedSnapshotManifestFSF(s.scan.ioF)
 	for _, snapshot := range snapshots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		manifests, err := snapshot.Manifests(fs)
+		manifestSet, err := planningScan.manifestSetWithFSF(ctx, snapshot, manifestFS)
 		if err != nil {
 			return nil, err
 		}
-		for _, manifest := range manifests {
-			if manifest.ManifestContent() != iceberg.ManifestContentData {
-				continue
-			}
+		for _, manifest := range manifestSet.borrowDataManifests() {
 			if _, ok := appendSnapshots[manifest.SnapshotID()]; !ok {
 				continue
 			}
@@ -197,14 +188,20 @@ func (s *IncrementalAppendScan) PlanFiles(ctx context.Context) ([]FileScanTask, 
 		manifestList = append(manifestList, manifestsByPath[path])
 	}
 
-	manifestList, err = planningScan.filterManifestsWithSchema(manifestList, schema, &acc)
+	// Use one projection cache for manifest-summary and data-file pruning.
+	partitionFilters := planningScan.partitionFiltersForSchema(schema)
+	manifestList, err = planningScan.filterManifestsWithSchema(manifestList, schema, &acc, partitionFilters)
 	if err != nil {
 		return nil, err
 	}
 	if len(manifestList) == 0 {
 		return finish(nil)
 	}
-	entries, err := planningScan.collectManifestEntriesWithSchema(ctx, manifestList, schema)
+	// The IO above is scoped to reading manifest lists. Manifest workers reuse
+	// one factory result per concurrent batch, then reacquire through the factory
+	// so long-running incremental plans can renew vended credentials between
+	// batches.
+	entries, err := planningScan.collectManifestEntriesWithSchema(ctx, manifestList, schema, partitionFilters)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +218,7 @@ func (s *IncrementalAppendScan) PlanFiles(ctx context.Context) ([]FileScanTask, 
 		task := FileScanTask{File: file, Start: 0, Length: file.FileSizeBytes()}
 		task.Residual = residual
 		task.FirstRowID = file.FirstRowID()
-		if sequenceNumber := entry.SequenceNum(); sequenceNumber >= 0 {
+		if sequenceNumber := entry.DataSequenceNumber(); sequenceNumber >= 0 {
 			task.DataSequenceNumber = &sequenceNumber
 		}
 		tasks = append(tasks, task)
@@ -247,48 +244,13 @@ func (s *IncrementalAppendScan) toSnapshot() (*Snapshot, error) {
 }
 
 func (s *IncrementalAppendScan) snapshotsBetween(toSnapshotID int64) ([]Snapshot, error) {
-	ancestors := AncestorsOf(toSnapshotID, s.scan.metadata.SnapshotByID)
-	if len(ancestors) == 0 {
-		return nil, fmt.Errorf("%w: ending snapshot not found: %d", iceberg.ErrInvalidArgument, toSnapshotID)
+	snapshots, err := incrementalSnapshotsBetween(
+		s.scan.metadata, s.fromSnapshotID, s.fromInclusive, toSnapshotID)
+	if err != nil {
+		return nil, err
 	}
 
-	if s.fromSnapshotID == nil {
-		slices.Reverse(ancestors)
-
-		return appendOnlySnapshots(ancestors)
-	}
-
-	fromID := *s.fromSnapshotID
-	if !s.fromInclusive {
-		if fromID == toSnapshotID {
-			return nil, fmt.Errorf("%w: starting snapshot %d must be a parent ancestor of ending snapshot %d for an exclusive scan",
-				iceberg.ErrInvalidArgument, fromID, toSnapshotID)
-		}
-		between, found := AncestorsBetween(toSnapshotID, fromID, s.scan.metadata.SnapshotByID)
-		if !found {
-			return nil, fmt.Errorf("%w: starting snapshot %d is not an ancestor of ending snapshot %d", iceberg.ErrInvalidArgument, fromID, toSnapshotID)
-		}
-		slices.Reverse(between)
-
-		return appendOnlySnapshots(between)
-	}
-
-	if s.scan.metadata.SnapshotByID(fromID) == nil {
-		return nil, fmt.Errorf("%w: starting snapshot not found: %d", iceberg.ErrInvalidArgument, fromID)
-	}
-	if !IsAncestorOf(toSnapshotID, fromID, s.scan.metadata.SnapshotByID) {
-		return nil, fmt.Errorf("%w: starting snapshot %d is not an ancestor of ending snapshot %d", iceberg.ErrInvalidArgument, fromID, toSnapshotID)
-	}
-	selected := make([]Snapshot, 0, len(ancestors))
-	for _, snapshot := range ancestors {
-		selected = append(selected, snapshot)
-		if snapshot.SnapshotID == fromID {
-			break
-		}
-	}
-	slices.Reverse(selected)
-
-	return appendOnlySnapshots(selected)
+	return appendOnlySnapshots(snapshots)
 }
 
 func appendOnlySnapshots(snapshots []Snapshot) ([]Snapshot, error) {

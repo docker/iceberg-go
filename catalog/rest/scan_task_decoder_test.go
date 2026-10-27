@@ -27,6 +27,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/avro/atype"
 )
 
 func TestDecodeScanTasksFullPayload(t *testing.T) {
@@ -114,8 +115,8 @@ func TestDecodeScanTasksFullPayload(t *testing.T) {
 	}, task.File.Partition())
 	assert.Equal(t, []byte{0x0a, 0x0b}, task.File.KeyMetadata())
 	assert.Equal(t, []int64{4, 128}, task.File.SplitOffsets())
-	assert.Equal(t, intPtr(3), task.File.SortOrderID())
-	assert.Equal(t, int64Ptr(99), task.FirstRowID)
+	assert.Equal(t, new(3), task.File.SortOrderID())
+	assert.Equal(t, new(int64(99)), task.FirstRowID)
 	assert.Equal(t, map[int]int64{1: 800, 2: 1200}, task.File.ColumnSizes())
 	assert.Equal(t, map[int]int64{1: 100, 2: 100}, task.File.ValueCounts())
 	assert.Equal(t, map[int]int64{1: 0, 2: 1}, task.File.NullValueCounts())
@@ -137,9 +138,9 @@ func TestDecodeScanTasksFullPayload(t *testing.T) {
 	require.Len(t, task.DeletionVectorFiles, 1)
 	dv := task.DeletionVectorFiles[0]
 	assert.Equal(t, iceberg.PuffinFile, dv.FileFormat())
-	assert.Equal(t, stringPtr("s3://bucket/table/data.parquet"), dv.ReferencedDataFile())
-	assert.Equal(t, int64Ptr(25), dv.ContentOffset())
-	assert.Equal(t, int64Ptr(50), dv.ContentSizeInBytes())
+	assert.Equal(t, new("s3://bucket/table/data.parquet"), dv.ReferencedDataFile())
+	assert.Equal(t, new(int64(25)), dv.ContentOffset())
+	assert.Equal(t, new(int64(50)), dv.ContentSizeInBytes())
 }
 
 func TestDecodeScanTasksAcceptsLegacyJavaContentValues(t *testing.T) {
@@ -236,6 +237,62 @@ func TestDecodeScanTasksKeepsDeleteReferencesEnvelopeLocal(t *testing.T) {
 	assert.Equal(t, "s3://bucket/table/second-delete.parquet", secondTasks[0].DeleteFiles[0].FilePath())
 }
 
+func TestDecodeScanTasksAllowsDeleteReferenceAcrossTasks(t *testing.T) {
+	t.Parallel()
+
+	metadata := newScanTaskDecoderMetadata()
+	wire := validScanTasksWire()
+	secondDataFile := *wire.FileScanTasks[0].DataFile
+	secondDataFile.FilePath = "s3://bucket/table/second-data.parquet"
+	wire.FileScanTasks = append(wire.FileScanTasks, RESTFileScanTask{
+		DataFile:             &secondDataFile,
+		DeleteFileReferences: []int{0},
+	})
+
+	tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	require.Len(t, tasks[0].DeleteFiles, 1)
+	require.Len(t, tasks[1].DeleteFiles, 1)
+	assert.Equal(t, "s3://bucket/table/delete.parquet", tasks[0].DeleteFiles[0].FilePath())
+	assert.Equal(t, "s3://bucket/table/delete.parquet", tasks[1].DeleteFiles[0].FilePath())
+}
+
+func TestDecodeScanTasksReusesPartitionDecodePlan(t *testing.T) {
+	t.Parallel()
+
+	baseMetadata := newScanTaskDecoderMetadata()
+	metadata := &countingScanTaskDecoderMetadata{scanTaskDecoderMetadata: baseMetadata}
+	wire := validScanTasksWire()
+	secondDataFile := *wire.FileScanTasks[0].DataFile
+	secondDataFile.FilePath = "s3://bucket/table/second-data.parquet"
+	wire.FileScanTasks = append(wire.FileScanTasks, RESTFileScanTask{DataFile: &secondDataFile})
+
+	tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2)
+	assert.Equal(t, 1, metadata.specLookups)
+}
+
+func TestRemoteScanTasksReusesPartitionDecodePlanAcrossEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	baseMetadata := newScanTaskDecoderMetadata()
+	metadata := &countingScanTaskDecoderMetadata{scanTaskDecoderMetadata: baseMetadata}
+	first := validScanTasksWire()
+	second := validScanTasksWire()
+	second.FileScanTasks[0].DataFile.FilePath = "s3://bucket/table/second-data.parquet"
+	second.DeleteFiles[0].FilePath = "s3://bucket/table/second-delete.parquet"
+
+	tasks, err := remoteScanTasks([]ScanTasks{first, second}, table.ScanPlanningRequest{
+		Metadata: metadata,
+		Schema:   metadata.schema,
+	})
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2)
+	assert.Equal(t, 1, metadata.specLookups)
+}
+
 func TestDecodeScanTasksDerivesDeletionVectorTargetWhenOmitted(t *testing.T) {
 	t.Parallel()
 
@@ -243,14 +300,37 @@ func TestDecodeScanTasksDerivesDeletionVectorTargetWhenOmitted(t *testing.T) {
 	wire := validScanTasksWire()
 	wire.FileScanTasks[0].DeleteFileReferences = []int{0}
 	wire.DeleteFiles[0].FileFormat = "puffin"
-	wire.DeleteFiles[0].ContentOffset = int64Ptr(10)
-	wire.DeleteFiles[0].ContentSizeInBytes = int64Ptr(20)
+	wire.DeleteFiles[0].ContentOffset = new(int64(10))
+	wire.DeleteFiles[0].ContentSizeInBytes = new(int64(20))
 
 	tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	require.Len(t, tasks[0].DeletionVectorFiles, 1)
-	assert.Equal(t, stringPtr("s3://bucket/table/data.parquet"), tasks[0].DeletionVectorFiles[0].ReferencedDataFile())
+	assert.Equal(t, new("s3://bucket/table/data.parquet"), tasks[0].DeletionVectorFiles[0].ReferencedDataFile())
+}
+
+func TestDecodeScanTasksSharesDerivedDeletionVector(t *testing.T) {
+	t.Parallel()
+
+	metadata := newScanTaskDecoderMetadata()
+	wire := validScanTasksWire()
+	wire.DeleteFiles[0].FileFormat = "PUFFIN"
+	wire.DeleteFiles[0].ContentOffset = new(int64(10))
+	wire.DeleteFiles[0].ContentSizeInBytes = new(int64(20))
+	wire.FileScanTasks[0].DeleteFileReferences = []int{0}
+	// Two file-scan tasks for the same data file share a DV without an
+	// explicit referenced-data-file on the REST wire.
+	wire.FileScanTasks = append(wire.FileScanTasks, wire.FileScanTasks[0])
+
+	tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	require.Len(t, tasks[0].DeletionVectorFiles, 1)
+	require.Len(t, tasks[1].DeletionVectorFiles, 1)
+	assert.Equal(t, new("s3://bucket/table/data.parquet"),
+		tasks[0].DeletionVectorFiles[0].ReferencedDataFile())
+	assert.Same(t, tasks[0].DeletionVectorFiles[0], tasks[1].DeletionVectorFiles[0])
 }
 
 func TestRESTValueMapMatchesJavaContentFileParser(t *testing.T) {
@@ -286,7 +366,7 @@ func TestRESTValueMapUsesIcebergBinaryEncoding(t *testing.T) {
 	decoded, err := decodeValueMap("lower-bounds", &bounds)
 	require.NoError(t, err)
 
-	decimalType := iceberg.DecimalTypeOf(9, 2)
+	decimalType := iceberg.MustDecimalTypeOf(9, 2)
 	tests := []struct {
 		name    string
 		fieldID int
@@ -329,7 +409,7 @@ func TestDecodeScanTasksKeyMetadataMatchesJavaContentFileParser(t *testing.T) {
 	wire := validScanTasksWire()
 	// This value mirrors Java TestContentFileParser's all-optional data-file
 	// fixture. SingleValueParser encodes binary values as hexadecimal strings.
-	wire.FileScanTasks[0].DataFile.KeyMetadata = stringPtr("00000000000000000000000000000000")
+	wire.FileScanTasks[0].DataFile.KeyMetadata = new("00000000000000000000000000000000")
 
 	tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
 	require.NoError(t, err)
@@ -438,8 +518,8 @@ func TestDecodeScanTasksRejectsMalformedPayloads(t *testing.T) {
 			mutate: func(w *ScanTasks) {
 				w.DeleteFiles[0].Content = "equality-deletes"
 				w.DeleteFiles[0].EqualityIDs = []int{1}
-				w.DeleteFiles[0].ContentOffset = int64Ptr(10)
-				w.DeleteFiles[0].ContentSizeInBytes = int64Ptr(20)
+				w.DeleteFiles[0].ContentOffset = new(int64(10))
+				w.DeleteFiles[0].ContentSizeInBytes = new(int64(20))
 			},
 			want: "must not carry position-delete reference or blob offsets",
 		},
@@ -474,7 +554,7 @@ func TestDecodeScanTasksRejectsMalformedPayloads(t *testing.T) {
 		{
 			name: "referenced data file disagrees with task",
 			mutate: func(w *ScanTasks) {
-				w.DeleteFiles[0].ReferencedDataFile = stringPtr("s3://bucket/table/other.parquet")
+				w.DeleteFiles[0].ReferencedDataFile = new("s3://bucket/table/other.parquet")
 				w.FileScanTasks[0].DeleteFileReferences = []int{0}
 			},
 			want: "task data-file",
@@ -483,8 +563,8 @@ func TestDecodeScanTasksRejectsMalformedPayloads(t *testing.T) {
 			name: "deletion vector referenced by different data files",
 			mutate: func(w *ScanTasks) {
 				w.DeleteFiles[0].FileFormat = "puffin"
-				w.DeleteFiles[0].ContentOffset = int64Ptr(10)
-				w.DeleteFiles[0].ContentSizeInBytes = int64Ptr(20)
+				w.DeleteFiles[0].ContentOffset = new(int64(10))
+				w.DeleteFiles[0].ContentSizeInBytes = new(int64(20))
 				w.FileScanTasks[0].DeleteFileReferences = []int{0}
 				secondDataFile := *w.FileScanTasks[0].DataFile
 				secondDataFile.FilePath = "s3://bucket/table/other.parquet"
@@ -525,8 +605,8 @@ func TestDecodeScanTasksRejectsDeleteFilesWithoutTasks(t *testing.T) {
 func TestDecodePartitionLiteralCoversPrimitiveWireTypes(t *testing.T) {
 	t.Parallel()
 
-	decimalType := iceberg.DecimalTypeOf(9, 2)
-	fixedType := iceberg.FixedTypeOf(4)
+	decimalType := iceberg.MustDecimalTypeOf(9, 2)
+	fixedType := iceberg.MustFixedTypeOf(4)
 	tests := []struct {
 		name        string
 		raw         string
@@ -582,7 +662,7 @@ func TestDecodePartitionLiteralRejectsInvalidValues(t *testing.T) {
 		{"null", `null`, iceberg.PrimitiveTypes.Int64, "null is not valid"},
 		{"int32 overflow", `2147483648`, iceberg.PrimitiveTypes.Int32, "outside int32 range"},
 		{"long fraction", `1.5`, iceberg.PrimitiveTypes.Int64, "invalid integer value"},
-		{"wrong fixed width", `"00FF"`, iceberg.FixedTypeOf(4), "different length"},
+		{"wrong fixed width", `"00FF"`, iceberg.MustFixedTypeOf(4), "different length"},
 		{"invalid binary hex", `"XYZ"`, iceberg.PrimitiveTypes.Binary, "hexadecimal"},
 		{"nested value", `{"x":1}`, iceberg.PrimitiveTypes.String, "invalid string value"},
 	} {
@@ -591,6 +671,93 @@ func TestDecodePartitionLiteralRejectsInvalidValues(t *testing.T) {
 
 			_, err := decodePartitionLiteral(json.RawMessage(tt.raw), tt.typ)
 			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+func TestDecodeJSONInteger(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		raw     string
+		bitSize int
+		want    int64
+		wantErr string
+	}{
+		{name: "int64 max", raw: `9223372036854775807`, bitSize: 64, want: math.MaxInt64},
+		{name: "int64 min with whitespace", raw: ` -9223372036854775808 `, bitSize: 64, want: math.MinInt64},
+		{name: "int32 max", raw: `2147483647`, bitSize: 32, want: math.MaxInt32},
+		{name: "int32 min", raw: `-2147483648`, bitSize: 32, want: math.MinInt32},
+		{name: "above float precision", raw: `9007199254740993`, bitSize: 64, want: 9007199254740993},
+		{name: "quoted integer", raw: `"34"`, bitSize: 32, want: 34},
+		{name: "escaped integer", raw: `"\u0033\u0034"`, bitSize: 64, want: 34},
+		{name: "quoted overflow", raw: `"9223372036854775808"`, bitSize: 64, wantErr: "invalid integer value"},
+		{name: "invalid quoted number", raw: `"not-a-number"`, bitSize: 64, wantErr: "invalid integer value"},
+		{name: "non JSON whitespace", raw: "\u00a01\u00a0", bitSize: 64, wantErr: "invalid JSON number"},
+		{name: "fraction", raw: `1.5`, bitSize: 64, wantErr: "invalid integer value"},
+		{name: "exponent", raw: `1e2`, bitSize: 64, wantErr: "invalid integer value"},
+		{name: "int64 overflow", raw: `9223372036854775808`, bitSize: 64, wantErr: "invalid integer value"},
+		{name: "int32 overflow", raw: `2147483648`, bitSize: 32, wantErr: "outside int32 range"},
+		{name: "leading plus", raw: `+1`, bitSize: 64, wantErr: "invalid JSON number"},
+		{name: "leading zero", raw: `01`, bitSize: 64, wantErr: "invalid JSON number"},
+		{name: "trailing value", raw: `1 2`, bitSize: 64, wantErr: "invalid JSON number"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := decodeJSONInteger(json.RawMessage(tt.raw), tt.bitSize)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestDecodeJSONFloat(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name        string
+		raw         string
+		bitSize     int
+		want        float64
+		wantSignbit bool
+		wantErr     string
+	}{
+		{name: "exponent with whitespace", raw: ` -1.25e2 `, bitSize: 64, want: -125},
+		{name: "negative zero", raw: `-0`, bitSize: 64, wantSignbit: true},
+		{name: "float32 range", raw: `3.4028234e38`, bitSize: 32, want: 3.4028234e38},
+		{name: "float32 overflow", raw: `3.5e38`, bitSize: 32, wantErr: "outside float32 range"},
+		{name: "quoted float", raw: `"1.25"`, bitSize: 64, want: 1.25},
+		{name: "escaped float", raw: `"\u0031.25"`, bitSize: 32, want: 1.25},
+		{name: "quoted exponent", raw: `"-1.25e2"`, bitSize: 64, want: -125},
+		{name: "quoted negative zero", raw: `"-0"`, bitSize: 64, wantSignbit: true},
+		{name: "quoted overflow", raw: `"1e999"`, bitSize: 64, wantErr: "invalid floating-point value"},
+		{name: "invalid quoted number", raw: `"NaN"`, bitSize: 64, wantErr: "invalid floating-point value"},
+		{name: "non JSON whitespace", raw: "\u00a01.25\u00a0", bitSize: 64, wantErr: "invalid JSON number"},
+		{name: "overflow", raw: `1e999`, bitSize: 64, wantErr: "invalid floating-point value"},
+		{name: "leading plus", raw: `+1.5`, bitSize: 64, wantErr: "invalid JSON number"},
+		{name: "trailing value", raw: `1.5 2`, bitSize: 64, wantErr: "invalid JSON number"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := decodeJSONFloat(json.RawMessage(tt.raw), tt.bitSize)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+			if tt.wantSignbit {
+				assert.True(t, math.Signbit(got))
+			}
 		})
 	}
 }
@@ -623,13 +790,24 @@ type scanTaskDecoderMetadata struct {
 	spec   iceberg.PartitionSpec
 }
 
+type countingScanTaskDecoderMetadata struct {
+	*scanTaskDecoderMetadata
+	specLookups int
+}
+
+func (m *countingScanTaskDecoderMetadata) PartitionSpecByID(id int) *iceberg.PartitionSpec {
+	m.specLookups++
+
+	return m.scanTaskDecoderMetadata.PartitionSpecByID(id)
+}
+
 func newScanTaskDecoderMetadata() *scanTaskDecoderMetadata {
 	schema := iceberg.NewSchema(10,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String},
 		iceberg.NestedField{ID: 3, Name: "event_date", Type: iceberg.PrimitiveTypes.Date},
-		iceberg.NestedField{ID: 4, Name: "amount", Type: iceberg.DecimalTypeOf(9, 2)},
-		iceberg.NestedField{ID: 5, Name: "code", Type: iceberg.FixedTypeOf(4)},
+		iceberg.NestedField{ID: 4, Name: "amount", Type: iceberg.MustDecimalTypeOf(9, 2)},
+		iceberg.NestedField{ID: 5, Name: "code", Type: iceberg.MustFixedTypeOf(4)},
 		iceberg.NestedField{ID: 6, Name: "event_time", Type: iceberg.PrimitiveTypes.TimestampTzNs},
 		iceberg.NestedField{ID: 7, Name: "score", Type: iceberg.PrimitiveTypes.Float64},
 		iceberg.NestedField{ID: 8, Name: "lower_int", Type: iceberg.PrimitiveTypes.Int32},
@@ -646,6 +824,7 @@ func newScanTaskDecoderMetadata() *scanTaskDecoderMetadata {
 
 func (m *scanTaskDecoderMetadata) CurrentSchema() *iceberg.Schema { return m.schema }
 func (m *scanTaskDecoderMetadata) Schemas() []*iceberg.Schema     { return []*iceberg.Schema{m.schema} }
+
 func (m *scanTaskDecoderMetadata) PartitionSpec() iceberg.PartitionSpec {
 	return m.spec
 }
@@ -669,5 +848,160 @@ func mustLiteral(t *testing.T, value string, typ iceberg.Type) iceberg.Literal {
 	return literal
 }
 
-func intPtr(value int) *int       { return &value }
-func int64Ptr(value int64) *int64 { return &value }
+func TestPartitionDecodePlanKeepsValuesIndependent(t *testing.T) {
+	t.Parallel()
+
+	metadata := newScanTaskDecoderMetadata()
+	cache := newPartitionDecodePlanCache()
+	plan, err := cache.planFor(metadata.spec.ID(), metadata)
+	require.NoError(t, err)
+	first, firstLogical, err := decodePartition([]json.RawMessage{
+		json.RawMessage(`34`), json.RawMessage(`"2026-07-17"`), json.RawMessage(`"78797A21"`),
+	}, plan)
+	require.NoError(t, err)
+	second, secondLogical, err := decodePartition([]json.RawMessage{
+		json.RawMessage(`35`), json.RawMessage(`null`), json.RawMessage(`"41424344"`),
+	}, plan)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(34), first[1000])
+	assert.Equal(t, int64(35), second[1000])
+	assert.NotNil(t, first[1001])
+	assert.Nil(t, second[1001])
+	first[1002].([]byte)[0] = 0
+	assert.Equal(t, []byte("ABCD"), second[1002])
+	firstLogical[1001] = "changed"
+	assert.NotContains(t, secondLogical, 1001)
+	assert.Nil(t, secondLogical)
+
+	_, _, err = decodePartition([]json.RawMessage{json.RawMessage(`34`)}, plan)
+	require.ErrorContains(t, err, "has 1 values, want 3")
+	_, _, err = decodePartition([]json.RawMessage{
+		json.RawMessage(`34`), json.RawMessage(`"invalid-date"`), json.RawMessage(`"41424344"`),
+	}, plan)
+	require.ErrorContains(t, err, "date_part")
+}
+
+func TestDecodeScanTasksRejectsNilPartitionTransforms(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name      string
+		transform iceberg.Transform
+	}{
+		{name: "nil"},
+		{name: "nil identity", transform: (*iceberg.IdentityTransform)(nil)},
+		{name: "nil bucket", transform: (*iceberg.BucketTransform)(nil)},
+		{name: "nil unknown", transform: (*iceberg.UnknownTransform)(nil)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, raw := range []string{"null", "34"} {
+				t.Run(raw, func(t *testing.T) {
+					metadata := newScanTaskDecoderMetadata()
+					field := metadata.spec.Field(0)
+					field.Transform = tt.transform
+					metadata.spec = iceberg.NewPartitionSpecID(metadata.spec.ID(), field)
+					wire := validScanTasksWire()
+					wire.DeleteFiles = nil
+					wire.FileScanTasks[0].DeleteFileReferences = nil
+					wire.FileScanTasks[0].DataFile.Partition = []json.RawMessage{json.RawMessage(raw)}
+
+					tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+					require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+					require.ErrorContains(t, err, `partition field "id_part" (ID 1000) has no transform`)
+					assert.Nil(t, tasks)
+				})
+			}
+		})
+	}
+}
+
+func TestDecodeScanTasksAcceptsPointerAndUnknownPartitionTransforms(t *testing.T) {
+	t.Parallel()
+
+	unknown, err := iceberg.ParseTransform("custom-transform")
+	require.NoError(t, err)
+	for _, tt := range []struct {
+		name      string
+		transform iceberg.Transform
+		raw       string
+		want      any
+	}{
+		{name: "identity pointer", transform: &iceberg.IdentityTransform{}, raw: "34", want: int64(34)},
+		{name: "void pointer", transform: &iceberg.VoidTransform{}, raw: "null"},
+		{name: "unknown", transform: unknown, raw: `"opaque"`, want: "opaque"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := newScanTaskDecoderMetadata()
+			field := metadata.spec.Field(0)
+			field.Transform = tt.transform
+			metadata.spec = iceberg.NewPartitionSpecID(metadata.spec.ID(), field)
+			wire := validScanTasksWire()
+			wire.DeleteFiles = nil
+			wire.FileScanTasks[0].DeleteFileReferences = nil
+			wire.FileScanTasks[0].DataFile.Partition = []json.RawMessage{json.RawMessage(tt.raw)}
+
+			tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+			require.NoError(t, err)
+			require.Len(t, tasks, 1)
+			assert.Equal(t, tt.want, tasks[0].File.Partition()[1000])
+		})
+	}
+}
+
+func TestDecodePartitionLogicalMetadata(t *testing.T) {
+	t.Parallel()
+	decimalType := iceberg.MustDecimalTypeOf(9, 2)
+	for _, tt := range []struct {
+		name        string
+		typ         iceberg.Type
+		raw         string
+		want        any
+		logicalType string
+	}{
+		{name: "unpartitioned"},
+		{name: "integer", typ: iceberg.PrimitiveTypes.Int64, raw: `34`, want: int64(34)},
+		{name: "fixed", typ: iceberg.MustFixedTypeOf(4), raw: `"78797A21"`, want: []byte("xyz!")},
+		{name: "null date", typ: iceberg.PrimitiveTypes.Date, raw: `null`},
+		{name: "null decimal", typ: decimalType, raw: `null`},
+		{name: "date", typ: iceberg.PrimitiveTypes.Date, raw: `"2026-07-17"`, want: mustLiteral(t, "2026-07-17", iceberg.PrimitiveTypes.Date).Any(), logicalType: atype.Date},
+		{name: "decimal", typ: decimalType, raw: `"12.34"`, want: mustLiteral(t, "12.34", decimalType).Any(), logicalType: atype.Decimal},
+		{name: "uuid", typ: iceberg.PrimitiveTypes.UUID, raw: `"f79c3e09-677c-4bbd-a479-3f349cb785e7"`, want: mustLiteral(t, "f79c3e09-677c-4bbd-a479-3f349cb785e7", iceberg.PrimitiveTypes.UUID).Any(), logicalType: atype.UUID},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := &scanTaskDecoderMetadata{schema: iceberg.NewSchema(10), spec: *iceberg.UnpartitionedSpec}
+			var values []json.RawMessage
+			want := make(map[int]any)
+			if tt.typ != nil {
+				metadata.schema = iceberg.NewSchema(10, iceberg.NestedField{ID: 1, Name: "value", Type: tt.typ})
+				metadata.spec = iceberg.NewPartitionSpecID(7, iceberg.PartitionField{
+					SourceIDs: []int{1}, FieldID: 1000, Name: "value_part", Transform: iceberg.IdentityTransform{},
+				})
+				values = []json.RawMessage{json.RawMessage(tt.raw)}
+				want[1000] = tt.want
+			}
+			plan, err := newPartitionDecodePlan(&metadata.spec, metadata)
+			require.NoError(t, err)
+			partition, logicalTypes, err := decodePartition(values, plan)
+			require.NoError(t, err)
+			assert.Equal(t, want, partition)
+			if tt.logicalType == "" {
+				assert.Nil(t, logicalTypes)
+			} else {
+				assert.Equal(t, map[int]string{1000: tt.logicalType}, logicalTypes)
+			}
+
+			wire := validScanTasksWire()
+			wire.FileScanTasks[0].DataFile.SpecID = metadata.spec.ID()
+			wire.FileScanTasks[0].DataFile.Partition = values
+			wire.DeleteFiles[0].SpecID = metadata.spec.ID()
+			wire.DeleteFiles[0].Partition = values
+			tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+			require.NoError(t, err)
+			require.Len(t, tasks, 1)
+			assert.Equal(t, want, tasks[0].File.Partition())
+			require.Len(t, tasks[0].DeleteFiles, 1)
+			assert.Equal(t, want, tasks[0].DeleteFiles[0].Partition())
+		})
+	}
+}

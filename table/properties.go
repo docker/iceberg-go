@@ -19,6 +19,7 @@ package table
 
 import (
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/apache/iceberg-go"
@@ -33,6 +34,53 @@ const (
 	WriteObjectStorePartitionedPathsDefault = true
 	ObjectStoreEnabledKey                   = "write.object-storage.enabled"
 	ObjectStoreEnabledDefault               = false
+
+	// ReadSplitTargetSizeKey controls coalescing of safe row-group ranges during
+	// local Parquet scan planning. Remote plans already contain catalog-owned
+	// ranges and do not use this property.
+	ReadSplitTargetSizeKey     = "read.split.target-size"
+	ReadSplitTargetSizeDefault = 128 * 1024 * 1024 // 128 MiB
+
+	// ReadManifestListCacheEnabledKey controls reuse of decoded snapshot
+	// manifest lists across scans of a table handle. Disable it to avoid
+	// retaining manifest descriptors between operations.
+	ReadManifestListCacheEnabledKey     = "read.manifest-list-cache.enabled"
+	ReadManifestListCacheEnabledDefault = true
+
+	// IOManifestCacheEnabledKey controls Java-compatible raw manifest-file
+	// content caching. These settings come from catalog/FileIO properties;
+	// saved per-table configuration overrides matching catalog keys.
+	IOManifestCacheEnabledKey     = "io.manifest.cache-enabled"
+	IOManifestCacheEnabledDefault = false
+
+	// IOManifestCacheExpirationIntervalMsKey controls how long an unused cached
+	// manifest remains eligible for reuse. Expired bytes are removed lazily on
+	// cache access or insertion. Zero disables time-based expiration, matching
+	// Java Iceberg's ContentCache. Invalid negative values warn and disable
+	// the Go cache rather than throwing a Java ValidationException.
+	IOManifestCacheExpirationIntervalMsKey     = "io.manifest.cache.expiration-interval-ms"
+	IOManifestCacheExpirationIntervalMsDefault = 60 * 1000
+
+	// IOManifestCacheMaxTotalBytesKey bounds total retained manifest content per
+	// independently loaded table. Commit-derived handles share the same budget.
+	// Non-positive or unparsable values warn and disable the Go cache, whereas
+	// Java Iceberg rejects them.
+	IOManifestCacheMaxTotalBytesKey     = "io.manifest.cache.max-total-bytes"
+	IOManifestCacheMaxTotalBytesDefault = 100 * 1024 * 1024
+
+	// IOManifestCacheMaxContentLengthKey skips caching individual manifests
+	// larger than this size. Non-positive or unparsable values warn and disable
+	// the Go cache, whereas Java Iceberg rejects them.
+	IOManifestCacheMaxContentLengthKey     = "io.manifest.cache.max-content-length"
+	IOManifestCacheMaxContentLengthDefault = 8 * 1024 * 1024
+
+	// These Java-compatible properties are reserved for future task-group
+	// planning. They are exported so applications can share configuration
+	// names across Iceberg implementations.
+	ReadSplitPlanningLookbackKey     = "read.split.planning-lookback"
+	ReadSplitPlanningLookbackDefault = 10
+	ReadSplitOpenFileCostKey         = "read.split.open-file-cost"
+	ReadSplitOpenFileCostDefault     = 4 * 1024 * 1024 // 4 MiB
 
 	DefaultNameMappingKey = "schema.name-mapping.default"
 
@@ -156,7 +204,15 @@ const (
 	CommitTotalRetryTimeoutMsDefault = 30 * 60 * 1000
 )
 
-func isGCEnabled(props iceberg.Properties) bool {
+// IsGCEnabled reports whether garbage collection (physical file deletion) is
+// enabled for the given table properties. A missing "gc.enabled" key returns
+// [GCEnabledDefault]. Otherwise GC is enabled only when the value is a
+// case-insensitive "true"; any other value, including "1", "true " (with
+// surrounding whitespace), or arbitrary text, disables it.
+//
+// This is exported so the table/maintenance package can gate destructive
+// operations on it; the parsing rules above are part of that contract.
+func IsGCEnabled(props iceberg.Properties) bool {
 	value, ok := props[GCEnabledKey]
 	if !ok {
 		return GCEnabledDefault
@@ -172,13 +228,13 @@ const (
 	PropertySnapshotCount            = "snapshot-count"
 	PropertyCurrentSnapshotId        = "current-snapshot-id"
 	PropertyCurrentSnapshotSummary   = "current-snapshot-summary"
-	PropertyCurrentSnapshotTimestamp = "current-snapshot-timestamp"
+	PropertyCurrentSnapshotTimestamp = "current-snapshot-timestamp-ms"
 	PropertyCurrentSchema            = "current-schema"
 	PropertyDefaultPartitionSpec     = "default-partition-spec"
 	PropertyDefaultSortOrder         = "default-sort-order"
 )
 
-var ReservedProperties = [9]string{
+var reservedProperties = [...]string{
 	PropertyFormatVersion,
 	PropertyUuid,
 	PropertySnapshotCount,
@@ -188,6 +244,12 @@ var ReservedProperties = [9]string{
 	PropertyCurrentSchema,
 	PropertyDefaultPartitionSpec,
 	PropertyDefaultSortOrder,
+}
+
+// ReservedProperties returns a new slice of reserved table property names.
+// Mutating the returned slice does not change metadata validation.
+func ReservedProperties() []string {
+	return slices.Clone(reservedProperties[:])
 }
 
 // Metadata compression codecs

@@ -1,0 +1,409 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package azure
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"net/url"
+	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/fake"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	icebergio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/io/gocloud/blobfs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gocloud.dev/blob"
+	"gocloud.dev/blob/memblob"
+)
+
+func TestProductionAzureCredentialFactories(t *testing.T) {
+	factories := productionAzureCredentialFactories()
+
+	t.Run("default credential", func(t *testing.T) {
+		// azidentity reads AZURE_TOKEN_CREDENTIALS to select a subset of the default chain.
+		// "dev" narrows it to the CLI-based credentials, which keeps EnvironmentCredential,
+		// WorkloadIdentityCredential and ManagedIdentityCredential - the ones that read
+		// AZURE_CLIENT_ID/AZURE_TENANT_ID and probe IMDS - out of the chain. Pinning the value
+		// also stops an unrelated setting in the ambient environment from failing construction.
+		t.Setenv("AZURE_TOKEN_CREDENTIALS", "dev")
+
+		credential, err := factories.newDefaultCredential(nil)
+		require.NoError(t, err)
+		// The factory field returns azcore.TokenCredential, so this pins the production wiring
+		// to NewDefaultAzureCredential rather than restating that function's signature.
+		assert.IsType(t, &azidentity.DefaultAzureCredential{}, credential)
+	})
+
+	t.Run("managed identity credential", func(t *testing.T) {
+		credential, err := factories.newManagedIdentity(nil)
+		require.NoError(t, err)
+		assert.IsType(t, &azidentity.ManagedIdentityCredential{}, credential)
+	})
+}
+
+func TestCreateAzureBucketDefaultCredentialCalled(t *testing.T) {
+	ctx := context.Background()
+
+	parsedURL, err := url.Parse("abfs://container@testaccount.dfs.core.windows.net/path")
+	assert.NoError(t, err)
+
+	defaultCredentialCalled := false
+	credentialFactories := azureCredentialFactories{
+		newDefaultCredential: func(*azidentity.DefaultAzureCredentialOptions) (azcore.TokenCredential, error) {
+			defaultCredentialCalled = true
+
+			return &fake.TokenCredential{}, nil
+		},
+		newManagedIdentity: func(*azidentity.ManagedIdentityCredentialOptions) (azcore.TokenCredential, error) {
+			t.Errorf("managed identity credential factory should not be called")
+
+			return nil, errors.New("unexpected call to managed identity credential factory")
+		},
+	}
+
+	bucket, err := createAzureBucketWithOptions(ctx, parsedURL, nil, credentialFactories, nil)
+
+	require.NoError(t, err)
+	assert.NotNil(t, bucket)
+	assert.True(t, defaultCredentialCalled)
+}
+
+func TestCreateAzureBucketDefaultCredentialEmptyBucketName(t *testing.T) {
+	ctx := context.Background()
+
+	// Create URL with empty bucket name - no container specified in the URL
+	parsedURL, err := url.Parse("abfs://testaccount.dfs.core.windows.net/path")
+	assert.NoError(t, err)
+
+	props := map[string]string{}
+
+	// This should fail with "container name is required" error since no container is specified in User field
+	_, err = createAzureBucket(ctx, parsedURL, props)
+
+	assert.Error(t, err, "Expected error when container name is empty")
+	assert.Contains(t, err.Error(), "container name is required",
+		"Expected container name error but got: %v", err)
+}
+
+func TestCreateAzureBucketManagedIdentityCredentialCalled(t *testing.T) {
+	const clientID = "11111111-2222-3333-4444-555555555555"
+
+	tests := []struct {
+		name       string
+		props      map[string]string
+		assertOpts func(t *testing.T, opts *azidentity.ManagedIdentityCredentialOptions)
+	}{
+		{
+			name: "system assigned identity",
+			props: map[string]string{
+				icebergio.ADLSManagedIdentityEnabled: "true",
+			},
+			assertOpts: func(t *testing.T, opts *azidentity.ManagedIdentityCredentialOptions) {
+				// nil options and zero-valued options both select the system assigned
+				// identity, so only assert that no client ID was forwarded.
+				if opts != nil {
+					assert.Nil(t, opts.ID, "no client ID configured, so no ID should be forwarded")
+				}
+			},
+		},
+		{
+			name: "user assigned identity",
+			props: map[string]string{
+				icebergio.ADLSManagedIdentityEnabled: "true",
+				icebergio.ADLSClientID:               clientID,
+			},
+			assertOpts: func(t *testing.T, opts *azidentity.ManagedIdentityCredentialOptions) {
+				require.NotNil(t, opts)
+				assert.Equal(t, azidentity.ClientID(clientID), opts.ID)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			parsedURL, err := url.Parse("abfs://container@testaccount.dfs.core.windows.net/path")
+			assert.NoError(t, err)
+
+			managedIdentityCalled := false
+			credentialFactories := azureCredentialFactories{
+				newDefaultCredential: func(*azidentity.DefaultAzureCredentialOptions) (azcore.TokenCredential, error) {
+					t.Errorf("default credential factory should not be called")
+
+					return nil, errors.New("unexpected call to default credential factory")
+				},
+				newManagedIdentity: func(opts *azidentity.ManagedIdentityCredentialOptions) (azcore.TokenCredential, error) {
+					managedIdentityCalled = true
+					test.assertOpts(t, opts)
+
+					return &fake.TokenCredential{}, nil
+				},
+			}
+
+			bucket, err := createAzureBucketWithOptions(ctx, parsedURL, test.props, credentialFactories, nil)
+
+			require.NoError(t, err)
+			assert.NotNil(t, bucket)
+			assert.True(t, managedIdentityCalled)
+		})
+	}
+}
+
+func TestCreateAzureBucketSharedKeyMissingAccountKey(t *testing.T) {
+	ctx := context.Background()
+
+	parsedURL, err := url.Parse("abfs://container@testaccount.dfs.core.windows.net/path")
+	assert.NoError(t, err)
+
+	props := map[string]string{
+		"adls.auth.shared-key.account.name": "testaccount",
+		// "adls.auth.shared-key.account.key" is intentionally missing
+	}
+	_, err = createAzureBucket(ctx, parsedURL, props)
+
+	assert.Error(t, err, "Expected error when account key is missing")
+	assert.Contains(t, err.Error(), "shared-key requires both",
+		"Expected shared-key error but got: %v", err)
+}
+
+func TestNewAdlsLocationUriParsing(t *testing.T) {
+	tests := []struct {
+		uri               string
+		expectedAccount   string
+		expectedContainer string
+		expectedHostname  string
+		expectedPath      string
+		shouldFail        bool
+	}{
+		{
+			uri:               "abfs://container@account.dfs.core.windows.net/file.txt",
+			expectedAccount:   "account",
+			expectedContainer: "container",
+			expectedHostname:  "account.dfs.core.windows.net",
+			expectedPath:      "/file.txt",
+			shouldFail:        false,
+		},
+		{
+			uri:               "abfs://container@account.dfs.core.usgovcloudapi.net/file.txt",
+			expectedAccount:   "account",
+			expectedContainer: "container",
+			expectedHostname:  "account.dfs.core.usgovcloudapi.net",
+			expectedPath:      "/file.txt",
+			shouldFail:        false,
+		},
+		{
+			uri:               "wasb://container@account.blob.core.windows.net/file.txt",
+			expectedAccount:   "account",
+			expectedContainer: "container",
+			expectedHostname:  "account.blob.core.windows.net",
+			expectedPath:      "/file.txt",
+			shouldFail:        false,
+		},
+		{
+			uri:        "abfs://account.dfs.core.windows.net/path",
+			shouldFail: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.uri, func(t *testing.T) {
+			parsedURL, err := url.Parse(test.uri)
+			assert.NoError(t, err)
+
+			location, err := newAdlsLocation(parsedURL)
+
+			if test.shouldFail {
+				assert.Error(t, err, "Expected error for URI: %s", test.uri)
+				assert.Nil(t, location)
+			} else {
+				assert.NoError(t, err, "Unexpected error for URI: %s", test.uri)
+				assert.NotNil(t, location)
+				assert.Equal(t, test.expectedAccount, location.accountName, "Account name mismatch for URI: %s", test.uri)
+				assert.Equal(t, test.expectedContainer, location.containerName, "Container name mismatch for URI: %s", test.uri)
+				assert.Equal(t, test.expectedHostname, location.hostname, "Hostname mismatch for URI: %s", test.uri)
+				assert.Equal(t, test.expectedPath, location.path, "Path mismatch for URI: %s", test.uri)
+			}
+		})
+	}
+}
+
+func TestAdlsKeyExtractor(t *testing.T) {
+	tests := []struct {
+		name        string
+		root        string
+		input       string
+		expectedKey string
+		expectedErr string
+		wantErrIs   error
+		shouldError bool
+	}{
+		{
+			name:        "abfs valid URI",
+			input:       "abfs://container@account.dfs.core.windows.net/path/to/file.parquet",
+			expectedKey: "path/to/file.parquet",
+		},
+		{
+			name:        "abfss valid URI",
+			input:       "abfss://container@account.dfs.core.windows.net/path/to/file.parquet",
+			expectedKey: "path/to/file.parquet",
+		},
+		{
+			name:        "wasb valid URI",
+			root:        "wasb://container@account.blob.core.windows.net/",
+			input:       "wasb://container@account.blob.core.windows.net/path/to/file.parquet",
+			expectedKey: "path/to/file.parquet",
+		},
+		{
+			name:        "wasbs valid URI",
+			root:        "wasbs://container@account.blob.core.windows.net/",
+			input:       "wasbs://container@account.blob.core.windows.net/path/to/file.parquet",
+			expectedKey: "path/to/file.parquet",
+		},
+		{
+			name:        "URI with no path",
+			input:       "abfs://container@account.dfs.core.windows.net",
+			expectedErr: "object key is empty",
+			wantErrIs:   blobfs.ErrEmptyObjectKey,
+			shouldError: true,
+		},
+		{
+			name:        "URI with empty path",
+			input:       "abfs://container@account.dfs.core.windows.net/",
+			expectedErr: "object key is empty",
+			wantErrIs:   blobfs.ErrEmptyObjectKey,
+			shouldError: true,
+		},
+		{
+			name:        "URI with query but no path",
+			input:       "abfs://container@account.dfs.core.windows.net?prefix=data",
+			expectedErr: "must be followed by an object path",
+			shouldError: true,
+		},
+		{
+			name:        "URI with different container",
+			input:       "abfs://other@account.dfs.core.windows.net/path/to/file.parquet",
+			expectedErr: "does not match configured authority",
+			wantErrIs:   blobfs.ErrUnsupportedObjectAuthority,
+			shouldError: true,
+		},
+		{
+			name:        "invalid ADLS location - invalid scheme",
+			input:       "s3://bucket/path/to/file.parquet",
+			expectedErr: "invalid ADLS location",
+			shouldError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := test.root
+			if root == "" {
+				root = "abfs://container@account.dfs.core.windows.net/"
+			}
+			parsed, err := url.Parse(root)
+			require.NoError(t, err)
+
+			extractor := blobfs.KeyExtractorFromObjectLocation(adlsObjectLocationExtractor(parsed))
+			key, err := extractor(test.input)
+
+			if test.shouldError {
+				require.Error(t, err, "Expected error for input: %s", test.input)
+				if test.expectedErr != "" {
+					assert.ErrorContains(t, err, test.expectedErr, "Expected specific error for input: %s", test.input)
+				}
+				if test.wantErrIs != nil {
+					assert.ErrorIs(t, err, test.wantErrIs)
+				}
+			} else {
+				require.NoError(t, err, "Unexpected error for input: %s", test.input)
+				assert.Equal(t, test.expectedKey, key, "Key mismatch for input: %s", test.input)
+			}
+		})
+	}
+}
+
+func testADLSBlobFileIO(t *testing.T, ctx context.Context, root string, bucket *blob.Bucket) *blobfs.FileIO {
+	t.Helper()
+
+	parsed, err := url.Parse(root)
+	require.NoError(t, err)
+
+	return blobfs.New(ctx, bucket, adlsObjectLocationExtractor(parsed))
+}
+
+func TestBlobFileIOWalkDirRejectsWrongAzureAuthority(t *testing.T) {
+	ctx := context.Background()
+
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	bfs := testADLSBlobFileIO(t, ctx, "abfs://container@account.dfs.core.windows.net/", bucket)
+
+	err := bfs.WalkDir("abfs://other@account.dfs.core.windows.net/data", func(string, fs.DirEntry, error) error {
+		t.Fatal("WalkDir callback should not be called")
+
+		return nil
+	})
+	require.ErrorContains(t, err, "does not match configured authority")
+	require.ErrorIs(t, err, blobfs.ErrUnsupportedObjectAuthority)
+}
+
+func TestBlobFileIOWalkDirAzureURI(t *testing.T) {
+	ctx := context.Background()
+
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	files := []string{
+		"path/100%off/file.parquet",
+		"path/city=New York/file.parquet",
+		"path/to/file.parquet",
+	}
+	for _, f := range files {
+		require.NoError(t, bucket.WriteAll(ctx, f, []byte("data"), nil))
+	}
+
+	bfs := testADLSBlobFileIO(t, ctx, "abfs://container@account.dfs.core.windows.net/", bucket)
+
+	var walked []string
+	err := bfs.WalkDir("abfs://container@account.dfs.core.windows.net/path", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.IsDir() {
+			walked = append(walked, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	expected := []string{
+		"abfs://container@account.dfs.core.windows.net/path/100%off/file.parquet",
+		"abfs://container@account.dfs.core.windows.net/path/city=New York/file.parquet",
+		"abfs://container@account.dfs.core.windows.net/path/to/file.parquet",
+	}
+
+	assert.ElementsMatch(t, expected, walked)
+}

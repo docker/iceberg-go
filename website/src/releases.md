@@ -40,6 +40,42 @@ To track `main`, use `@main` instead of a version tag.
 
 Per-release notes (highlights, breaking changes, contributors) are published on the [GitHub Releases page](https://github.com/apache/iceberg-go/releases). Iceberg Go does not maintain a curated `CHANGELOG.md` in the repository; the GitHub Releases page is the canonical source.
 
+### Unreleased compatibility notes
+
+- **Data file block size setter removed.** `iceberg.DataFileBuilder.BlockSizeInBytes` is removed. New v1 manifests use the Avro schema's 64 MiB default when the field is unset. V2/v3 omit this deprecated field, and legacy v1 values remain readable.
+- **View creation APIs take a named SQL representation.** `view.NewVersionFromSQL`, `view.CreateView`, `view.CreateViewWithIOProperties`, and `sql.Catalog.CreateView` now accept a `view.Representation{SQL: sql, Dialect: dialect}` instead of positional SQL/dialect strings. The dialect is required; Hive preserves the selected representation's dialect.
+
+- **View SQL representation construction uses named fields.** Replace `view.NewRepresentation(sql, dialect)` with `view.NewRepresentation(view.Representation{SQL: sql, Dialect: dialect})`. Serialized JSON is unchanged.
+
+- **Reserved table properties now use a read-only API.** Replace references to `table.ReservedProperties` with `table.ReservedProperties()`. The function returns a fresh slice, so callers cannot change metadata validation by modifying it.
+- **Fixed and decimal constructors return errors.** `iceberg.FixedTypeOf` and `iceberg.DecimalTypeOf` now return `(type, error)` instead of panicking for invalid inputs. Use `MustFixedTypeOf` or `MustDecimalTypeOf` only for known-valid values.
+- **SQL UDF representations now use struct literals.** The `udf.NewSQLRepresentation(dialect, sql)` function, available since v0.7.0, is removed. Use `udf.SQLRepresentation{Dialect: "trino", SQL: "x + 1"}` instead. Empty fields and duplicate dialects are checked during metadata validation; serialized JSON is unchanged.
+- **Filesystem adapter construction consolidated.** Replace `io.FSPreProcName(fsys, fn)` with `io.FS(fsys, io.WithNamePreprocessor(fn))`. Plain `io.FS(fsys)` remains supported.
+- **Table purge is required on catalogs.** The `catalog.Catalog` interface now embeds `catalog.PurgeableCatalog`; every custom catalog implementation must provide `PurgeTable(ctx, identifier) error`. The narrow `catalog.PurgeableTable` interface is renamed to `catalog.PurgeableCatalog`. Built-in purge behavior is unchanged.
+- **Unify statistics blob types with Puffin.** Replace `table.BlobType` with `puffin.BlobType` when constructing `table.BlobMetadata`. Replace `table.BlobTypeApacheDatasketchesThetaV1` with `puffin.BlobTypeDataSketchesTheta` and `table.BlobTypeDeletionVectorV1` with `puffin.BlobTypeDeletionVector`. Use `puffin.BlobType.IsKnown()` to identify the types defined by the Puffin specification; the redundant `table.BlobType.IsValid()` method is removed. Unknown non-empty blob type names still round-trip through table metadata.
+- **View representation field uses the Go SQL initialism.** Replace `view.Representation.Sql` with `view.Representation.SQL`. Serialized view metadata still uses the `sql` JSON field.
+- **Orphan cleanup results now expose only `OrphanFiles`.** Replace `result.OrphanFileLocations` with `result.OrphanFiles` (each entry has `Path` and `SizeBytes`). `OrphanCleanupPlan.Files()` still provides path-only lists during planning.
+- **Catalog identifier helper renamed.** `catalog.TableNameFromIdent` is removed. Use `catalog.ObjectNameFromIdent` for tables, views, and functions.
+- **Substrait expression conversion no longer takes case sensitivity.** `substrait.ConvertExpr(schema, expression, caseSensitive)` becomes `substrait.ConvertExpr(schema, expression)`. Case sensitivity remains part of expression binding.
+
+- **Transform formatting requires the result type and uses the Java-aligned method name.** `Transform.ToHumanStr(value)` and `Transform.ToHumanStrType(resultType, value)` are removed. Use `Transform.ToHumanString(resultType, value)` to format partition values, including timestamps with time zones.
+- **Catalogs now require cleanup.** The `catalog.Catalog` interface includes `Close() error`. Custom catalog implementations must provide `Close`, and callers should close catalog instances after use. `catalog.Closer` is removed. Replace `cat.(catalog.Closer)` checks with `defer cat.Close()`; `catalog.Catalog` already implements `io.Closer`, so no type assertion is needed.
+
+- **Puffin writer property setter renamed.** `puffin.Writer.AddProperties` is now `puffin.Writer.SetProperties`. Repeated calls still merge keys; use `ClearProperties` to clear custom properties before finishing.
+
+- **Orphan file cleanup moved to `table/maintenance`.** The orphan-cleanup and file-purge API is no longer on `table.Table`; it now lives in the `table/maintenance` package as free functions that take the table as their first argument (matching `table/compaction`). For example, `tbl.DeleteOrphanFiles(ctx, ...)` becomes `maintenance.DeleteOrphanFiles(ctx, tbl, ...)`. Because `table/maintenance` imports `table` (and not the reverse), this cannot be offered as a deprecation shim on `table.Table` without an import cycle, so callers must switch to the new package. The following moved from `table` to `table/maintenance`:
+    - Functions (now free functions taking `*table.Table`): `DeleteOrphanFiles`, `PlanOrphanFiles`, `ExecuteOrphanCleanup`, `PurgeFiles`.
+    - Types: `OrphanCleanupOption`, `OrphanCleanupResult`, `OrphanFile`, `OrphanCleanupPlan`, `PrefixMismatchMode`.
+    - Constants: `PrefixMismatchError`, `PrefixMismatchIgnore`, `PrefixMismatchDelete`.
+    - Option constructors: `WithCleanupLocation`, `WithCleanupFilesOlderThan`, `WithCleanupDryRun`, `WithCleanupDeleteFunc`, `WithCleanupMaxConcurrency`, `WithPrefixMismatchMode`, `WithEqualSchemes`, `WithEqualAuthorities`. The four generic names (`WithLocation`, `WithFilesOlderThan`, `WithDryRun`, `WithDeleteFunc`) gained the `WithCleanup` prefix for consistency.
+
+    Relatedly, the previously unexported `isGCEnabled` is now `table.IsGCEnabled`, so the new package can gate destructive operations on the `gc.enabled` table property.
+- **Data-file replacement methods renamed.** Use `ReplaceDataFilesByPath` for string paths. Use `ReplaceDataFiles` for prebuilt `DataFile` values instead of `ReplaceDataFilesWithDataFiles`.
+
+- `maintenance.PurgeFiles` (previously `Table.PurgeFiles`) now calls `IO.Remove` concurrently, with up to 32 calls in flight, when the filesystem does not implement `BulkRemovableIO`. Custom IO implementations, including those registered with `io.Register`, must make `Remove` safe for concurrent use and synchronize any shared mutable state. The bulk deletion path is unchanged.
+
+- **Partition and sort source accessors renamed.** Replace `PartitionField.SourceID()` and `SortField.SourceID()` with `FirstSourceID()`. Their behavior and serialized fields are unchanged.
+
 ## Verifying and producing releases
 
 If you are validating an RC or cutting a new release, see:

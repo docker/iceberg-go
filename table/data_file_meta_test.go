@@ -1171,7 +1171,7 @@ func TestDataFileFromMetadata_V3ReplaceDataFilesRequiresFirstRowID(t *testing.T)
 	require.Nil(t, replacement.FirstRowID())
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFilesWithDataFiles(t.Context(),
+	err = tx.ReplaceDataFiles(t.Context(),
 		[]iceberg.DataFile{initial}, []iceberg.DataFile{replacement}, nil)
 	require.ErrorContains(t, err, "first_row_id")
 	require.ErrorContains(t, err, "required for v3")
@@ -1228,7 +1228,7 @@ func TestDataFileFromMetadata_V3RewriteAcceptsNilFirstRowID(t *testing.T) {
 }
 
 func TestDataFileFromMetadata_EndToEndRowDelta(t *testing.T) {
-	tbl := newRowDeltaCommitTestTableVersion(t, 3)
+	tbl := newRowDeltaCommitTestTableVersion(t, 2)
 	sch := tbl.Schema()
 
 	const dataPath = "s3://bucket/test/data/insert.parquet"

@@ -36,6 +36,9 @@ type View struct {
 	identifier       table.Identifier
 	metadata         Metadata
 	metadataLocation string
+	// labels is transient catalog enrichment from the load response; nil when
+	// the catalog returned none. It is excluded from Equals.
+	labels *iceberg.Labels
 }
 
 func (t View) Equals(other View) bool {
@@ -54,12 +57,42 @@ func (t View) Location() string                 { return t.metadata.Location() }
 func (t View) Versions() []*Version             { return t.metadata.Versions() }
 func (t View) Schemas() map[int]*iceberg.Schema { return t.metadata.SchemasByID() }
 
-func New(ident table.Identifier, meta Metadata, metadataLocation string) *View {
-	return &View{
+// Labels returns the catalog-provided labels from the load response, or nil if
+// the catalog returned none. Labels are transient enrichment, not view state.
+// The returned pointer aliases the view's labels and must be treated as
+// read-only; mutating it affects the shared view value.
+func (t View) Labels() *iceberg.Labels { return t.labels }
+
+// Option configures a [View] at construction.
+type Option func(*View)
+
+// noopViewOption is the shared no-op [Option], returned when an option has
+// nothing to apply (e.g. WithLabels(nil)). It mirrors noopTableOption.
+func noopViewOption(*View) {}
+
+// WithLabels attaches catalog-provided labels from a load response to the view.
+// A nil value is ignored, leaving the view's labels nil.
+func WithLabels(l *iceberg.Labels) Option {
+	if l == nil {
+		return noopViewOption
+	}
+
+	return func(v *View) {
+		v.labels = l
+	}
+}
+
+func New(ident table.Identifier, meta Metadata, metadataLocation string, opts ...Option) *View {
+	v := &View{
 		identifier:       slices.Clone(ident),
 		metadata:         meta,
 		metadataLocation: metadataLocation,
 	}
+	for _, opt := range opts {
+		opt(v)
+	}
+
+	return v
 }
 
 func NewFromLocation(
@@ -84,7 +117,7 @@ func NewFromLocation(
 			return nil, err
 		}
 	} else {
-		f, err := fsys.Open(metalocation)
+		f, err := fsys.Open(ctx, metalocation)
 		if err != nil {
 			return nil, err
 		}
@@ -104,33 +137,35 @@ func NewFromLocation(
 //
 // Note: This function only supports creating new views with format version 1.
 // It does not support updating existing view metadata.
+// representation holds both SQL text and its dialect.
 func CreateView(
 	ctx context.Context,
 	catalogName string,
 	viewIdent table.Identifier,
 	schema *iceberg.Schema,
-	viewSQL string,
+	representation Representation,
 	defaultNS table.Identifier,
 	loc string,
 	props iceberg.Properties,
 ) (*View, error) {
-	return createView(ctx, catalogName, viewIdent, schema, viewSQL, defaultNS, loc, props, props)
+	return createView(ctx, catalogName, viewIdent, schema, representation, defaultNS, loc, props, props)
 }
 
 // CreateViewWithIOProperties creates a view using ioProps to configure the
 // filesystem and metadataProps as the properties persisted in view metadata.
+// representation holds both SQL text and its dialect.
 func CreateViewWithIOProperties(
 	ctx context.Context,
 	catalogName string,
 	viewIdent table.Identifier,
 	schema *iceberg.Schema,
-	viewSQL string,
+	representation Representation,
 	defaultNS table.Identifier,
 	loc string,
 	ioProps iceberg.Properties,
 	metadataProps iceberg.Properties,
 ) (*View, error) {
-	return createView(ctx, catalogName, viewIdent, schema, viewSQL, defaultNS, loc, ioProps, metadataProps)
+	return createView(ctx, catalogName, viewIdent, schema, representation, defaultNS, loc, ioProps, metadataProps)
 }
 
 func createView(
@@ -138,7 +173,7 @@ func createView(
 	catalogName string,
 	viewIdent table.Identifier,
 	schema *iceberg.Schema,
-	viewSQL string,
+	representation Representation,
 	defaultNS table.Identifier,
 	loc string,
 	ioProps iceberg.Properties,
@@ -146,15 +181,12 @@ func createView(
 ) (*View, error) {
 	versionId := int64(1)
 
-	builder, err := NewMetadataBuilder()
-	if err != nil {
-		return nil, err
-	}
+	builder := NewMetadataBuilder()
 
 	viewVersion, err := NewVersionFromSQL(
 		versionId,
 		schema.ID,
-		viewSQL,
+		representation,
 		defaultNS,
 		WithDefaultViewCatalog(catalogName),
 	)

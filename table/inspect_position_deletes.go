@@ -18,8 +18,8 @@ package table
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"slices"
 
@@ -28,14 +28,15 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/scalar"
 	"github.com/apache/iceberg-go"
+	iceinternal "github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table/dv"
 	tblutils "github.com/apache/iceberg-go/table/internal"
 )
 
 const (
-	positionDeleteFilePathID       = math.MaxInt32 - 101
-	positionDeletePosID            = math.MaxInt32 - 102
+	positionDeleteFilePathID       = iceberg.DeleteFilePathFieldID
+	positionDeletePosID            = iceberg.DeleteFilePosFieldID
 	positionDeleteRowID            = math.MaxInt32 - 103
 	positionDeletePartitionID      = math.MaxInt32 - 5
 	positionDeleteSpecID           = math.MaxInt32 - 4
@@ -49,11 +50,11 @@ const (
 // by the current snapshot. Parquet position-delete files and V3 deletion
 // vectors are exposed through the same schema.
 func (i InspectTable) PositionDeletes(ctx context.Context) (array.RecordReader, error) {
-	partitionType, partitionIDs, err := positionDeletesPartitionType(i.tbl.metadata)
+	partitionType, partitionIDs, err := positionDeletesPartitionType(i.tbl.Metadata())
 	if err != nil {
 		return nil, fmt.Errorf("inspect position deletes: %w", err)
 	}
-	schema := PositionDeletesSchema(i.tbl.metadata.CurrentSchema(), partitionType, i.tbl.metadata.Version())
+	schema := PositionDeletesSchema(i.tbl.Metadata().CurrentSchema(), partitionType, i.tbl.Metadata().FormatVersion())
 	arrowSchema, err := SchemaToArrowSchema(schema, nil, true, false)
 	if err != nil {
 		return nil, fmt.Errorf("inspect position deletes: build arrow schema: %w", err)
@@ -66,24 +67,22 @@ func (i InspectTable) PositionDeletes(ctx context.Context) (array.RecordReader, 
 	ctx = compute.WithAllocator(ctx, i.alloc)
 
 	return i.positionDeleteRecordReader(
-		ctx, arrowSchema, fs, manifests, partitionType, partitionIDs, i.tbl.metadata.Version()), nil
+		ctx, arrowSchema, fs, manifests, partitionType, partitionIDs, i.tbl.Metadata().FormatVersion()), nil
 }
 
 func (i InspectTable) currentPositionDeleteManifests(
 	ctx context.Context,
-) (iceio.IO, []iceberg.ManifestFile, error) {
-	snapshot := i.tbl.metadata.CurrentSnapshot()
+) (iceio.IO, iter.Seq[iceberg.ManifestFile], error) {
+	snapshot := i.tbl.Metadata().CurrentSnapshot()
 	if snapshot == nil {
-		return nil, nil, nil
+		return nil, slices.Values([]iceberg.ManifestFile(nil)), nil
 	}
-	if i.tbl.fsF == nil {
-		return nil, nil, errors.New("table file IO is not configured")
-	}
-	fs, err := i.tbl.fsF(ctx)
+	provider := i.tbl.ManifestProvider()
+	manifests, err := provider.Manifests(ctx, *snapshot)
 	if err != nil {
 		return nil, nil, err
 	}
-	manifests, err := snapshot.Manifests(fs)
+	fs, err := provider.FS(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -477,7 +476,7 @@ func (i InspectTable) positionDeleteRecordReader(
 	ctx context.Context,
 	arrowSchema *arrow.Schema,
 	fs iceio.IO,
-	manifests []iceberg.ManifestFile,
+	manifests iter.Seq[iceberg.ManifestFile],
 	partitionType *iceberg.StructType,
 	partitionIDByOld map[int]int,
 	formatVersion int,
@@ -496,9 +495,9 @@ func (i InspectTable) positionDeleteRecordReader(
 			positionDeleteProjectionOptions{
 				ctx:             ctx,
 				formatVersion:   formatVersion,
-				tableSchema:     i.tbl.metadata.CurrentSchema(),
-				nameMapping:     i.tbl.metadata.NameMapping(),
-				tableProperties: i.tbl.metadata.Properties(),
+				tableSchema:     i.tbl.Metadata().CurrentSchema(),
+				nameMapping:     i.tbl.Metadata().NameMapping(),
+				tableProperties: i.tbl.Metadata().Properties(),
 			},
 		)
 		if err != nil {
@@ -534,7 +533,7 @@ func (i InspectTable) positionDeleteRecordReader(
 			return true, nil
 		}
 
-		for _, manifest := range manifests {
+		for manifest := range manifests {
 			if err := ctx.Err(); err != nil {
 				yieldError(err)
 
@@ -793,7 +792,8 @@ func validatePositionDeleteFilePathValues(values arrow.TypedArray[string], arr a
 func positionDeletesPartitionType(
 	metadata Metadata,
 ) (*iceberg.StructType, map[int]int, error) {
-	base, err := inspectPartitionType(metadata)
+	currentSchema := metadata.CurrentSchema()
+	base, err := inspectPartitionTypeWithSchema(metadata, currentSchema)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -808,33 +808,43 @@ func positionDeletesPartitionType(
 		positionDeleteContentOffsetID: {},
 		positionDeleteContentSizeID:   {},
 	}
-	for _, schema := range metadata.Schemas() {
-		fields, err := iceberg.IndexByID(schema)
-		if err != nil {
-			return nil, nil, err
-		}
-		for id := range fields {
-			used[id] = struct{}{}
-		}
-	}
 	for _, field := range base.FieldList {
 		used[field.ID] = struct{}{}
 	}
-
 	fields := make([]iceberg.NestedField, len(base.FieldList))
 	idByOld := make(map[int]int, len(base.FieldList))
-	nextID := 1
+	maxFieldID := int64(math.MaxInt32)
+	nextID := int64(1)
+	wrapped := false
+	lastColumnID := metadata.LastColumnID()
+	if lastColumnID >= 0 && int64(lastColumnID) < maxFieldID {
+		nextID = int64(lastColumnID) + 1
+	} else if int64(lastColumnID) >= maxFieldID {
+		wrapped = true
+	}
 	for index, field := range base.FieldList {
 		for {
-			if _, exists := used[nextID]; !exists {
-				break
+			if nextID > maxFieldID {
+				if wrapped {
+					return nil, nil, fmt.Errorf("%w: no field ID available for position delete partition field %q",
+						iceberg.ErrInvalidSchema, field.Name)
+				}
+				nextID = 1
+				wrapped = true
+			}
+			fieldID := int(nextID)
+			if _, exists := used[fieldID]; !exists {
+				if _, exists := currentSchema.FindFieldByIDRef(fieldID, iceinternal.SchemaRef{}); !exists {
+					break
+				}
 			}
 			nextID++
 		}
-		idByOld[field.ID] = nextID
-		field.ID = nextID
+		fieldID := int(nextID)
+		idByOld[field.ID] = fieldID
+		field.ID = fieldID
 		fields[index] = field
-		used[nextID] = struct{}{}
+		used[fieldID] = struct{}{}
 		nextID++
 	}
 

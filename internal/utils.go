@@ -66,6 +66,11 @@ func DecodeDefaultBytes(value string, fixedLen int) ([]byte, error) {
 // It is restricted to packages within this module by Go's internal package rules.
 type SchemaRef struct{}
 
+// PartitionSpecRef marks partition-spec access that may return references to
+// internal state. It is restricted to packages within this module by Go's
+// internal package rules.
+type PartitionSpecRef struct{}
+
 // FloorDiv performs floored integer division, rounding toward negative infinity.
 // This matches Java's Math.floorDiv behavior for negative dividends.
 func FloorDiv[T constraints.Integer](a, b T) T {
@@ -79,14 +84,32 @@ func FloorDiv[T constraints.Integer](a, b T) T {
 
 // Helper function to find the difference between two slices (a - b).
 func Difference(a, b []string) []string {
-	m := make(map[string]bool)
-	for _, item := range b {
-		m[item] = true
+	if len(a) == 0 {
+		return []string{}
+	}
+	if len(b) == 0 {
+		return append(make([]string, 0, len(a)), a...)
+	}
+	if len(b) <= 2 {
+		diff := make([]string, 0, len(a))
+		for _, item := range a {
+			if !slices.Contains(b, item) {
+				diff = append(diff, item)
+			}
+		}
+
+		return diff
 	}
 
-	diff := make([]string, 0)
+	m := make(map[string]struct{}, len(b))
+	for _, item := range b {
+		m[item] = struct{}{}
+	}
+	// Leave room for the likely survivors without reserving for every input.
+	// Append still handles duplicate entries and exclusions outside a.
+	diff := make([]string, 0, max(0, len(a)-len(b)))
 	for _, item := range a {
-		if !m[item] {
+		if _, excluded := m[item]; !excluded {
 			diff = append(diff, item)
 		}
 	}
@@ -133,8 +156,19 @@ func PackingIterator[T any](itr iter.Seq[T], targetWeight int64, lookback int, w
 			return maxBin
 		}
 
-		var out Bin[T]
-		out, bins = bins[0], bins[1:]
+		out := bins[0]
+		if lookback == 1 {
+			// Keep the two-bin buffer for the next FIFO eviction.
+			if len(bins) == 2 {
+				bins[0] = bins[1]
+				bins[1] = Bin[T]{}
+			} else {
+				bins[0] = Bin[T]{}
+			}
+			bins = bins[:len(bins)-1]
+		} else {
+			bins = bins[1:]
+		}
 
 		return out
 	}
@@ -173,23 +207,43 @@ type SlicePacker[T any] struct {
 }
 
 func (s *SlicePacker[T]) Pack(items []T, weightFunc func(T) int64) [][]T {
+	if s.shouldUseIndexedFIFO(len(items)) {
+		return slices.Collect(indexedFIFOPackingIterator(slices.Values(items),
+			s.TargetWeight, s.Lookback, weightFunc))
+	}
+
 	return slices.Collect(PackingIterator(slices.Values(items), s.TargetWeight,
 		s.Lookback, weightFunc, s.LargestBinFirst))
 }
 
 func (s *SlicePacker[T]) PackEnd(items []T, weightFunc func(T) int64) [][]T {
-	items = slices.Clone(items)
-	slices.Reverse(items)
-	packed := s.Pack(items, weightFunc)
-	slices.Reverse(packed)
-
-	result := make([][]T, 0, len(packed))
-	for _, items := range packed {
-		slices.Reverse(items)
-		result = append(result, items)
+	reversed := func(yield func(T) bool) {
+		for i := len(items); i > 0; i-- {
+			if !yield(items[i-1]) {
+				return
+			}
+		}
 	}
 
-	return result
+	var packed [][]T
+	if s.shouldUseIndexedFIFO(len(items)) {
+		packed = slices.Collect(indexedFIFOPackingIterator(reversed,
+			s.TargetWeight, s.Lookback, weightFunc))
+	} else {
+		packed = slices.Collect(PackingIterator(reversed,
+			s.TargetWeight, s.Lookback, weightFunc, s.LargestBinFirst))
+	}
+	slices.Reverse(packed)
+
+	for _, items := range packed {
+		slices.Reverse(items)
+	}
+
+	if packed == nil {
+		return make([][]T, 0)
+	}
+
+	return packed
 }
 
 type CountingWriter struct {

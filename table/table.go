@@ -48,14 +48,10 @@ import (
 
 // ErrCommitFailed is the sentinel error returned by catalogs when a
 // commit fails due to a concurrent modification (e.g. HTTP 409 Conflict
-// from the REST catalog). Catalog implementations should wrap this
-// error so that callers using errors.Is(err, table.ErrCommitFailed)
-// can detect retryable commit conflicts.
-//
-// Currently only catalog/rest wraps this sentinel; Glue, SQL, and Hive
-// catalogs return their conflict errors raw and will not trigger
-// retries until follow-up work wires them through (tracked under
-// issue #830).
+// from the REST catalog, or a commit requirement that no longer holds).
+// Catalog implementations should wrap this error so that callers using
+// errors.Is(err, table.ErrCommitFailed) can detect retryable commit
+// conflicts.
 var ErrCommitFailed = errors.New("commit failed, refresh and try again")
 
 // ErrWriteIORequired is returned by write paths when the table's file system
@@ -99,23 +95,34 @@ type CatalogIO interface {
 }
 
 type Table struct {
-	identifier       Identifier
-	metadata         Metadata
-	metadataLocation string
-	cat              CatalogIO
-	fsF              FSysF
-	planner          ScanPlanner
+	identifier           Identifier
+	metadata             Metadata
+	metadataLocation     string
+	cat                  CatalogIO
+	fsF                  FSysF
+	manifestCache        *snapshotManifestCache
+	manifestContentCache *manifestContentCache
+	planner              ScanPlanner
 	// scanPlanningIOProps are the table-scoped FileIO properties supplied by a
 	// catalog load response. They are separate from metadata properties because
 	// REST catalogs can return FileIO configuration in the response's config
 	// block.
 	scanPlanningIOProps iceberg.Properties
-	reporter            metrics.Reporter
+	// scanPlanningDirective is the raw `scan-planning-mode` value from the
+	// catalog load response's config block; hasScanPlanningDirective records
+	// whether the key was present.
+	scanPlanningDirective    string
+	hasScanPlanningDirective bool
+	savedConfig              iceberg.Properties
+	reporter                 metrics.Reporter
 	// reporterSet records whether a caller injected a reporter via
 	// WithMetricsReporter. It distinguishes an explicit reporter (including an
 	// explicit NopReporter opt-out) from the construction-time default, so
 	// Refresh knows whether it may overwrite reporter with the catalog default.
 	reporterSet bool
+	// labels is transient catalog enrichment from the load response; nil when
+	// the catalog returned none. It is excluded from Equals.
+	labels *iceberg.Labels
 }
 
 func (t Table) Equals(other Table) bool {
@@ -132,6 +139,13 @@ func (t Table) Schema() *iceberg.Schema                      { return t.metadata
 func (t Table) Spec() iceberg.PartitionSpec                  { return t.metadata.PartitionSpec() }
 func (t Table) SortOrder() SortOrder                         { return t.metadata.SortOrder() }
 func (t Table) Properties() iceberg.Properties               { return t.metadata.Properties() }
+func (t Table) SavedConfig() iceberg.Properties              { return maps.Clone(t.savedConfig) }
+
+// Labels returns the catalog-provided labels from the load response, or nil if
+// the catalog returned none. Labels are transient enrichment, not table state.
+// The returned pointer aliases the table's labels and must be treated as
+// read-only; mutating it affects the shared table value.
+func (t Table) Labels() *iceberg.Labels { return t.labels }
 
 // MetricsReporter returns the table's metrics reporter, never nil.
 func (t Table) MetricsReporter() metrics.Reporter {
@@ -160,20 +174,9 @@ func (t Table) LocationProvider() (LocationProvider, error) {
 }
 
 func (t Table) NewTransaction() *Transaction {
-	txn, err := t.NewTransactionOnBranchWithError(MainBranch)
+	txn, err := t.NewTransactionOnBranch(MainBranch)
 	if err != nil {
 		return t.newBrokenTransaction(MainBranch, err)
-	}
-
-	return txn
-}
-
-// NewTransactionOnBranch creates a new transaction that commits to the named
-// branch. Use [NewTransaction] to commit to the default "main" branch.
-func (t Table) NewTransactionOnBranch(branch string) *Transaction {
-	txn, err := t.NewTransactionOnBranchWithError(branch)
-	if err != nil {
-		return t.newBrokenTransaction(branch, err)
 	}
 
 	return txn
@@ -188,20 +191,19 @@ func (t Table) newBrokenTransaction(branch string, err error) *Transaction {
 	}
 }
 
-// NewTransactionOnBranchWithError creates a new transaction and returns any metadata
-// initialization error that prevents builder construction.
-//
-// This preserves the old non-failing constructor contract while allowing
-// callers to receive the precise initialization error instead of hitting
-// panic/undefined behavior later.
-func (t Table) NewTransactionOnBranchWithError(branch string) (*Transaction, error) {
+// NewTransactionOnBranch creates a transaction that commits to the named
+// branch. Initialization failures and attempts to target a tag are returned
+// immediately instead of being stored in a broken transaction.
+// A missing branch is allowed; its absence is checked at commit time.
+// Use [NewTransaction] to target the default "main" branch.
+func (t Table) NewTransactionOnBranch(branch string) (*Transaction, error) {
 	for name, ref := range t.metadata.Refs() {
 		if name != branch {
 			continue
 		}
-		if ref.SnapshotRefType != BranchRef {
+		if ref.Type != BranchRef {
 			return nil, fmt.Errorf("%w: ref %q is a %s; tags cannot be transaction targets",
-				iceberg.ErrInvalidArgument, branch, ref.SnapshotRefType)
+				iceberg.ErrInvalidArgument, branch, ref.Type)
 		}
 
 		break
@@ -235,8 +237,14 @@ func (t *Table) Refresh(ctx context.Context) error {
 	t.metadata = fresh.metadata
 	t.fsF = fresh.fsF
 	t.metadataLocation = fresh.metadataLocation
+	t.manifestCache = newSnapshotManifestCacheForMetadata(fresh.metadata)
+	t.manifestContentCache = reuseManifestContentCache(t.manifestContentCache, fresh.manifestContentCache)
 	t.planner = fresh.planner
 	t.scanPlanningIOProps = maps.Clone(fresh.scanPlanningIOProps)
+	t.scanPlanningDirective = fresh.scanPlanningDirective
+	t.hasScanPlanningDirective = fresh.hasScanPlanningDirective
+	t.labels = fresh.labels
+	t.savedConfig = maps.Clone(fresh.savedConfig)
 	// Only inherit the catalog-derived reporter when the caller hasn't set one
 	// of their own. Refresh runs inside commit retry loops, so unconditionally
 	// copying fresh.reporter would silently revert a WithMetricsReporter-injected
@@ -295,6 +303,11 @@ func (t Table) Append(ctx context.Context, rdr array.RecordReader, snapshotProps
 //
 // New data from the provided table is written to the table regardless of the filter.
 //
+// On a v3 table, every data file the overwrite removes or rewrites takes its deletion vector with it.
+// A commit that removes a deletion vector is not replayed: if another writer commits first,
+// it fails with ErrCommitFailed instead of refreshing and retrying.
+// Reload the table and run the overwrite again.
+//
 // The batchSize parameter refers to the batch size for reading the input data, not the batch size for writes.
 // The concurrency parameter controls the level of parallelism for manifest processing and file rewriting and
 // can be overridden using the WithOverwriteConcurrency option. Defaults to runtime.GOMAXPROCS(0).
@@ -323,6 +336,11 @@ func (t Table) OverwriteTable(ctx context.Context, tbl arrow.Table, batchSize in
 //
 // New data from the provided RecordReader is written to the table regardless of the filter.
 //
+// On a v3 table, every data file the overwrite removes or rewrites takes its deletion vector with it.
+// A commit that removes a deletion vector is not replayed: if another writer commits first,
+// it fails with ErrCommitFailed instead of refreshing and retrying.
+// Reload the table and run the overwrite again.
+//
 // The concurrency parameter controls the level of parallelism for manifest processing and file rewriting and
 // can be overridden using the WithOverwriteConcurrency option. Defaults to runtime.GOMAXPROCS(0).
 func (t Table) Overwrite(ctx context.Context, rdr array.RecordReader, snapshotProps iceberg.Properties, opts ...OverwriteOption) (*Table, error) {
@@ -341,10 +359,19 @@ func (t Table) Overwrite(ctx context.Context, rdr array.RecordReader, snapshotPr
 //   - Files where some rows match and others don't (partial match) are rewritten to keep only non-matching rows
 //   - Files where no rows match the filter are kept unchanged
 //
+// A row matches only if the filter is true for it. Rows where the filter evaluates to NULL, for example
+// `age = 30` on a NULL age, do not match and are kept.
+//
 // The filter uses both inclusive and strict metrics evaluators on file statistics to classify files:
 //   - Inclusive evaluator identifies candidate files that may contain matching rows
 //   - Strict evaluator determines if all rows in a file must match the filter
 //   - Files that pass inclusive but not strict evaluation are rewritten with filtered data
+//
+// On a v3 table, every data file the delete removes or rewrites takes its deletion vector with it.
+// A merge-on-read delete replaces the existing deletion vector of a file it deletes rows from.
+//
+// A commit that removes a deletion vector is not replayed: if another writer commits first,
+// it fails with ErrCommitFailed instead of refreshing and retrying, so reload the table and run the delete again.
 //
 // The concurrency parameter controls the level of parallelism for manifest processing and file rewriting and
 // can be overridden using the WithOverwriteConcurrency option. Defaults to runtime.GOMAXPROCS(0).
@@ -357,14 +384,23 @@ func (t Table) Delete(ctx context.Context, filter iceberg.BooleanExpression, sna
 	return txn.Commit(ctx)
 }
 
-func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile, error] {
-	fs, err := t.fsF(ctx)
-	if err != nil {
-		return func(yield func(iceberg.ManifestFile, error) bool) {
-			yield(nil, err)
-		}
-	}
+func (t Table) manifestSet(ctx context.Context, snapshot Snapshot) (snapshotManifestSet, error) {
+	return t.manifestSetWithFSF(ctx, snapshot, t.fsF)
+}
 
+func (t Table) manifestSetWithFSF(
+	ctx context.Context,
+	snapshot Snapshot,
+	fsF FSysF,
+) (snapshotManifestSet, error) {
+	return t.manifestCache.get(ctx, snapshot, func(loadCtx context.Context) (snapshotManifestSet, error) {
+		return readSnapshotManifestSet(loadCtx, snapshot, fsF)
+	})
+}
+
+// AllManifests returns the manifests referenced by the table's snapshots.
+// Tables without snapshots return an empty sequence without resolving file IO.
+func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile, error] {
 	type list = tblutils.Enumerated[[]iceberg.ManifestFile]
 	snapshots := t.metadata.Snapshots()
 	n := len(snapshots)
@@ -376,6 +412,7 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 	ch := make(chan list, allManifestsWorkerCount(n))
 	workers := allManifestsWorkerCount(n)
 	g, groupCtx := errgroup.WithContext(workCtx)
+	manifestFS := sharedSnapshotManifestFSF(t.fsF)
 
 	for range workers {
 		g.Go(func() error {
@@ -388,10 +425,11 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 						return nil
 					}
 
-					manifests, err := snapshots[i].Manifests(fs)
+					manifestSet, err := t.manifestSetWithFSF(groupCtx, snapshots[i], manifestFS)
 					if err != nil {
 						return err
 					}
+					manifests := manifestSet.borrowAllManifests()
 
 					select {
 					case ch <- list{Index: i, Value: manifests, Last: i == n-1}:
@@ -526,9 +564,8 @@ type commitOpts struct {
 	// in snapshotProducer.commitManifests for the rationale.
 	noReplay bool
 
-	// pinnedRefs names branches with an explicit requirement from
-	// Transaction.AssertRefSnapshotID, whose assertions must not be
-	// rewritten to the fresh branch head between retries (see
+	// pinnedRefs names refs whose assertions guard the commit and must
+	// not be rewritten to the fresh head between retries (see
 	// Transaction.pinnedRefs).
 	pinnedRefs map[string]struct{}
 }
@@ -611,8 +648,11 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		if !cleanupOrphans || len(orphanedManifests) == 0 {
 			return
 		}
+		// The commit may have failed because ctx was canceled; remove the
+		// orphans without that cancellation so they are not left behind.
+		cleanupCtx := context.WithoutCancel(ctx)
 		for _, path := range orphanedManifests {
-			if removeErr := wfs.Remove(path); removeErr != nil {
+			if removeErr := wfs.Remove(cleanupCtx, path); removeErr != nil {
 				log.Printf("Warning: failed to delete orphaned manifest list %s: %v", path, removeErr)
 			}
 		}
@@ -671,7 +711,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 			// never succeed — fail now instead of burning the remaining
 			// retries on it.
 			if err := validatePinnedRefRequirements(reqs, co.pinnedRefs, current); err != nil {
-				return nil, fmt.Errorf("%w: explicit ref requirement failed: %w", ErrCommitFailed, err)
+				return nil, fmt.Errorf("%w: pinned ref requirement failed: %w", ErrCommitFailed, err)
 			}
 			if err := validateBranchRequirement(reqs, co.branch, current); err != nil {
 				return nil, err
@@ -699,9 +739,9 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		// peers (partition-filter overlap, referenced-file removal)
 		// even when the catalog-side AssertRefSnapshotID would accept
 		// them. On attempt 0 base == current → no concurrent
-		// snapshots → validators short-circuit. Real divergence
-		// detection fires on attempts > 0 once `current` is the
-		// post-conflict state.
+		// snapshots → validators that inspect them short-circuit, but
+		// validateDataFilesExist still reads the branch head. Real
+		// divergence detection fires on attempts > 0 once `current` is the post-conflict state.
 		//
 		// Skipped when the branch does not exist on `current` — that
 		// always means "the committer is creating this branch" (e.g.
@@ -804,7 +844,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		}
 	}
 
-	return New(
+	next := New(
 		t.identifier,
 		newMeta,
 		newLoc,
@@ -812,7 +852,13 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		t.cat,
 		withReporterState(t.reporter, t.reporterSet),
 		WithScanPlanningIOProperties(t.scanPlanningIOProps),
-	), nil
+		WithScanPlanningDirective(t.scanPlanningDirective, t.hasScanPlanningDirective),
+		WithLabels(t.labels),
+		WithSavedConfig(t.savedConfig),
+	)
+	next.manifestContentCache = reuseManifestContentCache(t.manifestContentCache, next.manifestContentCache)
+
+	return next, nil
 }
 
 // rewriteRefSnapshotRequirements returns a copy of reqs with every
@@ -831,10 +877,10 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 // deleted underneath us), reqs is returned unchanged — newConflict-
 // Context will surface the divergence on the next pre-flight pass.
 //
-// Assertions on branches in pinned were registered explicitly by the
-// committer (Transaction.AssertRefSnapshotID) for compare-and-swap
-// semantics and are never rewritten: a branch that has changed must
-// fail the commit, not be replayed against the new head.
+// Assertions on refs in pinned guard the commit (an explicit
+// Transaction.AssertRefSnapshotID, a rollback, or snapshot expiry) and
+// are never rewritten: a ref that has changed must fail the commit, not
+// be replayed against the new head.
 func rewriteRefSnapshotRequirements(reqs []Requirement, branch string, fresh Metadata, pinned map[string]struct{}) []Requirement {
 	if branch == "" || fresh == nil {
 		return reqs
@@ -927,11 +973,11 @@ func stagedSnapshotStillValid(snap *Snapshot, fresh Metadata) bool {
 		return true
 	}
 
-	if fresh.Version() >= 2 && snap.SequenceNumber <= fresh.LastSequenceNumber() {
+	if fresh.FormatVersion() >= 2 && snap.SequenceNumber <= fresh.LastSequenceNumber() {
 		return false
 	}
 
-	if fresh.Version() >= 3 && (snap.FirstRowID == nil || *snap.FirstRowID < fresh.NextRowID()) {
+	if fresh.FormatVersion() >= 3 && (snap.FirstRowID == nil || *snap.FirstRowID < fresh.NextRowID()) {
 		return false
 	}
 
@@ -1132,9 +1178,11 @@ func backoffDuration(attempt uint, minMs, maxMs uint64) time.Duration {
 	return time.Duration(wait) * time.Millisecond
 }
 
-// SnapshotAsOf finds the snapshot that was current as of or right before the given timestamp.
-func (t Table) SnapshotAsOf(timestampMs int64, inclusive bool) *Snapshot {
-	entry, ok := snapshotLogEntryAsOf(t.metadata.SnapshotLogs(), timestampMs, inclusive)
+// SnapshotAsOf returns the snapshot that was current at or before timestampMs,
+// measured in milliseconds since the Unix epoch. It returns nil when no
+// snapshot was current at or before that time.
+func (t Table) SnapshotAsOf(timestampMs int64) *Snapshot {
+	entry, ok := SnapshotLogEntryAsOf(t.metadata.SnapshotLogs(), timestampMs, true)
 	if ok {
 		return t.metadata.SnapshotByID(entry.SnapshotID)
 	}
@@ -1168,7 +1216,8 @@ func deleteOldMetadata(fs icebergio.IO, baseMeta, newMeta Metadata) {
 		toRemove := internal.Difference(removedPrevious, currentMetadata)
 
 		for _, file := range toRemove {
-			if err := fs.Remove(file); err != nil {
+			// deleteOldMetadata is best-effort cleanup with no caller context.
+			if err := fs.Remove(context.Background(), file); err != nil {
 				// Log the error instead of raising it when deleting old metadata files, as an external entity like a compactor may have already deleted them
 				log.Printf("Warning: Failed to delete old metadata file: %s error: %v", file, err)
 			}
@@ -1251,7 +1300,9 @@ func WithLimit(n int64) ScanOption {
 }
 
 // WithMaxConcurrency sets the maximum concurrency for table scan and plan
-// operations. When unset it defaults to runtime.GOMAXPROCS.
+// operations. When unset it defaults to runtime.GOMAXPROCS. Above one, a
+// scan holds the decoded batches of up to n tasks at once while it returns
+// them in task order; [Scan.ReadTasks] states the bound.
 func WithMaxConcurrency(n int) ScanOption {
 	if n <= 0 {
 		return noopOption
@@ -1260,14 +1311,6 @@ func WithMaxConcurrency(n int) ScanOption {
 	return func(scan *Scan) {
 		scan.concurrency = n
 	}
-}
-
-// WitMaxConcurrency is a deprecated alias for [WithMaxConcurrency], kept for
-// backward compatibility with the pre-existing typo'd name.
-//
-// Deprecated: use [WithMaxConcurrency].
-func WitMaxConcurrency(n int) ScanOption {
-	return WithMaxConcurrency(n)
 }
 
 func WithOptions(opts iceberg.Properties) ScanOption {
@@ -1304,22 +1347,44 @@ func WithRowLineage() ScanOption {
 	}
 }
 
+// WithArrowBatchSize caps the number of rows decoded per Arrow record
+// batch when reading data files, overriding the table's
+// read.parquet.batch-size property for this scan. Smaller batches bound
+// the memory a scan holds per decoded batch, which matters when the
+// consumer buffers batches (e.g. a compaction's read+write pipeline).
+// The cap is stored on the scan itself rather than in the options map,
+// so it applies regardless of ordering relative to [WithOptions]. A
+// non-positive value is ignored.
+func WithArrowBatchSize(n int) ScanOption {
+	if n <= 0 {
+		return noopOption
+	}
+
+	return func(scan *Scan) {
+		scan.arrowBatchSize = n
+	}
+}
+
 func (t Table) Scan(opts ...ScanOption) *Scan {
+	directive, directiveErr := t.ScanPlanningDirective()
 	s := &Scan{
-		identifier:          slices.Clone(t.identifier),
-		metadata:            t.metadata,
-		metadataLocation:    t.metadataLocation,
-		ioF:                 t.fsF,
-		planner:             t.planner,
-		scanPlanningIOProps: maps.Clone(t.scanPlanningIOProps),
-		// TODO(#1178 Phase 6): resolve scan-planning-mode table properties here.
-		planningMode:   ScanPlanningLocal,
-		rowFilter:      iceberg.AlwaysTrue{},
-		selectedFields: []string{"*"},
-		caseSensitive:  true,
-		limit:          ScanNoLimit,
-		concurrency:    runtime.GOMAXPROCS(0),
-		reporter:       t.MetricsReporter(),
+		identifier:           slices.Clone(t.identifier),
+		metadata:             t.metadata,
+		metadataLocation:     t.metadataLocation,
+		ioF:                  t.fsF,
+		manifestCache:        t.manifestCache,
+		manifestContentCache: t.manifestContentCache,
+		planner:              t.planner,
+		scanPlanningIOProps:  maps.Clone(t.scanPlanningIOProps),
+		directive:            directive,
+		directiveErr:         directiveErr,
+		planningMode:         ScanPlanningLocal,
+		rowFilter:            iceberg.AlwaysTrue{},
+		selectedFields:       []string{"*"},
+		caseSensitive:        true,
+		limit:                ScanNoLimit,
+		concurrency:          runtime.GOMAXPROCS(0),
+		reporter:             t.MetricsReporter(),
 	}
 
 	for _, opt := range opts {
@@ -1352,10 +1417,9 @@ func WithMetricsReporter(r metrics.Reporter) Option {
 	}
 }
 
-// WithScanPlanningIOProperties supplies the table-scoped FileIO properties
-// that a remote scan planner needs when it builds a plan-scoped FileIO. This
-// is intended for catalog implementations whose table-load response carries
-// FileIO configuration separately from table metadata properties.
+// WithScanPlanningIOProperties supplies FileIO/catalog properties for
+// manifest content caching and remote scan planning. These can include
+// settings returned separately from table metadata by a REST catalog.
 func WithScanPlanningIOProperties(props iceberg.Properties) Option {
 	if props == nil {
 		return noopTableOption
@@ -1363,6 +1427,33 @@ func WithScanPlanningIOProperties(props iceberg.Properties) Option {
 
 	return func(t *Table) {
 		t.scanPlanningIOProps = maps.Clone(props)
+	}
+}
+
+// WithLabels attaches catalog-provided labels from a load response to the
+// table. A nil value is ignored, leaving the table's labels nil.
+func WithLabels(l *iceberg.Labels) Option {
+	if l == nil {
+		return noopTableOption
+	}
+
+	return func(t *Table) {
+		t.labels = l
+	}
+}
+
+// WithSavedConfig supplies a set of properties used to create a *Table
+// instance. This saved config is exposed through table.SavedConfig() and
+// can be used by callers to save properties along with a table instance, for
+// reuse later if the table instance were to be cloned in a new call to
+// table.New.
+func WithSavedConfig(config iceberg.Properties) Option {
+	if config == nil {
+		return noopTableOption
+	}
+
+	return func(t *Table) {
+		t.savedConfig = maps.Clone(config)
 	}
 }
 
@@ -1398,6 +1489,7 @@ func New(ident Identifier, meta Metadata, metadataLocation string, fsF FSysF, ca
 		metadata:         meta,
 		metadataLocation: metadataLocation,
 		fsF:              fsF,
+		manifestCache:    newSnapshotManifestCacheForMetadata(meta),
 		cat:              cat,
 		planner:          planner,
 		reporter:         metrics.NopReporter{},
@@ -1405,6 +1497,14 @@ func New(ident Identifier, meta Metadata, metadataLocation string, fsF FSysF, ca
 	for _, opt := range opts {
 		opt(t)
 	}
+	// FileIO/catalog settings are the default. Per-table saved settings
+	// (including REST LoadTable overrides) take precedence when supplied.
+	cacheConfig := t.savedConfig
+	if len(t.scanPlanningIOProps) > 0 {
+		cacheConfig = maps.Clone(t.scanPlanningIOProps)
+		maps.Copy(cacheConfig, t.savedConfig)
+	}
+	t.manifestContentCache = newManifestContentCacheForConfig(cacheConfig)
 
 	return t
 }
@@ -1446,7 +1546,7 @@ func NewFromLocation(
 			return nil, err
 		}
 	} else {
-		f, err := fsys.Open(metalocation)
+		f, err := fsys.Open(ctx, metalocation)
 		if err != nil {
 			return nil, err
 		}

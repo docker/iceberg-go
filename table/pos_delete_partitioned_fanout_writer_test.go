@@ -477,9 +477,9 @@ func TestPositionDeletePartitionedFanoutWriterEarlyStopCancelsRecordProduction(t
 	require.Zero(t, mem.CurrentAlloc())
 }
 
+// Not parallel: runtime.NumGoroutine counts every goroutine in the test binary,
+// so goroutines started by concurrently running tests would count as leaks.
 func TestPositionDeletePartitionedNoGoroutineLeak(t *testing.T) {
-	t.Parallel()
-
 	partitionSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
 		SourceIDs: []int{2},
 		Name:      "age_bucket",
@@ -541,9 +541,11 @@ func TestPositionDeletePartitionedNoGoroutineLeak(t *testing.T) {
 	after := runtime.NumGoroutine()
 
 	// Before the fix, each iteration leaked a goroutine from iter.Pull(args.counter)
-	// being called unconditionally but stopCount never invoked in the partitioned path.
-	// Allow a small margin for background runtime goroutines.
-	assert.LessOrEqual(t, after, before+5,
+	// being called unconditionally but stopCount never invoked in the partitioned path,
+	// so a regression grows the count by about one per iteration. Goroutines left by
+	// earlier tests can still start or exit in between, so only fail on growth that
+	// scales with the iteration count.
+	assert.Less(t, after-before, iterations/2,
 		"expected no goroutine growth after %d iterations, got %d -> %d (delta: %d)",
 		iterations, before, after, after-before)
 }
@@ -735,10 +737,6 @@ func (m *dataFileMatcher) Format(val iceberg.DataFile) string {
 
 // defaultPositionDeleteMatching is a convenience preset for the options we want to match for position delete matching
 var defaultPositionDeleteMatching = []dataFileMatcherOption{withContentTypeMatching(), withColumnSizesMatching(), withCountMatching(), withFileFormatMatching(), withSpecIDMatching(), withPartitionMatching(), withCountMatching(), withSortOrderIDMatching()}
-
-// ptr returns a pointer to v. A generic stand-in for the various one-off
-// ptr-helpers previously sprinkled across the internal package tests.
-func ptr[T any](v T) *T { return &v }
 
 // Position deletes are ordered by (file_path, pos), never by a table sort
 // order, so their sort order id stays null.

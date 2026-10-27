@@ -119,12 +119,12 @@ func clusteredPartitionedWrite(
 					return err
 				}
 				if completedPartitions.contains(part.partitionRec) {
-					partitionPath := spec.PartitionToPath(part.partitionRec, schema)
+					partitionPath := extractionPlan.pathPlan.format(part.partitionRec)
 
 					return fmt.Errorf("clustered write: incoming records violate the clustering assumption; "+
 						"partition %q has records arriving after its writer was already closed", partitionPath)
 				}
-				partitionPath := spec.PartitionToPath(part.partitionRec, schema)
+				partitionPath := extractionPlan.pathPlan.format(part.partitionRec)
 				currentWriter = factory.newRollingDataWriter(
 					ctx, partitionPath, part.partitionValues, outputCh)
 				currentRec = part.partitionRec
@@ -217,7 +217,7 @@ func clusteredPartitionedWrite(
 // tree keyed on each partition field's value, mirroring the layout of
 // partitionMapNode. Go's any-equality at each level distinguishes SQL
 // NULL from the literal string "null" — the same property that
-// PartitionToPath drops via Transform.ToHumanStr.
+// PartitionToPath drops via Transform.ToHumanString.
 type closedPartitionSet map[any]closedPartitionSet
 
 func (s closedPartitionSet) add(rec partitionRecord) {

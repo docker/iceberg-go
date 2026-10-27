@@ -70,7 +70,7 @@ import (
 
 awsCfg, err := config.LoadDefaultConfig(context.TODO())
 // handle err
-cat := glue.NewCatalog(glue.WithAwsConfig(awsCfg))
+cat := glue.NewCatalog(glue.WithAWSConfig(awsCfg))
 ```
 
 #### Hive
@@ -92,9 +92,10 @@ cat, err := hive.NewCatalog(iceberg.Properties{},
 import (
     "github.com/apache/iceberg-go"
     "github.com/apache/iceberg-go/catalog/hadoop"
+    "context"
 )
 
-cat, err := hadoop.NewCatalog("default", "file:///tmp/warehouse", iceberg.Properties{})
+cat, err := hadoop.NewCatalog(context.Background(), "default", "file:///tmp/warehouse", iceberg.Properties{})
 ```
 
 #### Via the registry
@@ -112,7 +113,12 @@ cat, err := catalog.Load(ctx, "default", iceberg.Properties{
     "uri":       "http://localhost:8181",
     "warehouse": "s3://my-bucket/warehouse",
 })
+if err != nil { panic(err) }
+defer cat.Close()
 ```
+
+Every catalog implements `Close() error`. Close it when done to release catalog-owned
+resources. A caller-supplied database connection remains caller-owned.
 
 ### Namespaces
 
@@ -348,7 +354,7 @@ When you already have data files (e.g. produced by another writer), register the
 
 ```go
 txn := tbl.NewTransaction()
-err := txn.AddFiles(ctx, []string{
+err := txn.AddDataFilesByPath(ctx, []string{
     "s3://my-bucket/sales/orders/data/file-1.parquet",
     "s3://my-bucket/sales/orders/data/file-2.parquet",
 }, nil /* snapshot props */, false /* ignoreDuplicates */)
@@ -357,7 +363,7 @@ if err != nil { /* ... */ }
 newTbl, err := txn.Commit(ctx)
 ```
 
-`ReplaceDataFiles(ctx, filesToDelete, filesToAdd, snapshotProps)` and `ReplaceDataFilesWithDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)` are also available on `*Transaction` for swapping files atomically.
+`ReplaceDataFilesByPath(ctx, filesToDelete, filesToAdd, snapshotProps)` and `ReplaceDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)` are also available on `*Transaction` for swapping files atomically.
 
 ### Transactions
 
@@ -383,7 +389,8 @@ newTbl, err := txn.Commit(ctx)
 To target a specific branch:
 
 ```go
-txn := tbl.NewTransactionOnBranch("staging")
+txn, err := tbl.NewTransactionOnBranch("staging")
+if err != nil { /* ... */ }
 ```
 
 `Commit` retries automatically on conflict (`ErrCommitFailed`) - tune via the `commit.retry.*` table properties.
@@ -484,19 +491,19 @@ Tune retention with the `history.expire.min-snapshots-to-keep`, `history.expire.
 import (
     "time"
 
-    "github.com/apache/iceberg-go/table"
+    "github.com/apache/iceberg-go/table/maintenance"
 )
 
-result, err := tbl.DeleteOrphanFiles(ctx,
-    table.WithFilesOlderThan(72*time.Hour),
-    table.WithDryRun(false),
-    table.WithCleanupMaxConcurrency(8),
+result, err := maintenance.DeleteOrphanFiles(ctx, tbl,
+    maintenance.WithCleanupFilesOlderThan(72*time.Hour),
+    maintenance.WithCleanupDryRun(false),
+    maintenance.WithCleanupMaxConcurrency(8),
 )
 if err != nil { /* ... */ }
 fmt.Printf("removed %d files\n", len(result.DeletedFiles))
 ```
 
-Also see `table.WithLocation`, `table.WithDeleteFunc`, `table.WithPrefixMismatchMode`, `table.WithEqualSchemes`, and `table.WithEqualAuthorities` in `table/orphan_cleanup.go`.
+Also see `maintenance.WithCleanupLocation`, `maintenance.WithCleanupDeleteFunc`, `maintenance.WithPrefixMismatchMode`, `maintenance.WithEqualSchemes`, and `maintenance.WithEqualAuthorities` in `table/maintenance/orphan_cleanup.go`.
 
 ### Compaction (rewrite data files)
 
@@ -513,6 +520,8 @@ fmt.Printf("rewrote %d files into %d (%d -> %d bytes)\n",
 ```
 
 The `table/compaction` subpackage provides bin-packing planning. The `iceberg compact analyze` and `compact run` CLI commands wrap the same machinery - see [CLI](./cli.md).
+
+Compaction tasks represent complete data files, not independent scan splits. The planner collapses split tasks for the same file into one whole-file task, rejecting inconsistent delete or lineage metadata and dropping residual filters because they select files but do not filter rows during compaction. Direct calls to `ExecuteCompactionGroup` reject partial ranges and residual row filters. Attached delete files are still applied when rewriting each source file.
 
 ### Expiring snapshots
 
@@ -548,7 +557,7 @@ v, err := view.CreateView(
     "my-catalog",
     table.Identifier{"analytics", "monthly_orders"},
     schema,
-    "SELECT month, sum(amount) FROM orders GROUP BY month",
+    view.Representation{SQL: "SELECT month, sum(amount) FROM orders GROUP BY month", Dialect: "spark"},
     table.Identifier{"sales"},                      // default namespace for unqualified names
     "s3://my-bucket/views/monthly_orders",
     iceberg.Properties{},
@@ -589,7 +598,7 @@ When iceberg-go converts an Iceberg schema to Arrow (e.g. for the scanner output
 | `struct<...>` | `arrow.StructOf(...)` |
 | `list<E>` | `arrow.ListOf(E)` (or `LargeListOf` if `useLargeTypes`) |
 | `map<K, V>` | `arrow.MapOf(K, V)` |
-| `variant` | `arrow.ExtensionType` for Variant |
+| `variant` | `arrow.ExtensionType` for Variant (see [Variant Type](./variant.md)) |
 
 Helpers in [`table/arrow_utils.go`](https://github.com/apache/iceberg-go/blob/main/table/arrow_utils.go):
 

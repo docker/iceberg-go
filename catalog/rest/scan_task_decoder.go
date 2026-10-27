@@ -24,7 +24,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
@@ -118,6 +121,62 @@ func DecodeScanTasks(
 	schema *iceberg.Schema,
 	fallbackResidual iceberg.BooleanExpression,
 ) ([]table.FileScanTask, error) {
+	return decodeScanTasks(wire, metadata, schema, fallbackResidual, newPartitionDecodePlanCache())
+}
+
+// deriveDeletionVectorOwners identifies a unique data-file path for unowned
+// Puffin deletion vectors. A conflicting owner stays unresolved so the normal
+// task validation can report the conflict in its original order.
+func deriveDeletionVectorOwners(wire ScanTasks) []string {
+	hasDerivedDV := false
+	for _, del := range wire.DeleteFiles {
+		if del.ReferencedDataFile == nil &&
+			strings.EqualFold(del.FileFormat, string(iceberg.PuffinFile)) {
+			hasDerivedDV = true
+
+			break
+		}
+	}
+	if !hasDerivedDV {
+		return nil
+	}
+
+	owners := make([]string, len(wire.DeleteFiles))
+	conflicts := make([]bool, len(wire.DeleteFiles))
+	for _, task := range wire.FileScanTasks {
+		if task.DataFile == nil || task.DataFile.FilePath == "" {
+			continue
+		}
+		path := task.DataFile.FilePath
+		for _, ref := range task.DeleteFileReferences {
+			// Leave malformed references for the regular validation pass.
+			if ref < 0 || ref >= len(wire.DeleteFiles) || conflicts[ref] {
+				continue
+			}
+			del := &wire.DeleteFiles[ref]
+			if del.ReferencedDataFile != nil ||
+				!strings.EqualFold(del.FileFormat, string(iceberg.PuffinFile)) {
+				continue
+			}
+			if owners[ref] == "" {
+				owners[ref] = path
+			} else if owners[ref] != path {
+				owners[ref] = ""
+				conflicts[ref] = true
+			}
+		}
+	}
+
+	return owners
+}
+
+func decodeScanTasks(
+	wire ScanTasks,
+	metadata table.ScanPlanningMetadata,
+	schema *iceberg.Schema,
+	fallbackResidual iceberg.BooleanExpression,
+	plans *partitionDecodePlanCache,
+) ([]table.FileScanTask, error) {
 	if metadata == nil {
 		return nil, fmt.Errorf("%w: decoding scan tasks: table metadata is required", ErrRESTError)
 	}
@@ -135,11 +194,19 @@ func DecodeScanTasks(
 		return nil, nil
 	}
 
+	// Resolve unique owners first so unowned deletion vectors are built once,
+	// even when multiple scan tasks reference the same vector.
+	derivedDVOwners := deriveDeletionVectorOwners(wire)
+
 	// Decode every delete before resolving references. This validates all wire
 	// entries, including an unreferenced entry that will be rejected below.
 	deletes := make([]iceberg.DataFile, len(wire.DeleteFiles))
 	for i := range wire.DeleteFiles {
-		decoded, err := decodeRESTDeleteFile(wire.DeleteFiles[i], metadata, "")
+		owner := ""
+		if derivedDVOwners != nil {
+			owner = derivedDVOwners[i]
+		}
+		decoded, err := decodeRESTDeleteFile(wire.DeleteFiles[i], metadata, owner, plans)
 		if err != nil {
 			return nil, fmt.Errorf("%w: decoding scan tasks: delete-files[%d]: %w", ErrRESTError, i, err)
 		}
@@ -148,19 +215,20 @@ func DecodeScanTasks(
 
 	out := make([]table.FileScanTask, 0, len(wire.FileScanTasks))
 	dvOwners := make(map[int]string)
-	referencedDeletes := make([]bool, len(deletes))
+	deleteRefTaskIDs := make([]int, len(deletes))
+	var residuals taskResidualDecoder
 	for i := range wire.FileScanTasks {
 		wireTask := wire.FileScanTasks[i]
 		if wireTask.DataFile == nil {
 			return nil, fmt.Errorf("%w: decoding scan tasks: file-scan-tasks[%d] is missing data-file", ErrRESTError, i)
 		}
 
-		dataFile, err := decodeRESTDataFile(*wireTask.DataFile, metadata)
+		dataFile, err := decodeRESTDataFile(*wireTask.DataFile, metadata, plans)
 		if err != nil {
 			return nil, fmt.Errorf("%w: decoding scan tasks: file-scan-tasks[%d].data-file: %w", ErrRESTError, i, err)
 		}
 
-		residual, err := decodeTaskResidual(wireTask.ResidualFilter, schema, fallbackResidual)
+		residual, err := residuals.decode(wireTask.ResidualFilter, schema, fallbackResidual)
 		if err != nil {
 			return nil, fmt.Errorf("%w: decoding scan tasks: file-scan-tasks[%d].residual-filter: %w", ErrRESTError, i, err)
 		}
@@ -175,20 +243,20 @@ func DecodeScanTasks(
 		// The REST FileScanTask schema does not carry manifest data sequence
 		// numbers, so DataSequenceNumber intentionally remains nil.
 
-		seenRefs := make(map[int]struct{}, len(wireTask.DeleteFileReferences))
+		// Use one-based task IDs so zero remains the unreferenced marker.
+		taskID := i + 1
 		for j, ref := range wireTask.DeleteFileReferences {
 			if ref < 0 || ref >= len(deletes) {
 				return nil, fmt.Errorf(
 					"%w: decoding scan tasks: file-scan-tasks[%d].delete-file-references[%d] is %d, want 0 <= index < %d",
 					ErrRESTError, i, j, ref, len(deletes))
 			}
-			if _, ok := seenRefs[ref]; ok {
+			if deleteRefTaskIDs[ref] == taskID {
 				return nil, fmt.Errorf(
 					"%w: decoding scan tasks: file-scan-tasks[%d] repeats delete-file reference %d",
 					ErrRESTError, i, ref)
 			}
-			seenRefs[ref] = struct{}{}
-			referencedDeletes[ref] = true
+			deleteRefTaskIDs[ref] = taskID
 
 			wireDelete := wire.DeleteFiles[ref]
 			if wireDelete.ReferencedDataFile != nil && *wireDelete.ReferencedDataFile != dataFile.FilePath() {
@@ -207,8 +275,11 @@ func DecodeScanTasks(
 				dvOwners[ref] = dataFile.FilePath()
 				// Derive referenced-data-file from the FileScanTask association
 				// when the server omits Java's optional extension field.
-				if wireDelete.ReferencedDataFile == nil {
-					deleteFile, err = decodeRESTDeleteFile(wireDelete, metadata, dataFile.FilePath())
+				if wireDelete.ReferencedDataFile == nil &&
+					(derivedDVOwners == nil || derivedDVOwners[ref] != dataFile.FilePath()) {
+					// Conflicting or missing owners fall back to the original
+					// per-reference decoder, preserving the validation path.
+					deleteFile, err = decodeRESTDeleteFile(wireDelete, metadata, dataFile.FilePath(), plans)
 					if err != nil {
 						return nil, fmt.Errorf("%w: decoding scan tasks: delete-files[%d]: %w", ErrRESTError, ref, err)
 					}
@@ -232,8 +303,8 @@ func DecodeScanTasks(
 		out = append(out, task)
 	}
 
-	for i, referenced := range referencedDeletes {
-		if !referenced {
+	for i, taskID := range deleteRefTaskIDs {
+		if taskID == 0 {
 			return nil, fmt.Errorf(
 				"%w: decoding scan tasks: delete-files[%d] is not referenced by any file scan task",
 				ErrRESTError, i)
@@ -243,8 +314,12 @@ func DecodeScanTasks(
 	return out, nil
 }
 
-func decodeRESTDataFile(wire RESTDataFile, metadata table.ScanPlanningMetadata) (iceberg.DataFile, error) {
-	builder, _, err := contentFileBuilder(wire.RESTContentFile, iceberg.EntryContentData, metadata)
+func decodeRESTDataFile(
+	wire RESTDataFile,
+	metadata table.ScanPlanningMetadata,
+	plans *partitionDecodePlanCache,
+) (iceberg.DataFile, error) {
+	builder, _, err := contentFileBuilder(wire.RESTContentFile, iceberg.EntryContentData, metadata, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -306,13 +381,14 @@ func decodeRESTDeleteFile(
 	wire RESTDeleteFile,
 	metadata table.ScanPlanningMetadata,
 	referencedDataFile string,
+	plans *partitionDecodePlanCache,
 ) (iceberg.DataFile, error) {
 	content, ok := parseRESTFileContent(wire.Content)
 	if !ok || content == iceberg.EntryContentData {
 		return nil, fmt.Errorf("unknown delete content %q", wire.Content)
 	}
 
-	builder, format, err := contentFileBuilder(wire.RESTContentFile, content, metadata)
+	builder, format, err := contentFileBuilder(wire.RESTContentFile, content, metadata, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +459,7 @@ func contentFileBuilder(
 	wire RESTContentFile,
 	expectedContent iceberg.ManifestEntryContent,
 	metadata table.ScanPlanningMetadata,
+	plans *partitionDecodePlanCache,
 ) (*iceberg.DataFileBuilder, iceberg.FileFormat, error) {
 	actualContent, ok := parseRESTFileContent(wire.Content)
 	wantContent := map[iceberg.ManifestEntryContent]string{
@@ -400,11 +477,11 @@ func contentFileBuilder(
 		return nil, "", fmt.Errorf("file-size-in-bytes must be non-negative: %d", wire.FileSizeInBytes)
 	}
 
-	spec := metadata.PartitionSpecByID(wire.SpecID)
-	if spec == nil {
-		return nil, "", fmt.Errorf("unknown partition spec ID %d", wire.SpecID)
+	plan, err := plans.planFor(wire.SpecID, metadata)
+	if err != nil {
+		return nil, "", err
 	}
-	partition, logicalTypes, fixedSizes, err := decodePartition(wire.Partition, spec, metadata)
+	partition, logicalTypes, err := decodePartition(wire.Partition, plan)
 	if err != nil {
 		return nil, "", err
 	}
@@ -414,13 +491,13 @@ func contentFileBuilder(
 		return nil, "", err
 	}
 	builder, err := iceberg.NewDataFileBuilder(
-		*spec,
+		*plan.spec,
 		expectedContent,
 		wire.FilePath,
 		format,
 		partition,
 		logicalTypes,
-		fixedSizes,
+		nil,
 		wire.RecordCount,
 		wire.FileSizeInBytes,
 	)
@@ -469,43 +546,120 @@ func parseRESTFileContent(value string) (iceberg.ManifestEntryContent, bool) {
 	}
 }
 
+// partitionDecodePlanCache is scoped to one remote scan operation. Metadata is
+// immutable for the operation, so plans can safely retain resolved types and
+// the partition spec while decoded values remain per-file allocations.
+type partitionDecodePlanCache struct {
+	plans map[int]*partitionDecodePlan
+}
+
+type partitionDecodePlan struct {
+	spec   *iceberg.PartitionSpec
+	fields []partitionDecodeField
+}
+
+type partitionDecodeField struct {
+	fieldID         int
+	fieldName       string
+	sourceID        int
+	sourceTypeFound bool
+	resultType      iceberg.Type
+	logicalType     string
+}
+
+func newPartitionDecodePlanCache() *partitionDecodePlanCache {
+	return &partitionDecodePlanCache{plans: make(map[int]*partitionDecodePlan)}
+}
+
+func (c *partitionDecodePlanCache) planFor(
+	specID int,
+	metadata table.ScanPlanningMetadata,
+) (*partitionDecodePlan, error) {
+	if plan, ok := c.plans[specID]; ok {
+		return plan, nil
+	}
+
+	spec := metadata.PartitionSpecByID(specID)
+	if spec == nil {
+		return nil, fmt.Errorf("unknown partition spec ID %d", specID)
+	}
+
+	plan, err := newPartitionDecodePlan(spec, metadata)
+	if err != nil {
+		return nil, err
+	}
+	c.plans[specID] = plan
+
+	return plan, nil
+}
+
+func newPartitionDecodePlan(spec *iceberg.PartitionSpec, metadata table.ScanPlanningMetadata) (*partitionDecodePlan, error) {
+	plan := &partitionDecodePlan{
+		spec:   spec,
+		fields: make([]partitionDecodeField, spec.NumFields()),
+	}
+	for i, field := range spec.Fields() {
+		transform := reflect.ValueOf(field.Transform)
+		if !transform.IsValid() || (transform.Kind() == reflect.Pointer && transform.IsNil()) {
+			return nil, fmt.Errorf("%w: partition field %q (ID %d) has no transform",
+				iceberg.ErrInvalidTransform, field.Name, field.FieldID)
+		}
+
+		fieldPlan := partitionDecodeField{
+			fieldID:   field.FieldID,
+			fieldName: field.Name,
+			sourceID:  field.FirstSourceID(),
+		}
+		sourceType, ok := findFieldType(fieldPlan.sourceID, metadata)
+		fieldPlan.sourceTypeFound = ok
+		if ok {
+			fieldPlan.resultType = field.Transform.ResultType(sourceType)
+			fieldPlan.logicalType = partitionLogicalType(fieldPlan.resultType)
+		}
+		plan.fields[i] = fieldPlan
+	}
+
+	return plan, nil
+}
+
 func decodePartition(
 	values []json.RawMessage,
-	spec *iceberg.PartitionSpec,
-	metadata table.ScanPlanningMetadata,
-) (map[int]any, map[int]string, map[int]int, error) {
-	if len(values) != spec.NumFields() {
-		return nil, nil, nil, fmt.Errorf(
-			"partition for spec ID %d has %d values, want %d", spec.ID(), len(values), spec.NumFields())
+	plan *partitionDecodePlan,
+) (map[int]any, map[int]string, error) {
+	if len(values) != len(plan.fields) {
+		return nil, nil, fmt.Errorf(
+			"partition for spec ID %d has %d values, want %d", plan.spec.ID(), len(values), len(plan.fields))
 	}
 
 	partition := make(map[int]any, len(values))
-	logicalTypes := make(map[int]string)
-	fixedSizes := make(map[int]int)
-	for i, field := range spec.Fields() {
+	var logicalTypes map[int]string
+	for i, field := range plan.fields {
 		raw := values[i]
 		if isJSONNull(raw) {
-			partition[field.FieldID] = nil
+			partition[field.fieldID] = nil
 
 			continue
 		}
 
-		sourceType, ok := findFieldType(field.SourceID(), metadata)
-		if !ok {
-			return nil, nil, nil, fmt.Errorf(
+		if !field.sourceTypeFound {
+			return nil, nil, fmt.Errorf(
 				"partition field %q (ID %d) has unknown source field ID %d",
-				field.Name, field.FieldID, field.SourceID())
+				field.fieldName, field.fieldID, field.sourceID)
 		}
-		resultType := field.Transform.ResultType(sourceType)
-		literal, err := decodePartitionLiteral(raw, resultType)
+		literal, err := decodePartitionLiteral(raw, field.resultType)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("partition[%d] for field %q: %w", i, field.Name, err)
+			return nil, nil, fmt.Errorf("partition[%d] for field %q: %w", i, field.fieldName, err)
 		}
-		partition[field.FieldID] = literal.Any()
-		setPartitionLogicalType(field.FieldID, resultType, logicalTypes, fixedSizes)
+		partition[field.fieldID] = literal.Any()
+		if field.logicalType != "" {
+			if logicalTypes == nil {
+				logicalTypes = make(map[int]string)
+			}
+			logicalTypes[field.fieldID] = field.logicalType
+		}
 	}
 
-	return partition, logicalTypes, fixedSizes, nil
+	return partition, logicalTypes, nil
 }
 
 func findFieldType(fieldID int, metadata table.ScanPlanningMetadata) (iceberg.Type, bool) {
@@ -526,22 +680,23 @@ func findFieldType(fieldID int, metadata table.ScanPlanningMetadata) (iceberg.Ty
 	return nil, false
 }
 
-func setPartitionLogicalType(fieldID int, typ iceberg.Type, logicalTypes map[int]string, fixedSizes map[int]int) {
-	switch typ := typ.(type) {
+func partitionLogicalType(typ iceberg.Type) string {
+	switch typ.(type) {
 	case iceberg.DateType:
-		logicalTypes[fieldID] = atype.Date
+		return atype.Date
 	case iceberg.TimeType:
-		logicalTypes[fieldID] = atype.TimeMicros
+		return atype.TimeMicros
 	case iceberg.TimestampType, iceberg.TimestampTzType:
-		logicalTypes[fieldID] = atype.TimestampMicros
+		return atype.TimestampMicros
 	case iceberg.TimestampNsType, iceberg.TimestampTzNsType:
-		logicalTypes[fieldID] = atype.TimestampNanos
+		return atype.TimestampNanos
 	case iceberg.DecimalType:
-		logicalTypes[fieldID] = atype.Decimal
-		fixedSizes[fieldID] = typ.Scale()
+		return atype.Decimal
 	case iceberg.UUIDType:
-		logicalTypes[fieldID] = atype.UUID
+		return atype.UUID
 	}
+
+	return ""
 }
 
 func decodeCountMap(name string, wire *RESTCountMap) (map[int]int64, error) {
@@ -665,13 +820,18 @@ func decodePartitionLiteral(raw json.RawMessage, typ iceberg.Type) (iceberg.Lite
 }
 
 func decodeJSONInteger(raw json.RawMessage, bitSize int) (int64, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var value json.Number
-	if err := dec.Decode(&value); err != nil {
-		return 0, fmt.Errorf("invalid integer value: %w", err)
+	value := bytes.Trim(raw, " \t\r\n")
+	if !json.Valid(value) {
+		return 0, fmt.Errorf("invalid integer value: invalid JSON number %q", raw)
 	}
-	parsed, err := value.Int64()
+	if len(value) > 0 && value[0] == '"' {
+		var number json.Number
+		if err := json.Unmarshal(value, &number); err != nil {
+			return 0, fmt.Errorf("invalid integer value: %w", err)
+		}
+		value = []byte(number)
+	}
+	parsed, err := strconv.ParseInt(string(value), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid integer value %q: %w", value, err)
 	}
@@ -683,13 +843,18 @@ func decodeJSONInteger(raw json.RawMessage, bitSize int) (int64, error) {
 }
 
 func decodeJSONFloat(raw json.RawMessage, bitSize int) (float64, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var value json.Number
-	if err := dec.Decode(&value); err != nil {
-		return 0, fmt.Errorf("invalid floating-point value: %w", err)
+	value := bytes.Trim(raw, " \t\r\n")
+	if !json.Valid(value) {
+		return 0, fmt.Errorf("invalid floating-point value: invalid JSON number %q", raw)
 	}
-	parsed, err := value.Float64()
+	if len(value) > 0 && value[0] == '"' {
+		var number json.Number
+		if err := json.Unmarshal(value, &number); err != nil {
+			return 0, fmt.Errorf("invalid floating-point value: %w", err)
+		}
+		value = []byte(number)
+	}
+	parsed, err := strconv.ParseFloat(string(value), 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid floating-point value %q: %w", value, err)
 	}
@@ -701,6 +866,38 @@ func decodeJSONFloat(raw json.RawMessage, bitSize int) (float64, error) {
 	}
 
 	return parsed, nil
+}
+
+// taskResidualDecoder avoids reparsing an identical residual for adjacent scan
+// tasks. It is local to one envelope: no global cache or retained task JSON.
+type taskResidualDecoder struct {
+	lastRaw   json.RawMessage
+	lastValue iceberg.BooleanExpression
+}
+
+func (d *taskResidualDecoder) decode(
+	raw json.RawMessage,
+	schema *iceberg.Schema,
+	fallback iceberg.BooleanExpression,
+) (iceberg.BooleanExpression, error) {
+	// Most scans omit per-task residuals. Preserve that zero-allocation
+	// fallback and do not retain a cached expression across missing filters.
+	if len(raw) == 0 {
+		d.lastRaw, d.lastValue = nil, nil
+
+		return fallback, nil
+	}
+	if len(d.lastRaw) > 0 && bytes.Equal(raw, d.lastRaw) {
+		return d.lastValue, nil
+	}
+
+	value, err := decodeTaskResidual(raw, schema, fallback)
+	if err != nil {
+		return nil, err
+	}
+	d.lastRaw, d.lastValue = raw, value
+
+	return value, nil
 }
 
 func decodeTaskResidual(

@@ -50,9 +50,9 @@ type failAfterGoodCloseFS struct {
 	goodClosedOnce sync.Once
 }
 
-func (f *failAfterGoodCloseFS) Open(name string) (iceio.File, error) {
+func (f *failAfterGoodCloseFS) Open(_ context.Context, name string) (iceio.File, error) {
 	if name == f.goodPath {
-		file, err := f.MemFS.Open(name)
+		file, err := f.MemFS.Open(context.Background(), name)
 		if err != nil {
 			return nil, err
 		}
@@ -79,7 +79,7 @@ func (f *failAfterGoodCloseFS) Open(name string) (iceio.File, error) {
 		return nil, &iofs.PathError{Op: "open", Path: name, Err: iofs.ErrNotExist}
 	}
 
-	return f.MemFS.Open(name)
+	return f.MemFS.Open(context.Background(), name)
 }
 
 type closeSignalFile struct {
@@ -149,7 +149,7 @@ func TestArrowScanSnapshotsInvariants(t *testing.T) {
 	assert.Equal(t, 1, metadata.nameMappingCalls)
 }
 
-func TestArrowScanAddTaskProjectedFieldIDsSkipsNilResiduals(t *testing.T) {
+func TestArrowScanAddTaskProjectedFieldIDsUsesTaskResiduals(t *testing.T) {
 	schema := iceberg.NewSchema(1,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
 		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String},
@@ -162,9 +162,9 @@ func TestArrowScanAddTaskProjectedFieldIDsSkipsNilResiduals(t *testing.T) {
 		scanSchema:     schema,
 		boundRowFilter: boundFilter,
 	}
-	invariants := &arrowScanInvariants{projectedIDs: set[int]{1: {}}}
+	invariants := &arrowScanInvariants{projectedIDs: set[int]{}}
 	tasks := []FileScanTask{
-		{},
+		{Residual: iceberg.AlwaysTrue{}},
 		{Residual: iceberg.EqualTo(iceberg.Reference("data"), "value")},
 		{},
 	}
@@ -172,6 +172,37 @@ func TestArrowScanAddTaskProjectedFieldIDsSkipsNilResiduals(t *testing.T) {
 	err = scanner.addTaskProjectedFieldIDs(invariants, tasks)
 	require.NoError(t, err)
 	assert.Equal(t, set[int]{1: {}, 2: {}}, invariants.projectedIDs)
+}
+
+func TestArrowScanInvariantsStartWithRequestedFields(t *testing.T) {
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String},
+	)
+	projected, err := schema.Select(true, "data")
+	require.NoError(t, err)
+	metadata, err := NewMetadata(
+		schema, iceberg.UnpartitionedSpec, UnsortedSortOrder, "mem://test/table", iceberg.Properties{},
+	)
+	require.NoError(t, err)
+
+	boundFilter, err := iceberg.BindExpr(schema,
+		iceberg.EqualTo(iceberg.Reference("id"), int64(1)), true)
+	require.NoError(t, err)
+
+	scanner := &arrowScan{
+		metadata:        metadata,
+		scanSchema:      schema,
+		projectedSchema: projected,
+		boundRowFilter:  boundFilter,
+	}
+	invariants, err := scanner.scanInvariants(metadata.Properties())
+	require.NoError(t, err)
+	assert.Equal(t, set[int]{2: {}}, invariants.projectedIDs)
+
+	err = scanner.addTaskProjectedFieldIDs(invariants, []FileScanTask{{Residual: iceberg.AlwaysTrue{}}})
+	require.NoError(t, err)
+	assert.Equal(t, set[int]{2: {}}, invariants.projectedIDs)
 }
 
 func TestEnrichRecordsWithPosDeleteFields(t *testing.T) {
@@ -274,18 +305,29 @@ func mustLoadRecordBatchFromJSON(schema *arrow.Schema, content string) arrow.Rec
 
 func writePosDeleteParquetToMemFS(t *testing.T, memFS *iceio.MemFS, path, content string) {
 	t.Helper()
+	writePosDeleteParquetToMemFSWithSchema(t, memFS, path, PositionalDeleteArrowSchema, content)
+}
 
-	rec := mustLoadRecordBatchFromJSON(PositionalDeleteArrowSchema, content)
+func writePosDeleteParquetToMemFSWithSchema(t *testing.T, memFS *iceio.MemFS, path string,
+	schema *arrow.Schema, content string, props ...parquet.WriterProperty,
+) {
+	t.Helper()
+
+	rec := mustLoadRecordBatchFromJSON(schema, content)
 	defer rec.Release()
 
-	tbl := array.NewTableFromRecords(PositionalDeleteArrowSchema, []arrow.RecordBatch{rec})
+	tbl := array.NewTableFromRecords(schema, []arrow.RecordBatch{rec})
 	defer tbl.Release()
 
 	fw, err := memFS.Create(path)
 	require.NoError(t, err)
 
+	props = append([]parquet.WriterProperty{
+		parquet.WithDictionaryDefault(true),
+		parquet.WithStats(true),
+	}, props...)
 	require.NoError(t, pqarrow.WriteTable(tbl, fw, rec.NumRows(),
-		parquet.NewWriterProperties(parquet.WithStats(true)),
+		parquet.NewWriterProperties(props...),
 		pqarrow.DefaultWriterProps()))
 	require.NoError(t, fw.Close())
 }
@@ -344,6 +386,7 @@ func TestReadAllDeleteFilesReturnsPartialDeletesOnError(t *testing.T) {
 	// the good worker closes first, then the bad worker returns its error.
 	deletesPerFile, err := readAllDeleteFiles(ctx, testFS, tasks, 2)
 	require.Error(t, err)
+	require.ErrorContains(t, err, "read position deletes from "+badDeletePath)
 	require.NotNil(t, deletesPerFile)
 	require.Contains(t, deletesPerFile, dataPath)
 	require.Len(t, deletesPerFile[dataPath], 1)
@@ -391,7 +434,7 @@ func TestReleasePerFilePosDeletes(t *testing.T) {
 	t.Run("nil chunk in slice does not panic", func(t *testing.T) {
 		// Defensive: production code paths never insert a nil *arrow.Chunked
 		// into the map. This subtest pins the guard so a future caller (the
-		// in-flight readAllDeletionVectors merger, or a refactor of readDeletes)
+		// in-flight delete-file merger, or a refactor of readDeletesForPaths)
 		// can't silently NPE the cleanup path.
 		mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
 		defer mem.AssertSize(t, 0)

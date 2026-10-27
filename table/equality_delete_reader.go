@@ -24,8 +24,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"reflect"
 	"slices"
+	"sync"
 	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -42,15 +45,28 @@ import (
 
 var ErrAmbiguousEqualityColumn = errors.New("equality delete column is ambiguous")
 
+// ErrConflictingEqualityDeleteMetadata indicates incompatible metadata for one delete-file path.
+var ErrConflictingEqualityDeleteMetadata = errors.New("conflicting equality delete metadata")
+
 // equalityDeleteSet holds the set of delete keys and the column names
 // used to look them up in data records. Each set corresponds to one
 // group of equality field IDs — delete files with different field IDs
-// produce separate sets. The set is immutable after construction so it
-// can be shared by tasks with the same delete files.
+// produce separate sets. Key material and metadata are immutable after
+// construction; derived typed indexes are built once and shared safely.
+// Typed indexes retain additional map storage alongside keys for the lifetime
+// of the set. Merged groups can hold their own indexes on top of per-file ones.
+// Do not copy the set after the first use of an index.
 type equalityDeleteSet struct {
 	keys     set[string]
 	fieldIDs []int
 	colNames []string
+
+	singleInt64Once sync.Once
+	singleInt64     *singleInt64EqualityDeleteSet
+	singleInt32Once sync.Once
+	singleInt32     *singleInt32EqualityDeleteSet
+	singleBytesOnce sync.Once
+	singleBytes     *singleBytesEqualityDeleteSet
 }
 
 type arrowFieldRef struct {
@@ -93,6 +109,54 @@ func indexArrowFields(schema *iceberg.Schema) arrowFieldRefsByID {
 	return refs
 }
 
+type requestedArrowFieldResolver struct {
+	requested map[int]struct{}
+	refs      arrowFieldRefsByID
+	path      []int
+	pathBuf   [8]int
+}
+
+func (r *requestedArrowFieldResolver) visit(fields []iceberg.NestedField) {
+	for i, field := range fields {
+		parentLen := len(r.path)
+		r.path = append(r.path, i)
+
+		if _, ok := r.requested[field.ID]; ok {
+			r.refs[field.ID] = append(r.refs[field.ID], arrowFieldRef{path: slices.Clone(r.path)})
+		}
+
+		if nested, ok := field.Type.(*iceberg.StructType); ok {
+			r.visit(nested.FieldList)
+		}
+
+		r.path = r.path[:parentLen]
+	}
+}
+
+// resolveArrowFieldsByID resolves paths only for the requested field IDs.
+// It walks the schema using borrowed fields and keeps one reusable path stack,
+// copying a path only when it matches an equality field.
+func resolveArrowFieldsByID(schema *iceberg.Schema, fieldIDs []int) arrowFieldRefsByID {
+	refs := make(arrowFieldRefsByID, len(fieldIDs))
+	if schema == nil || len(fieldIDs) == 0 {
+		return refs
+	}
+
+	requested := make(map[int]struct{}, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		requested[fieldID] = struct{}{}
+	}
+
+	resolver := requestedArrowFieldResolver{
+		requested: requested,
+		refs:      refs,
+	}
+	resolver.path = resolver.pathBuf[:0]
+	resolver.visit(schema.FieldsRef(iceinternal.SchemaRef{}))
+
+	return refs
+}
+
 // indexArrowFieldsByMetadata is used for delete files whose Arrow fields carry
 // IDs directly, before any name mapping is needed.
 func indexArrowFieldsByMetadata(schema *arrow.Schema) arrowFieldRefsByID {
@@ -111,6 +175,61 @@ func indexArrowFieldsByMetadata(schema *arrow.Schema) arrowFieldRefsByID {
 		}
 	}
 	visit(schema.Fields(), nil)
+
+	return refs
+}
+
+type requestedArrowMetadataFieldResolver struct {
+	requested map[int]struct{}
+	refs      arrowFieldRefsByID
+	path      []int
+	pathBuf   [8]int
+}
+
+func (r *requestedArrowMetadataFieldResolver) visitField(field arrow.Field, index int) {
+	parentLen := len(r.path)
+	r.path = append(r.path, index)
+
+	if id := getFieldID(field); id != nil {
+		if _, ok := r.requested[*id]; ok {
+			r.refs[*id] = append(r.refs[*id], arrowFieldRef{path: slices.Clone(r.path)})
+		}
+	}
+
+	if nested, ok := field.Type.(*arrow.StructType); ok {
+		r.visitStruct(nested)
+	}
+
+	r.path = r.path[:parentLen]
+}
+
+func (r *requestedArrowMetadataFieldResolver) visitStruct(schema *arrow.StructType) {
+	for i := range schema.NumFields() {
+		r.visitField(schema.Field(i), i)
+	}
+}
+
+// resolveArrowFieldsByMetadata resolves paths only for requested field IDs in
+// an Arrow schema whose fields carry Iceberg IDs in metadata.
+func resolveArrowFieldsByMetadata(schema *arrow.Schema, fieldIDs []int) arrowFieldRefsByID {
+	refs := make(arrowFieldRefsByID, len(fieldIDs))
+	if schema == nil || len(fieldIDs) == 0 {
+		return refs
+	}
+
+	requested := make(map[int]struct{}, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		requested[fieldID] = struct{}{}
+	}
+
+	resolver := requestedArrowMetadataFieldResolver{
+		requested: requested,
+		refs:      refs,
+	}
+	resolver.path = resolver.pathBuf[:0]
+	for i := range schema.NumFields() {
+		resolver.visitField(schema.Field(i), i)
+	}
 
 	return refs
 }
@@ -198,19 +317,343 @@ func newEqualityDeleteFileSet(id int, deleteSet *equalityDeleteSet) *equalityDel
 	}
 }
 
+func sameEqualityFieldIDSet(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for _, id := range left {
+		if !slices.Contains(right, id) {
+			return false
+		}
+	}
+	for _, id := range right {
+		if !slices.Contains(left, id) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func dataFileHasPointerIdentity(dataFile iceberg.DataFile) bool {
+	return reflect.TypeOf(dataFile).Kind() == reflect.Pointer
+}
+
+func validateEqualityDeleteMetadata(
+	dataFile iceberg.DataFile,
+	existingFile iceberg.DataFile,
+	existingFieldIDs []int,
+	existingHasPointerIdentity bool,
+) error {
+	// Callers have already inspected ContentType, so both files must be non-nil.
+	// A pointer-backed retained file makes interface identity comparison safe,
+	// even when a later custom DataFile value itself is not comparable.
+	if existingHasPointerIdentity && dataFile == existingFile {
+		return nil
+	}
+
+	fieldIDs := dataFileEqualityFieldIDsRef(dataFile)
+	if len(fieldIDs) == 0 {
+		return fmt.Errorf("%w: equality delete file %s", ErrEmptyEqualityFieldIDs, dataFile.FilePath())
+	}
+	// Equality delete field IDs are a set predicate. The first file keeps its
+	// encoding order; later entries for the same path may list the same IDs in
+	// a different order.
+	if dataFile.FileFormat() == existingFile.FileFormat() && sameEqualityFieldIDSet(fieldIDs, existingFieldIDs) {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w for file %s: first format=%s equality field IDs=%v, later format=%s equality field IDs=%v",
+		ErrConflictingEqualityDeleteMetadata, dataFile.FilePath(),
+		existingFile.FileFormat(), existingFieldIDs, dataFile.FileFormat(), fieldIDs)
+}
+
+func schemaForEqualityFields(current *iceberg.Schema, schemas []*iceberg.Schema, fieldIDs []int) *iceberg.Schema {
+	hasAllFields := func(schema *iceberg.Schema) bool {
+		for _, fieldID := range fieldIDs {
+			if _, ok := schema.FindFieldByID(fieldID); !ok {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	if hasAllFields(current) {
+		return current
+	}
+	// Scan tasks do not retain the equality delete's sequence number, so use
+	// the newest schema that can resolve the file's complete equality key.
+	for _, v := range slices.Backward(schemas) {
+		if hasAllFields(v) {
+			return v
+		}
+	}
+
+	return current
+}
+
+type lazyEqualityDeleteLoader struct {
+	fs           iceio.IO
+	tableSchema  *iceberg.Schema
+	tableSchemas []*iceberg.Schema
+	nameMapping  iceberg.NameMapping
+	files        map[string]*lazyEqualityDeleteFile
+	singleFile   *lazyEqualityDeleteFile
+	combinations sync.Map
+}
+
+type lazyEqualityDeleteFile struct {
+	id                 int
+	dataFile           iceberg.DataFile
+	fieldIDs           []int
+	hasPointerIdentity bool
+
+	once sync.Once
+	set  *equalityDeleteFileSet
+	err  error
+}
+
+type lazyEqualityDeleteCombination struct {
+	once sync.Once
+	set  *equalityDeleteSet
+}
+
+func newLazyEqualityDeleteLoader(
+	fs iceio.IO,
+	tableSchema *iceberg.Schema,
+	tableSchemas []*iceberg.Schema,
+	nameMapping iceberg.NameMapping,
+	tasks []FileScanTask,
+) (*lazyEqualityDeleteLoader, error) {
+	loader := &lazyEqualityDeleteLoader{
+		fs:           fs,
+		tableSchema:  tableSchema,
+		tableSchemas: tableSchemas,
+		nameMapping:  nameMapping,
+	}
+
+	var firstPath string
+	var firstFile *lazyEqualityDeleteFile
+	for _, task := range tasks {
+		for _, dataFile := range task.EqualityDeleteFiles {
+			if loader.files == nil && firstFile != nil &&
+				firstFile.hasPointerIdentity && dataFile == firstFile.dataFile {
+				continue
+			}
+			if dataFile.ContentType() != iceberg.EntryContentEqDeletes {
+				continue
+			}
+
+			path := dataFile.FilePath()
+			if loader.files == nil {
+				if firstFile == nil {
+					fieldIDs := dataFileEqualityFieldIDs(dataFile)
+					if len(fieldIDs) == 0 {
+						return nil, fmt.Errorf("%w: equality delete file %s", ErrEmptyEqualityFieldIDs, path)
+					}
+
+					firstPath = path
+					firstFile = &lazyEqualityDeleteFile{
+						dataFile:           dataFile,
+						fieldIDs:           fieldIDs,
+						hasPointerIdentity: dataFileHasPointerIdentity(dataFile),
+					}
+
+					continue
+				}
+				if path == firstPath {
+					if err := validateEqualityDeleteMetadata(
+						dataFile, firstFile.dataFile, firstFile.fieldIDs, firstFile.hasPointerIdentity,
+					); err != nil {
+						return nil, err
+					}
+
+					continue
+				}
+
+				loader.files = make(map[string]*lazyEqualityDeleteFile, 2)
+				loader.files[firstPath] = firstFile
+			}
+			if file, ok := loader.files[path]; ok {
+				if err := validateEqualityDeleteMetadata(
+					dataFile, file.dataFile, file.fieldIDs, file.hasPointerIdentity,
+				); err != nil {
+					return nil, err
+				}
+
+				continue
+			}
+
+			fieldIDs := dataFileEqualityFieldIDs(dataFile)
+			if len(fieldIDs) == 0 {
+				return nil, fmt.Errorf("%w: equality delete file %s", ErrEmptyEqualityFieldIDs, path)
+			}
+
+			loader.files[path] = &lazyEqualityDeleteFile{
+				id:                 len(loader.files),
+				dataFile:           dataFile,
+				fieldIDs:           fieldIDs,
+				hasPointerIdentity: dataFileHasPointerIdentity(dataFile),
+			}
+		}
+	}
+
+	if firstFile == nil {
+		return nil, nil
+	}
+	if loader.files == nil {
+		loader.files = map[string]*lazyEqualityDeleteFile{firstPath: firstFile}
+		loader.singleFile = firstFile
+	}
+
+	return loader, nil
+}
+
+func (l *lazyEqualityDeleteLoader) needsSchemaHistory() bool {
+	if l == nil {
+		return false
+	}
+
+	for _, file := range l.files {
+		for _, fieldID := range file.fieldIDs {
+			if _, found := l.tableSchema.FindFieldByID(fieldID); !found {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (l *lazyEqualityDeleteLoader) addFieldIDs(idset set[int]) {
+	if l == nil {
+		return
+	}
+
+	for _, file := range l.files {
+		for _, fieldID := range file.fieldIDs {
+			idset[fieldID] = struct{}{}
+		}
+	}
+}
+
+func (l *lazyEqualityDeleteLoader) loadFile(ctx context.Context, file *lazyEqualityDeleteFile) (*equalityDeleteFileSet, error) {
+	file.once.Do(func() {
+		deleteSchema := l.tableSchema
+		if len(l.tableSchemas) > 0 {
+			deleteSchema = schemaForEqualityFields(l.tableSchema, l.tableSchemas, file.fieldIDs)
+		}
+		keys, colNames, err := readEqualityDeleteFile(
+			ctx, l.fs, deleteSchema, l.nameMapping, file.dataFile, file.fieldIDs)
+		if err != nil {
+			file.err = err
+
+			return
+		}
+
+		file.set = newEqualityDeleteFileSet(file.id, &equalityDeleteSet{
+			fieldIDs: file.fieldIDs,
+			colNames: colNames,
+			keys:     keys,
+		})
+	})
+
+	return file.set, file.err
+}
+
+func (l *lazyEqualityDeleteLoader) combine(files []*equalityDeleteFileSet) *equalityDeleteSet {
+	files = normalizeEqualityDeleteFiles(files)
+	if len(files) == 1 {
+		return files[0].equalityDeleteSet
+	}
+
+	// A comparable pair avoids building a string key for the common two-file case.
+	// Keep the existing string key for larger combinations.
+	var key any
+	if len(files) == 2 {
+		key = equalityDeletePairKey(files)
+	} else {
+		key = equalityDeleteSetCombinationKey(files)
+	}
+	entryValue, ok := l.combinations.Load(key)
+	if !ok {
+		entryValue, _ = l.combinations.LoadOrStore(key, &lazyEqualityDeleteCombination{})
+	}
+	entry := entryValue.(*lazyEqualityDeleteCombination)
+	entry.once.Do(func() {
+		entry.set = mergeEqualityDeleteSets(files)
+	})
+
+	return entry.set
+}
+
+func (l *lazyEqualityDeleteLoader) load(ctx context.Context, task FileScanTask) ([]*equalityDeleteSet, error) {
+	if l == nil || len(task.EqualityDeleteFiles) == 0 {
+		return nil, nil
+	}
+	if len(task.EqualityDeleteFiles) == 1 {
+		dataFile := task.EqualityDeleteFiles[0]
+		file := l.singleFile
+		if file == nil || !file.hasPointerIdentity || dataFile != file.dataFile {
+			if dataFile.ContentType() != iceberg.EntryContentEqDeletes {
+				return nil, nil
+			}
+
+			var ok bool
+			file, ok = l.files[dataFile.FilePath()]
+			if !ok {
+				return nil, nil
+			}
+		}
+
+		fileSet, err := l.loadFile(ctx, file)
+		if err != nil {
+			return nil, err
+		}
+		if len(fileSet.keys) == 0 {
+			return nil, nil
+		}
+
+		return []*equalityDeleteSet{fileSet.equalityDeleteSet}, nil
+	}
+
+	files := make([]*equalityDeleteFileSet, 0, len(task.EqualityDeleteFiles))
+	for _, dataFile := range task.EqualityDeleteFiles {
+		if dataFile.ContentType() != iceberg.EntryContentEqDeletes {
+			continue
+		}
+
+		file, ok := l.files[dataFile.FilePath()]
+		if !ok {
+			continue
+		}
+
+		fileSet, err := l.loadFile(ctx, file)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, fileSet)
+	}
+
+	return buildEqualityDeleteSetsForFiles(files, l.combine), nil
+}
+
 // readAllEqualityDeleteFiles reads all unique equality delete files from
 // the tasks and builds per-task delete key sets. Returns nil if there are
 // no equality deletes. Delete files with different equality field IDs are
 // kept as separate sets (not merged).
 func readAllEqualityDeleteFiles(ctx context.Context, fs iceio.IO, schema *iceberg.Schema, nameMapping iceberg.NameMapping, tasks []FileScanTask, concurrency int) (map[int][]*equalityDeleteSet, error) {
 	type deleteFileInfo struct {
-		id       int
-		file     iceberg.DataFile
-		fieldIDs []int
+		id                 int
+		file               iceberg.DataFile
+		fieldIDs           []int
+		hasPointerIdentity bool
 	}
 
 	uniqueDeletes := make(map[string]deleteFileInfo)
-	hasAny := false
 
 	for _, t := range tasks {
 		for _, d := range t.EqualityDeleteFiles {
@@ -218,22 +661,32 @@ func readAllEqualityDeleteFiles(ctx context.Context, fs iceio.IO, schema *iceber
 				continue
 			}
 
-			if len(d.EqualityFieldIDs()) == 0 {
-				return nil, fmt.Errorf("%w: equality delete file %s", ErrEmptyEqualityFieldIDs, d.FilePath())
+			path := d.FilePath()
+			if info, ok := uniqueDeletes[path]; ok {
+				if err := validateEqualityDeleteMetadata(
+					d, info.file, info.fieldIDs, info.hasPointerIdentity,
+				); err != nil {
+					return nil, err
+				}
+
+				continue
 			}
 
-			hasAny = true
-			if _, ok := uniqueDeletes[d.FilePath()]; !ok {
-				uniqueDeletes[d.FilePath()] = deleteFileInfo{
-					id:       len(uniqueDeletes),
-					file:     d,
-					fieldIDs: d.EqualityFieldIDs(),
-				}
+			fieldIDs := dataFileEqualityFieldIDs(d)
+			if len(fieldIDs) == 0 {
+				return nil, fmt.Errorf("%w: equality delete file %s", ErrEmptyEqualityFieldIDs, path)
+			}
+
+			uniqueDeletes[path] = deleteFileInfo{
+				id:                 len(uniqueDeletes),
+				file:               d,
+				fieldIDs:           fieldIDs,
+				hasPointerIdentity: dataFileHasPointerIdentity(d),
 			}
 		}
 	}
 
-	if !hasAny {
+	if len(uniqueDeletes) == 0 {
 		return nil, nil
 	}
 
@@ -301,59 +754,13 @@ func buildEqualityDeleteSetsPerTask(
 	// File IDs are sufficient as the cache key because each ID identifies one
 	// immutable delete set with a fixed equality-field group for this call.
 	sharedSets := make(map[string]*equalityDeleteSet)
+	pairSets := make(map[equalityDeleteFilePair]*equalityDeleteSet)
+	combine := func(files []*equalityDeleteFileSet) *equalityDeleteSet {
+		return equalityDeleteSetForFiles(files, sharedSets, pairSets)
+	}
+
 	for i, t := range tasks {
-		if len(t.EqualityDeleteFiles) == 0 {
-			continue
-		}
-
-		var (
-			groupKey   string
-			groupFiles []*equalityDeleteFileSet
-			groups     map[string][]*equalityDeleteFileSet
-		)
-
-		for _, d := range t.EqualityDeleteFiles {
-			dk, ok := perFile[d.FilePath()]
-			if !ok {
-				continue
-			}
-
-			if groups != nil {
-				groups[dk.groupKey] = append(groups[dk.groupKey], dk)
-			} else if len(groupFiles) == 0 {
-				groupKey = dk.groupKey
-				groupFiles = append(groupFiles, dk)
-			} else if dk.groupKey != groupKey {
-				groups = make(map[string][]*equalityDeleteFileSet, 2)
-				groups[groupKey] = groupFiles
-				groupFiles = nil
-				groups[dk.groupKey] = append(groups[dk.groupKey], dk)
-			} else {
-				groupFiles = append(groupFiles, dk)
-			}
-		}
-
-		if groups == nil {
-			if len(groupFiles) == 0 {
-				continue
-			}
-
-			deleteSet := equalityDeleteSetForFiles(groupFiles, sharedSets)
-			if len(deleteSet.keys) > 0 {
-				perTask[i] = []*equalityDeleteSet{deleteSet}
-			}
-
-			continue
-		}
-
-		sets := make([]*equalityDeleteSet, 0, len(groups))
-		for _, files := range groups {
-			deleteSet := equalityDeleteSetForFiles(files, sharedSets)
-			if len(deleteSet.keys) > 0 {
-				sets = append(sets, deleteSet)
-			}
-		}
-
+		sets := buildEqualityDeleteSetsForTask(t, perFile, combine)
 		if len(sets) > 0 {
 			perTask[i] = sets
 		}
@@ -362,42 +769,179 @@ func buildEqualityDeleteSetsPerTask(
 	return perTask
 }
 
+func buildEqualityDeleteSetsForTask(
+	task FileScanTask,
+	perFile map[string]*equalityDeleteFileSet,
+	combine func([]*equalityDeleteFileSet) *equalityDeleteSet,
+) []*equalityDeleteSet {
+	if len(task.EqualityDeleteFiles) == 0 {
+		return nil
+	}
+	if len(task.EqualityDeleteFiles) == 1 {
+		fileSet, ok := perFile[task.EqualityDeleteFiles[0].FilePath()]
+		if !ok || len(fileSet.keys) == 0 {
+			return nil
+		}
+
+		return []*equalityDeleteSet{fileSet.equalityDeleteSet}
+	}
+
+	files := make([]*equalityDeleteFileSet, 0, len(task.EqualityDeleteFiles))
+	for _, dataFile := range task.EqualityDeleteFiles {
+		if fileSet, ok := perFile[dataFile.FilePath()]; ok {
+			files = append(files, fileSet)
+		}
+	}
+
+	return buildEqualityDeleteSetsForFiles(files, combine)
+}
+
+func buildEqualityDeleteSetsForFiles(
+	files []*equalityDeleteFileSet,
+	combine func([]*equalityDeleteFileSet) *equalityDeleteSet,
+) []*equalityDeleteSet {
+	if len(files) == 0 {
+		return nil
+	}
+	if len(files) == 1 {
+		if len(files[0].keys) == 0 {
+			return nil
+		}
+
+		return []*equalityDeleteSet{files[0].equalityDeleteSet}
+	}
+
+	groupKey := files[0].groupKey
+	oneGroup := true
+	for _, file := range files[1:] {
+		if file.groupKey != groupKey {
+			oneGroup = false
+
+			break
+		}
+	}
+	if oneGroup {
+		deleteSet := combine(files)
+		if len(deleteSet.keys) == 0 {
+			return nil
+		}
+
+		return []*equalityDeleteSet{deleteSet}
+	}
+
+	groups := make(map[string][]*equalityDeleteFileSet, 2)
+	for _, file := range files {
+		groups[file.groupKey] = append(groups[file.groupKey], file)
+	}
+
+	sets := make([]*equalityDeleteSet, 0, len(groups))
+	for _, groupFiles := range groups {
+		deleteSet := combine(groupFiles)
+		if len(deleteSet.keys) > 0 {
+			sets = append(sets, deleteSet)
+		}
+	}
+
+	return sets
+}
+
 func equalityDeleteSetForFiles(
 	files []*equalityDeleteFileSet,
 	sharedSets map[string]*equalityDeleteSet,
+	pairSets map[equalityDeleteFilePair]*equalityDeleteSet,
 ) *equalityDeleteSet {
-	slices.SortFunc(files, func(a, b *equalityDeleteFileSet) int {
-		return cmp.Compare(a.id, b.id)
-	})
-	files = slices.CompactFunc(files, func(a, b *equalityDeleteFileSet) bool {
-		return a.id == b.id
-	})
-
+	files = normalizeEqualityDeleteFiles(files)
 	if len(files) == 1 {
 		return files[0].equalityDeleteSet
 	}
+	if len(files) == 2 {
+		key := equalityDeletePairKey(files)
+		if deleteSet, ok := pairSets[key]; ok {
+			return deleteSet
+		}
+		deleteSet := mergeEqualityDeleteSets(files)
+		pairSets[key] = deleteSet
 
-	combinationKey := make([]byte, 0, len(files)*8)
-	for _, file := range files {
-		combinationKey = binary.LittleEndian.AppendUint64(combinationKey, uint64(file.id))
+		return deleteSet
 	}
-	key := string(combinationKey)
+
+	key := equalityDeleteSetCombinationKey(files)
 	if deleteSet, ok := sharedSets[key]; ok {
 		return deleteSet
 	}
 
+	deleteSet := mergeEqualityDeleteSets(files)
+	sharedSets[key] = deleteSet
+
+	return deleteSet
+}
+
+func normalizeEqualityDeleteFiles(files []*equalityDeleteFileSet) []*equalityDeleteFileSet {
+	switch len(files) {
+	case 0, 1:
+		return files
+	case 2:
+		if files[0].id == files[1].id {
+			return files[:1]
+		}
+		if files[0].id > files[1].id {
+			files[0], files[1] = files[1], files[0]
+		}
+
+		return files
+	}
+
+	slices.SortFunc(files, func(a, b *equalityDeleteFileSet) int {
+		return cmp.Compare(a.id, b.id)
+	})
+
+	return slices.CompactFunc(files, func(a, b *equalityDeleteFileSet) bool {
+		return a.id == b.id
+	})
+}
+
+// equalityDeleteFilePair is a comparable cache key for two delete files.
+// normalizeEqualityDeleteFiles ensures the IDs are distinct and sorted.
+type equalityDeleteFilePair struct {
+	firstID  int
+	secondID int
+}
+
+func equalityDeletePairKey(files []*equalityDeleteFileSet) equalityDeleteFilePair {
+	return equalityDeleteFilePair{firstID: files[0].id, secondID: files[1].id}
+}
+
+func equalityDeleteSetCombinationKey(files []*equalityDeleteFileSet) string {
+	combinationKey := make([]byte, 0, len(files)*8)
+	for _, file := range files {
+		combinationKey = binary.LittleEndian.AppendUint64(combinationKey, uint64(file.id))
+	}
+
+	return string(combinationKey)
+}
+
+func mergeEqualityDeleteSets(files []*equalityDeleteFileSet) *equalityDeleteSet {
+	largest := 0
+	for i := 1; i < len(files); i++ {
+		if len(files[i].keys) > len(files[largest].keys) {
+			largest = i
+		}
+	}
+
 	deleteSet := &equalityDeleteSet{
-		keys:     make(set[string]),
+		keys:     maps.Clone(files[largest].keys),
 		fieldIDs: files[0].fieldIDs,
 		colNames: files[0].colNames,
 	}
-	for _, file := range files {
+	for i, file := range files {
+		if i == largest {
+			continue
+		}
+
 		for key := range file.keys {
 			deleteSet.keys[key] = struct{}{}
 		}
 	}
-
-	sharedSets[key] = deleteSet
 
 	return deleteSet
 }
@@ -448,9 +992,9 @@ func readEqualityDeleteFile(ctx context.Context, fs iceio.IO, tableSchema *icebe
 
 	var fieldRefsByID arrowFieldRefsByID
 	if hasFieldIDs {
-		fieldRefsByID = indexArrowFieldsByMetadata(projectedSchema)
+		fieldRefsByID = resolveArrowFieldsByMetadata(projectedSchema, fieldIDs)
 	} else {
-		fieldRefsByID = indexArrowFields(fileSchema)
+		fieldRefsByID = resolveArrowFieldsByID(fileSchema, fieldIDs)
 	}
 
 	// Resolve projected field paths from field IDs.
@@ -727,42 +1271,45 @@ func makeColEncoder(arr arrow.Array) colEncoder {
 		})
 	case *array.String:
 		offsets := a.ValueOffsets()
-
 		rawBytes := a.ValueBytes()
+		baseOffset := offsets[0]
 
 		return withNullGuard(a, func(buf *bytes.Buffer, row int) {
 			buf.WriteByte(1)
-			start, end := offsets[row], offsets[row+1]
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
 			bufPutUint32(buf, uint32(end-start))
 			buf.Write(rawBytes[start:end])
 		})
 	case *array.LargeString:
 		offsets := a.ValueOffsets()
 		rawBytes := a.ValueBytes()
+		baseOffset := offsets[0]
 
 		return withNullGuard(a, func(buf *bytes.Buffer, row int) {
 			buf.WriteByte(1)
-			start, end := offsets[row], offsets[row+1]
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
 			bufPutUint32(buf, uint32(end-start))
 			buf.Write(rawBytes[start:end])
 		})
 	case *array.Binary:
 		offsets := a.ValueOffsets()
 		rawBytes := a.ValueBytes()
+		baseOffset := offsets[0]
 
 		return withNullGuard(a, func(buf *bytes.Buffer, row int) {
 			buf.WriteByte(1)
-			start, end := offsets[row], offsets[row+1]
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
 			bufPutUint32(buf, uint32(end-start))
 			buf.Write(rawBytes[start:end])
 		})
 	case *array.LargeBinary:
 		offsets := a.ValueOffsets()
 		rawBytes := a.ValueBytes()
+		baseOffset := offsets[0]
 
 		return withNullGuard(a, func(buf *bytes.Buffer, row int) {
 			buf.WriteByte(1)
-			start, end := offsets[row], offsets[row+1]
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
 			bufPutUint32(buf, uint32(end-start))
 			buf.Write(rawBytes[start:end])
 		})
@@ -787,19 +1334,349 @@ func makeColEncoder(arr arrow.Array) colEncoder {
 	}
 }
 
+type singleInt64EqualityDeleteSet struct {
+	keys    set[uint64]
+	hasNull bool
+}
+
+func (e *equalityDeleteSet) singleInt64Set(fileSchema *iceberg.Schema) *singleInt64EqualityDeleteSet {
+	if fileSchema == nil || len(e.fieldIDs) != 1 {
+		return nil
+	}
+
+	field, ok := fileSchema.FindFieldByID(e.fieldIDs[0])
+	if !ok {
+		return nil
+	}
+	if _, ok := field.Type.(iceberg.Int64Type); !ok {
+		return nil
+	}
+
+	e.singleInt64Once.Do(func() {
+		result := &singleInt64EqualityDeleteSet{
+			keys: make(set[uint64], len(e.keys)),
+		}
+		for key := range e.keys {
+			if len(key) == 1 && key[0] == 0 {
+				result.hasNull = true
+
+				continue
+			}
+			if len(key) != 9 || key[0] != 1 {
+				// Unexpected key formats must keep using the generic path.
+				return
+			}
+
+			value := uint64(key[1])<<56 |
+				uint64(key[2])<<48 |
+				uint64(key[3])<<40 |
+				uint64(key[4])<<32 |
+				uint64(key[5])<<24 |
+				uint64(key[6])<<16 |
+				uint64(key[7])<<8 |
+				uint64(key[8])
+			result.keys[value] = struct{}{}
+		}
+
+		e.singleInt64 = result
+	})
+
+	return e.singleInt64
+}
+
+// singleInt32EqualityDeleteSet avoids encoding one key buffer per data row.
+// The 4-byte value is stored as its raw bit pattern, preserving negative values.
+type singleInt32EqualityDeleteSet struct {
+	keys    set[uint32]
+	hasNull bool
+}
+
+func (e *equalityDeleteSet) singleInt32Set(fileSchema *iceberg.Schema) *singleInt32EqualityDeleteSet {
+	if fileSchema == nil || len(e.fieldIDs) != 1 {
+		return nil
+	}
+
+	field, ok := fileSchema.FindFieldByID(e.fieldIDs[0])
+	if !ok {
+		return nil
+	}
+	if _, ok := field.Type.(iceberg.Int32Type); !ok {
+		return nil
+	}
+
+	e.singleInt32Once.Do(func() {
+		result := &singleInt32EqualityDeleteSet{
+			keys: make(set[uint32], len(e.keys)),
+		}
+		for key := range e.keys {
+			if len(key) == 1 && key[0] == 0 {
+				result.hasNull = true
+
+				continue
+			}
+			if len(key) != 5 || key[0] != 1 {
+				// An unexpected encoding must use the generic path.
+				return
+			}
+			result.keys[binary.BigEndian.Uint32([]byte(key[1:]))] = struct{}{}
+		}
+		e.singleInt32 = result
+	})
+
+	return e.singleInt32
+}
+
+type singleBytesEqualityDeleteSet struct {
+	keys    set[string]
+	hasNull bool
+}
+
+// singleBytesSet indexes one string or binary equality field by its raw
+// value. The encoded representation has a null tag and, for non-null values,
+// a four-byte length prefix. Unexpected keys must use the generic encoder.
+func (e *equalityDeleteSet) singleBytesSet(fileSchema *iceberg.Schema) *singleBytesEqualityDeleteSet {
+	if fileSchema == nil || len(e.fieldIDs) != 1 {
+		return nil
+	}
+
+	field, ok := fileSchema.FindFieldByID(e.fieldIDs[0])
+	if !ok {
+		return nil
+	}
+	switch field.Type.(type) {
+	case iceberg.StringType, iceberg.BinaryType:
+	default:
+		return nil
+	}
+
+	e.singleBytesOnce.Do(func() {
+		result := &singleBytesEqualityDeleteSet{
+			keys: make(set[string], len(e.keys)),
+		}
+		for key := range e.keys {
+			if len(key) == 1 && key[0] == 0 {
+				result.hasNull = true
+
+				continue
+			}
+			if len(key) < 5 || key[0] != 1 ||
+				int(binary.BigEndian.Uint32([]byte(key[1:5]))) != len(key)-5 {
+				return
+			}
+			// A substring retains the immutable encoded key's backing bytes.
+			result.keys[key[5:]] = struct{}{}
+		}
+		e.singleBytes = result
+	})
+
+	return e.singleBytes
+}
+
+type equalityDeleteMask struct {
+	buffer *memory.Buffer
+	bits   []byte
+}
+
+func (m *equalityDeleteMask) ensure(mem memory.Allocator, numRows int) {
+	if m.buffer != nil {
+		return
+	}
+
+	m.buffer = memory.NewResizableBuffer(mem)
+	m.buffer.Resize(int(bitutil.BytesForBits(int64(numRows))))
+	m.bits = m.buffer.Bytes()
+	for i := range m.bits {
+		m.bits[i] = 0xFF
+	}
+}
+
+func (m *equalityDeleteMask) release() {
+	if m.buffer != nil {
+		m.buffer.Release()
+	}
+}
+
+// applySingleInt64 returns false for unexpected Arrow column types, allowing
+// the caller to fall back to the generic field encoder.
+func (m *equalityDeleteMask) applySingleInt64(
+	column arrow.Array,
+	deleteSet *singleInt64EqualityDeleteSet,
+	mem memory.Allocator,
+) bool {
+	values, ok := column.(*array.Int64)
+	if !ok {
+		return false
+	}
+
+	rawValues := values.Int64Values()
+	numRows := values.Len()
+	if values.NullN() == 0 {
+		for row := range numRows {
+			if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+				continue
+			}
+			if _, deleted := deleteSet.keys[uint64(rawValues[row])]; deleted {
+				m.ensure(mem, numRows)
+				bitutil.ClearBit(m.bits, row)
+			}
+		}
+	} else {
+		for row := range numRows {
+			if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+				continue
+			}
+
+			if values.IsNull(row) {
+				if !deleteSet.hasNull {
+					continue
+				}
+			} else if _, deleted := deleteSet.keys[uint64(rawValues[row])]; !deleted {
+				continue
+			}
+			m.ensure(mem, numRows)
+			bitutil.ClearBit(m.bits, row)
+		}
+	}
+
+	return true
+}
+
+func applySingleBytesValues[Offset ~int32 | ~int64](
+	m *equalityDeleteMask,
+	column arrow.Array,
+	offsets []Offset,
+	data []byte,
+	deleteSet *singleBytesEqualityDeleteSet,
+	mem memory.Allocator,
+) {
+	numRows := column.Len()
+	baseOffset := offsets[0]
+	if column.NullN() == 0 {
+		for row := range numRows {
+			if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+				continue
+			}
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
+			if _, deleted := deleteSet.keys[string(data[start:end])]; !deleted {
+				continue
+			}
+			m.ensure(mem, numRows)
+			bitutil.ClearBit(m.bits, row)
+		}
+
+		return
+	}
+
+	for row := range numRows {
+		if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+			continue
+		}
+		if column.IsNull(row) {
+			if !deleteSet.hasNull {
+				continue
+			}
+		} else {
+			start, end := offsets[row]-baseOffset, offsets[row+1]-baseOffset
+			if _, deleted := deleteSet.keys[string(data[start:end])]; !deleted {
+				continue
+			}
+		}
+		m.ensure(mem, numRows)
+		bitutil.ClearBit(m.bits, row)
+	}
+}
+
+// applySingleBytes avoids length-prefix serialization for flat string/binary
+// columns, including their large-offset Arrow variants.
+func (m *equalityDeleteMask) applySingleBytes(
+	column arrow.Array,
+	deleteSet *singleBytesEqualityDeleteSet,
+	mem memory.Allocator,
+) bool {
+	switch values := column.(type) {
+	case *array.String:
+		applySingleBytesValues(m, column, values.ValueOffsets(), values.ValueBytes(), deleteSet, mem)
+	case *array.LargeString:
+		applySingleBytesValues(m, column, values.ValueOffsets(), values.ValueBytes(), deleteSet, mem)
+	case *array.Binary:
+		applySingleBytesValues(m, column, values.ValueOffsets(), values.ValueBytes(), deleteSet, mem)
+	case *array.LargeBinary:
+		applySingleBytesValues(m, column, values.ValueOffsets(), values.ValueBytes(), deleteSet, mem)
+	default:
+		return false
+	}
+
+	return true
+}
+
+// applySingleInt32 returns false for other physical Arrow types, so callers
+// can preserve the generic key encoder for schema evolution.
+func (m *equalityDeleteMask) applySingleInt32(
+	column arrow.Array,
+	deleteSet *singleInt32EqualityDeleteSet,
+	mem memory.Allocator,
+) bool {
+	values, ok := column.(*array.Int32)
+	if !ok {
+		return false
+	}
+
+	rawValues := values.Int32Values()
+	numRows := values.Len()
+	if values.NullN() == 0 {
+		for row := range numRows {
+			if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+				continue
+			}
+			if _, deleted := deleteSet.keys[uint32(rawValues[row])]; deleted {
+				m.ensure(mem, numRows)
+				bitutil.ClearBit(m.bits, row)
+			}
+		}
+	} else {
+		for row := range numRows {
+			if m.bits != nil && !bitutil.BitIsSet(m.bits, row) {
+				continue
+			}
+			if values.IsNull(row) {
+				if !deleteSet.hasNull {
+					continue
+				}
+			} else if _, deleted := deleteSet.keys[uint32(rawValues[row])]; !deleted {
+				continue
+			}
+			m.ensure(mem, numRows)
+			bitutil.ClearBit(m.bits, row)
+		}
+	}
+
+	return true
+}
+
 // processEqualityDeletesColumnarForFile resolves field paths once per file and
 // typed column encoders once per batch, then iterates rows without per-row type
 // switches. Each delete set is applied independently because sets may have
 // different field IDs.
 func processEqualityDeletesColumnarForFile(ctx context.Context, eqDeleteSets []*equalityDeleteSet, fileSchema *iceberg.Schema, dataFilePath string) (recProcessFn, error) {
-	fieldRefsByID := indexArrowFields(fileSchema)
-	fieldRefs := make([][]arrowFieldRef, len(eqDeleteSets))
-	for i, eqDel := range eqDeleteSets {
+	requestedFieldIDs := make([]int, 0)
+	requestedFieldIDSet := make(map[int]struct{})
+	for _, eqDel := range eqDeleteSets {
 		if len(eqDel.fieldIDs) != len(eqDel.colNames) {
 			return nil, fmt.Errorf("%w: equality delete set has %d field IDs and %d column names",
 				iceberg.ErrInvalidArgument, len(eqDel.fieldIDs), len(eqDel.colNames))
 		}
 
+		for _, fieldID := range eqDel.fieldIDs {
+			if _, ok := requestedFieldIDSet[fieldID]; !ok {
+				requestedFieldIDSet[fieldID] = struct{}{}
+				requestedFieldIDs = append(requestedFieldIDs, fieldID)
+			}
+		}
+	}
+
+	fieldRefsByID := resolveArrowFieldsByID(fileSchema, requestedFieldIDs)
+	fieldRefs := make([][]arrowFieldRef, len(eqDeleteSets))
+	for i, eqDel := range eqDeleteSets {
 		fieldRefs[i] = make([]arrowFieldRef, len(eqDel.fieldIDs))
 		for fieldIdx, fieldID := range eqDel.fieldIDs {
 			ref, err := resolveArrowField(fieldRefsByID, fieldID, eqDel.colNames[fieldIdx], dataFilePath)
@@ -811,24 +1688,49 @@ func processEqualityDeletesColumnarForFile(ctx context.Context, eqDeleteSets []*
 		}
 	}
 
+	singleInt64Sets := make([]*singleInt64EqualityDeleteSet, len(eqDeleteSets))
+	singleInt32Sets := make([]*singleInt32EqualityDeleteSet, len(eqDeleteSets))
+	singleBytesSets := make([]*singleBytesEqualityDeleteSet, len(eqDeleteSets))
+	for i, eqDel := range eqDeleteSets {
+		// Nested fields need parent validity checks and use the generic path.
+		// Do not duplicate their encoded keys in an index that cannot be used.
+		if len(fieldRefs[i]) == 1 && len(fieldRefs[i][0].path) == 1 {
+			singleInt64Sets[i] = eqDel.singleInt64Set(fileSchema)
+			singleInt32Sets[i] = eqDel.singleInt32Set(fileSchema)
+			singleBytesSets[i] = eqDel.singleBytesSet(fileSchema)
+		}
+	}
+
 	return func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
 		defer r.Release()
 
 		mem := compute.GetAllocator(ctx)
 		numRows := int(r.NumRows())
 
-		maskBuf := memory.NewResizableBuffer(mem)
-		defer maskBuf.Release()
-		maskBuf.Resize(int(bitutil.BytesForBits(int64(numRows))))
-		maskBytes := maskBuf.Bytes()
-
-		for i := range maskBytes {
-			maskBytes[i] = 0xFF
-		}
+		var mask equalityDeleteMask
+		defer mask.release()
 
 		var keyBuf bytes.Buffer
 
 		for setIdx, eqDel := range eqDeleteSets {
+			int32Set, int64Set, bytesSet := singleInt32Sets[setIdx], singleInt64Sets[setIdx], singleBytesSets[setIdx]
+			if int32Set != nil || int64Set != nil || bytesSet != nil {
+				column, _, err := arrowArraysAtField(
+					r, fieldRefs[setIdx][0], eqDel.fieldIDs[0], eqDel.colNames[0], dataFilePath)
+				if err != nil {
+					return nil, err
+				}
+				if int32Set != nil && mask.applySingleInt32(column, int32Set, mem) {
+					continue
+				}
+				if int64Set != nil && mask.applySingleInt64(column, int64Set, mem) {
+					continue
+				}
+				if bytesSet != nil && mask.applySingleBytes(column, bytesSet, mem) {
+					continue
+				}
+			}
+
 			encoders := make([]colEncoder, len(eqDel.colNames))
 			for i, name := range eqDel.colNames {
 				var err error
@@ -839,7 +1741,7 @@ func processEqualityDeletesColumnarForFile(ctx context.Context, eqDeleteSets []*
 			}
 
 			for row := range numRows {
-				if !bitutil.BitIsSet(maskBytes, row) {
+				if mask.bits != nil && !bitutil.BitIsSet(mask.bits, row) {
 					continue
 				}
 
@@ -849,20 +1751,31 @@ func processEqualityDeletesColumnarForFile(ctx context.Context, eqDeleteSets []*
 					enc(&keyBuf, row)
 				}
 
-				if _, deleted := eqDel.keys[bufString(&keyBuf)]; deleted {
-					bitutil.ClearBit(maskBytes, row)
+				if _, deleted := eqDel.keys[bufString(&keyBuf)]; !deleted {
+					continue
 				}
+
+				mask.ensure(mem, numRows)
+				bitutil.ClearBit(mask.bits, row)
 			}
 		}
 
-		mask := array.NewBooleanData(array.NewData(
+		if mask.buffer == nil {
+			r.Retain()
+
+			return r, nil
+		}
+
+		maskData := array.NewData(
 			arrow.FixedWidthTypes.Boolean, numRows,
-			[]*memory.Buffer{nil, maskBuf}, nil, 0, 0))
-		defer mask.Release()
+			[]*memory.Buffer{nil, mask.buffer}, nil, 0, 0)
+		filterMask := array.NewBooleanData(maskData)
+		maskData.Release()
+		defer filterMask.Release()
 
 		filtered, err := compute.Filter(ctx,
 			compute.NewDatumWithoutOwning(r),
-			compute.NewDatumWithoutOwning(mask),
+			compute.NewDatumWithoutOwning(filterMask),
 			*compute.DefaultFilterOptions())
 		if err != nil {
 			return nil, err

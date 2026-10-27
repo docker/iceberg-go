@@ -38,7 +38,7 @@ go get github.com/apache/arrow-go/v18@latest
 go get github.com/uptrace/bun/driver/sqliteshim@latest
 ```
 
-`iceberg-go` itself only registers the local file system. For S3, GCS, or Azure Blob you would also blank-import `github.com/apache/iceberg-go/io/gocloud`. We are staying on local disk for this tutorial.
+`iceberg-go` itself only registers the local file system. For S3, GCS, or Azure Blob you would also blank-import the matching backend package, such as `github.com/apache/iceberg-go/io/gocloud/s3`. We are staying on local disk for this tutorial.
 
 ## 2. Open a local catalog
 
@@ -235,7 +235,10 @@ func createExperimentBranch(ctx context.Context, cat *sqlcat.Catalog, tbl *table
 
 // Step 2: open a transaction on the branch and write.
 func writeOnBranch(ctx context.Context, tbl *table.Table, arrowTbl arrow.Table) (*table.Table, error) {
-    txn := tbl.NewTransactionOnBranch("experiment")
+    txn, err := tbl.NewTransactionOnBranch("experiment")
+    if err != nil {
+        return nil, err
+    }
     if err := txn.AppendTable(ctx, arrowTbl, 1024, nil); err != nil {
         return nil, err
     }

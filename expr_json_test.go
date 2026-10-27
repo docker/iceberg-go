@@ -155,7 +155,7 @@ func TestMarshalExpressionTypedLiterals(t *testing.T) {
 		{"date", mustLit(t, "2022-08-14", iceberg.PrimitiveTypes.Date), `{"type":"eq","term":"d","value":"2022-08-14"}`},
 		{"uuid", iceberg.UUIDLiteral(uuid.MustParse("f79c3e09-677c-4bbd-a479-3f349cb785e7")), `{"type":"eq","term":"d","value":"f79c3e09-677c-4bbd-a479-3f349cb785e7"}`},
 		{"binary", iceberg.BinaryLiteral([]byte{0x01, 0x02, 0x03}), `{"type":"eq","term":"d","value":"010203"}`},
-		{"decimal", mustLit(t, "3.14", iceberg.DecimalTypeOf(9, 2)), `{"type":"eq","term":"d","value":"3.14"}`},
+		{"decimal", mustLit(t, "3.14", iceberg.MustDecimalTypeOf(9, 2)), `{"type":"eq","term":"d","value":"3.14"}`},
 	}
 
 	for _, tt := range tests {
@@ -275,6 +275,62 @@ func TestMarshalExpressionNonFiniteFloat(t *testing.T) {
 		_, err := json.Marshal(expr)
 		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
 	}
+}
+
+// TestMarshalExpressionExtractNotSerializable proves an extract term errors on JSON
+// marshal (both unbound and bound) rather than silently encoding to "term":{}.
+func TestMarshalExpressionExtractNotSerializable(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	unbound := iceberg.LiteralPredicate(iceberg.OpEQ,
+		iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64), iceberg.NewLiteral(int64(5)))
+	_, err := json.Marshal(unbound)
+	require.ErrorIs(t, err, iceberg.ErrExtractNotSerializable)
+
+	bound, err := iceberg.BindExpr(schema, unbound, true)
+	require.NoError(t, err)
+	_, err = json.Marshal(bound)
+	require.ErrorIs(t, err, iceberg.ErrExtractNotSerializable)
+}
+
+// TestSanitizeExpressionExtractCollapses proves an unbound extract term collapses to always-true so the sanitized scan-report filter still marshals.
+func TestSanitizeExpressionExtractCollapses(t *testing.T) {
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	sanitized, err := iceberg.SanitizeExpression(
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, sanitized)
+	_, err = json.Marshal(sanitized)
+	require.NoError(t, err)
+
+	mixed := iceberg.NewAnd(
+		iceberg.EqualTo(iceberg.Reference("id"), int32(5)),
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))))
+	sanitized, err = iceberg.SanitizeExpression(mixed)
+	require.NoError(t, err)
+	raw, err := json.Marshal(sanitized)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"id"`, "the non-extract predicate survives in the sanitized filter")
+
+	schema := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}})
+	boundExt, err := iceberg.BindExpr(schema,
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))), true)
+	require.NoError(t, err)
+	sanitizedBound, err := iceberg.SanitizeExpression(boundExt)
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, sanitizedBound)
+
+	negated, err := iceberg.SanitizeExpression(
+		iceberg.NewNot(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5)))))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, negated)
+
+	negatedBound, err := iceberg.SanitizeExpression(iceberg.NewNot(boundExt))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, negatedBound)
 }
 
 func mustLit(t *testing.T, s string, typ iceberg.Type) iceberg.Literal {
@@ -552,11 +608,74 @@ func TestUnmarshalExpressionTransformTermUnknown(t *testing.T) {
 	require.ErrorContains(t, err, "unknown transform in expression term")
 }
 
+// TestUnmarshalExpressionLiteralWrapper checks that a predicate value wrapped as
+// {"type":"literal","value":...}, as the spec's JSON grammar allows, parses the
+// same as the bare value.
+func TestUnmarshalExpressionLiteralWrapper(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "i", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "d", Type: iceberg.PrimitiveTypes.Date},
+	)
+
+	tests := []struct {
+		name    string
+		schema  *iceberg.Schema
+		wrapped string
+		bare    string
+	}{
+		{
+			"value takes the field type", schema,
+			`{"type":"eq","term":"d","value":{"type":"literal","value":"2022-08-14"}}`,
+			`{"type":"eq","term":"d","value":"2022-08-14"}`,
+		},
+		{
+			"data-type is ignored", schema,
+			`{"type":"eq","term":"d","value":{"type":"literal","value":"2022-08-14","data-type":"string"}}`,
+			`{"type":"eq","term":"d","value":"2022-08-14"}`,
+		},
+		{
+			"values mix wrapped and bare", schema,
+			`{"type":"in","term":"i","values":[{"type":"literal","value":1},2]}`,
+			`{"type":"in","term":"i","values":[1,2]}`,
+		},
+		{
+			"schema-less value", nil,
+			`{"type":"lt","term":"x","value":{"type":"literal","value":5}}`,
+			`{"type":"lt","term":"x","value":5}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want, err := iceberg.ParseExpr([]byte(tt.bare), tt.schema)
+			require.NoError(t, err)
+			got, err := iceberg.ParseExpr([]byte(tt.wrapped), tt.schema)
+			require.NoError(t, err)
+			assert.Truef(t, want.Equals(got), "want %s, got %s", want, got)
+		})
+	}
+}
+
+func TestUnmarshalExpressionLiteralWrapperErrors(t *testing.T) {
+	for name, value := range map[string]string{
+		"not a literal": `{"type":"reference","term":"a"}`,
+		"missing type":  `{"value":1}`,
+		"missing value": `{"type":"literal"}`,
+		"null value":    `{"type":"literal","value":null}`,
+		"nested":        `{"type":"literal","value":{"type":"literal","value":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := iceberg.ParseExpr([]byte(`{"type":"eq","term":"a","value":`+value+`}`), nil)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+		})
+	}
+}
+
 // TestUnmarshalExpressionFixedLength rejects a fixed value whose decoded length
 // doesn't match the column's declared length.
 func TestUnmarshalExpressionFixedLength(t *testing.T) {
 	schema := iceberg.NewSchema(0,
-		iceberg.NestedField{ID: 1, Name: "f", Type: iceberg.FixedTypeOf(4)},
+		iceberg.NestedField{ID: 1, Name: "f", Type: iceberg.MustFixedTypeOf(4)},
 	)
 	_, err := iceberg.ParseExpr([]byte(`{"type":"eq","term":"f","value":"0102"}`), schema)
 	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
@@ -570,4 +689,64 @@ func TestUnmarshalExpressionCaseSensitive(t *testing.T) {
 	)
 	_, err := iceberg.ParseExpr([]byte(`{"type":"eq","term":"ID","value":1}`), schema)
 	require.Error(t, err)
+}
+
+// A leaf name can resolve successfully to the wrong top-level field, silently
+// changing a remote filter. Preserve the schema-qualified name when binding.
+func TestMarshalBoundNestedReferencePreservesPath(t *testing.T) {
+	t.Parallel()
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "Nested", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 2, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+		}}},
+		iceberg.NestedField{ID: 3, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+	)
+	ref := iceberg.Reference("nested.value")
+	for _, tc := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		want string
+	}{
+		{"unary", iceberg.IsNull(ref), `{"type":"is-null","term":"Nested.Value"}`},
+		{"literal", iceberg.EqualTo(ref, int32(7)), `{"type":"eq","term":"Nested.Value","value":7}`},
+		{"set", iceberg.IsIn(ref, int32(7), int32(8)), `{"type":"in","term":"Nested.Value","values":[7,8]}`},
+		{
+			"transform", iceberg.EqualTo(iceberg.NewUnboundTransform(iceberg.BucketTransform{NumBuckets: 16}, ref), int32(7)),
+			`{"type":"eq","term":{"type":"transform","transform":"bucket[16]","term":"Nested.Value"},"value":7}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bound, err := iceberg.BindExpr(schema, tc.expr, false)
+			require.NoError(t, err)
+			assert.Equal(t, "Value", bound.(iceberg.BoundPredicate).Ref().Field().Name)
+			encoded, err := json.Marshal(bound)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.want, string(encoded))
+			parsed, err := iceberg.ParseExpr(encoded, schema)
+			require.NoError(t, err)
+			rebound, err := iceberg.BindExpr(schema, parsed, true)
+			require.NoError(t, err)
+			assert.True(t, bound.Equals(rebound), "the round trip must retain the nested field ID")
+			assert.Equal(t, 2, rebound.(iceberg.BoundPredicate).Ref().Field().ID)
+		})
+	}
+}
+
+func TestUnboundTransformRejectsWrappedReference(t *testing.T) {
+	t.Parallel()
+	// External wrappers can embed Reference, but binding
+	// rejects them before they can reach BoundTransform.MarshalJSON.
+	type wrappedReference struct {
+		iceberg.Reference
+	}
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "Nested", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 2, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+		}}},
+	)
+	term := iceberg.NewUnboundTransform(iceberg.BucketTransform{NumBuckets: 16},
+		wrappedReference{iceberg.Reference("Nested.Value")})
+	_, err := term.Bind(schema, true)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	require.ErrorContains(t, err, "transform terms must wrap a direct reference")
 }

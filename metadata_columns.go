@@ -17,10 +17,7 @@
 
 package iceberg
 
-import (
-	"math"
-	"slices"
-)
+import "math"
 
 // MaxStructFieldID is the largest field ID a user-supplied schema may assign.
 // Field IDs greater than this are reserved by the spec for metadata columns
@@ -44,6 +41,17 @@ const (
 	// LastUpdatedSequenceNumberFieldID is the field ID for _last_updated_sequence_number (optional long).
 	// The sequence number of the commit that last updated the row. Reserved as Integer.MAX_VALUE - 108.
 	LastUpdatedSequenceNumberFieldID = 2147483539
+)
+
+// Position delete file column field IDs. Reserved IDs are Integer.MAX_VALUE - 101
+// and Integer.MAX_VALUE - 102 per the Iceberg spec (Position Delete Files).
+const (
+	// DeleteFilePathFieldID is the field ID for file_path (required string), the
+	// data file a position delete applies to. Reserved as Integer.MAX_VALUE - 101.
+	DeleteFilePathFieldID = 2147483546
+	// DeleteFilePosFieldID is the field ID for pos (required long), the ordinal
+	// of the deleted row in that file. Reserved as Integer.MAX_VALUE - 102.
+	DeleteFilePosFieldID = 2147483545
 )
 
 // Row lineage metadata column names (v3+).
@@ -94,7 +102,7 @@ func SchemaWithRowLineageColumns(s *Schema, rowID, lastUpdatedSeq bool) *Schema 
 	if s == nil {
 		return nil
 	}
-	fields := slices.Clone(s.Fields())
+	fields := s.Fields()
 
 	hasRowID := false
 	hasSeqNum := false

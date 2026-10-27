@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -38,6 +39,7 @@ func testFSF(io iceio.IO) FSysF {
 // trackingCallsIO wraps trackingIO to count Open and Remove calls per path.
 type trackingCallsIO struct {
 	*trackingIO
+	mu          sync.Mutex
 	openCount   map[string]int
 	removeCount map[string]int
 }
@@ -50,23 +52,27 @@ func newTrackingCallsIO() *trackingCallsIO {
 	}
 }
 
-func (c *trackingCallsIO) Open(name string) (iceio.File, error) {
+func (c *trackingCallsIO) Open(_ context.Context, name string) (iceio.File, error) {
+	c.mu.Lock()
 	c.openCount[name]++
+	c.mu.Unlock()
 
-	return c.trackingIO.Open(name)
+	return c.trackingIO.Open(context.Background(), name)
 }
 
-func (c *trackingCallsIO) Remove(name string) error {
+func (c *trackingCallsIO) Remove(_ context.Context, name string) error {
+	c.mu.Lock()
 	c.removeCount[name]++
+	c.mu.Unlock()
 
-	return c.trackingIO.Remove(name)
+	return c.trackingIO.Remove(context.Background(), name)
 }
 
 // writeManifest writes a v2 data manifest with a single ADDED
 // entry pointing at dataPath into tio.files at manifestPath, and returns a
 // ManifestFile descriptor with seqNum pre-assigned so the same descriptor
 // can be referenced from multiple manifest lists.
-func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, manifestPath, dataPath string) iceberg.ManifestFile {
+func writeManifest(t testing.TB, tio *trackingIO, snapshotID, seqNum int64, manifestPath, dataPath string) iceberg.ManifestFile {
 	t.Helper()
 
 	dataSchema := iceberg.NewSchema(0,
@@ -81,7 +87,7 @@ func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, mani
 	require.NoError(t, err)
 
 	entry := iceberg.NewManifestEntryBuilder(iceberg.EntryStatusADDED, &snapshotID, df.Build()).
-		SequenceNum(seqNum).
+		DataSequenceNumber(seqNum).
 		Build()
 
 	var buf bytes.Buffer
@@ -89,8 +95,8 @@ func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, mani
 	require.NoError(t, err)
 	require.NoError(t, tio.WriteFile(manifestPath, buf.Bytes()))
 
-	return iceberg.NewManifestFile(2, manifestPath, int64(buf.Len()), 0, snapshotID).
-		SequenceNum(seqNum, seqNum).
+	return iceberg.NewManifestBuilder(2, manifestPath, int64(buf.Len()), 0, snapshotID).
+		SequenceNumber(seqNum, seqNum).
 		AddedFiles(1).
 		AddedRows(1).
 		Build()
@@ -98,7 +104,7 @@ func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, mani
 
 // writeManifestList writes a v2 manifest list referencing the
 // given manifests into tio.files at listPath.
-func writeManifestList(t *testing.T, tio *trackingIO, snapshotID int64, listPath string, manifests []iceberg.ManifestFile) {
+func writeManifestList(t testing.TB, tio *trackingIO, snapshotID int64, listPath string, manifests []iceberg.ManifestFile) {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -724,7 +730,7 @@ func TestUnmarshalUpdatesRejectsMissingRequiredFields(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.action, func(t *testing.T) {
 			var updates Updates
-			data := []byte(fmt.Sprintf(`[{"action":%q}]`, tt.action))
+			data := fmt.Appendf(nil, `[{"action":%q}]`, tt.action)
 			if tt.action == UpdateSetSnapshotRef {
 				data = snapshotRefPayload(tt.field, false)
 			}
@@ -791,7 +797,7 @@ func TestUnmarshalUpdatesRejectsNullRequiredPayload(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.action+"/"+tt.field, func(t *testing.T) {
 			var updates Updates
-			data := []byte(fmt.Sprintf(`[{"action":%q,%q:null}]`, tt.action, tt.field))
+			data := fmt.Appendf(nil, `[{"action":%q,%q:null}]`, tt.action, tt.field)
 			if tt.action == UpdateSetSnapshotRef {
 				data = snapshotRefPayload(tt.field, true)
 			}

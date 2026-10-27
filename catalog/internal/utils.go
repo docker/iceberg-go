@@ -33,7 +33,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/internal"
+	iceinternal "github.com/apache/iceberg-go/internal"
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
@@ -52,21 +52,21 @@ func WriteTableMetadata(metadata table.Metadata, fs icebergio.WriteFileIO, loc s
 	if err != nil {
 		return err
 	}
-	defer internal.CheckedClose(out, &err)
+	defer iceinternal.CheckedClose(out, &err)
 
 	var writer io.Writer = out
 	switch compression {
 	case table.MetadataCompressionCodecGzip:
 		gzw := gzip.NewWriter(out)
 		writer = gzw
-		defer internal.CheckedClose(gzw, &err)
+		defer iceinternal.CheckedClose(gzw, &err)
 	case table.MetadataCompressionCodecZstd:
 		enc, zErr := zstd.NewWriter(out)
 		if zErr != nil {
 			return zErr
 		}
 		writer = enc
-		defer internal.CheckedClose(enc, &err)
+		defer iceinternal.CheckedClose(enc, &err)
 	}
 
 	err = json.NewEncoder(writer).Encode(metadata)
@@ -135,7 +135,7 @@ func createStagedTable(
 	}
 
 	dbIdent := catalog.NamespaceFromIdent(ident)
-	tblname := catalog.TableNameFromIdent(ident)
+	tblname := catalog.ObjectNameFromIdent(ident)
 	if namespaceKey == "" {
 		namespaceKey = strings.Join(dbIdent, ".")
 	}
@@ -261,6 +261,26 @@ func ParseMetadataVersion(location string) int {
 	return v
 }
 
+// ValidateRequirements checks commit requirements against the table's current
+// metadata, which is nil when the table does not exist. A failed requirement
+// on a missing table is reported as catalog.ErrNoSuchTable; any other failure
+// means a concurrent writer changed the table, and is reported as
+// table.ErrCommitFailed so the commit retry loop can refresh and replay, as it
+// does for a REST 409.
+func ValidateRequirements(ident table.Identifier, current table.Metadata, reqs []table.Requirement) error {
+	for _, r := range reqs {
+		if err := r.Validate(current); err != nil {
+			if current == nil {
+				return fmt.Errorf("%w: %s: %w", catalog.ErrNoSuchTable, strings.Join(ident, "."), err)
+			}
+
+			return fmt.Errorf("%w: %w", table.ErrCommitFailed, err)
+		}
+	}
+
+	return nil
+}
+
 func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, current *table.Table, ident table.Identifier, reqs []table.Requirement, updates []table.Update, cat table.CatalogIO) (*table.StagedTable, error) {
 	var (
 		baseMeta        table.Metadata
@@ -287,10 +307,8 @@ func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, curre
 		}
 		newVersion = metadataVersion + 1
 	}
-	for _, r := range reqs {
-		if err := r.Validate(currentMetadata); err != nil {
-			return nil, err
-		}
+	if err := ValidateRequirements(ident, currentMetadata, reqs); err != nil {
+		return nil, err
 	}
 
 	updated, err := UpdateTableMetadata(baseMeta, updates, metadataLoc)
@@ -323,4 +341,54 @@ func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, curre
 			cat,
 		),
 	}, nil
+}
+
+func checkForOverlap(removals []string, updates iceberg.Properties) error {
+	overlap := []string{}
+	for _, key := range removals {
+		if _, ok := updates[key]; ok {
+			overlap = append(overlap, key)
+		}
+	}
+	if len(overlap) > 0 {
+		return fmt.Errorf("conflict between removals and updates for keys: %v", overlap)
+	}
+
+	return nil
+}
+
+// GetUpdatedPropsAndUpdateSummary applies removals and updates to currentProps
+// and returns the updated properties alongside a summary of the changes. It is
+// shared by the catalog backend implementations.
+func GetUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, catalog.PropertiesUpdateSummary, error) {
+	if err := checkForOverlap(removals, updates); err != nil {
+		return nil, catalog.PropertiesUpdateSummary{}, err
+	}
+	var (
+		updatedProps = maps.Clone(currentProps)
+		removed      = make([]string, 0, len(removals))
+		updated      = make([]string, 0, len(updates))
+	)
+
+	for _, key := range removals {
+		if _, exists := updatedProps[key]; exists {
+			delete(updatedProps, key)
+			removed = append(removed, key)
+		}
+	}
+
+	for key, value := range updates {
+		if updatedProps[key] != value {
+			updated = append(updated, key)
+			updatedProps[key] = value
+		}
+	}
+
+	summary := catalog.PropertiesUpdateSummary{
+		Removed: removed,
+		Updated: updated,
+		Missing: iceinternal.Difference(removals, removed),
+	}
+
+	return updatedProps, summary, nil
 }

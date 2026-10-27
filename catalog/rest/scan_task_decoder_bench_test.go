@@ -18,11 +18,16 @@
 package rest
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 )
 
-var decodeScanTasksBenchmarkSink int
+var (
+	decodeScanTasksBenchmarkSink   int
+	decodeJSONIntegerBenchmarkSink int64
+	decodeJSONFloatBenchmarkSink   float64
+)
 
 func BenchmarkDecodeScanTasksDeletionVectors(b *testing.B) {
 	metadata := newScanTaskDecoderMetadata()
@@ -59,8 +64,8 @@ func deletionVectorScanTasksWire(taskCount int, explicitOwner bool) ScanTasks {
 	dataFile := *base.FileScanTasks[0].DataFile
 	deleteFile := base.DeleteFiles[0]
 	deleteFile.FileFormat = "puffin"
-	deleteFile.ContentOffset = int64Ptr(10)
-	deleteFile.ContentSizeInBytes = int64Ptr(20)
+	deleteFile.ContentOffset = new(int64(10))
+	deleteFile.ContentSizeInBytes = new(int64(20))
 
 	wire := ScanTasks{
 		FileScanTasks: make([]RESTFileScanTask, taskCount),
@@ -72,7 +77,7 @@ func deletionVectorScanTasksWire(taskCount int, explicitOwner bool) ScanTasks {
 		delete := deleteFile
 		delete.FilePath = fmt.Sprintf("s3://bucket/table/delete-%d.puffin", i)
 		if explicitOwner {
-			delete.ReferencedDataFile = stringPtr(data.FilePath)
+			delete.ReferencedDataFile = new(data.FilePath)
 		}
 
 		wire.FileScanTasks[i] = RESTFileScanTask{
@@ -83,4 +88,117 @@ func deletionVectorScanTasksWire(taskCount int, explicitOwner bool) ScanTasks {
 	}
 
 	return wire
+}
+
+func BenchmarkDecodeScanTasks(b *testing.B) {
+	metadata := newScanTaskDecoderMetadata()
+	base := validScanTasksWire().FileScanTasks[0].DataFile
+
+	for _, taskCount := range []int{1, 64, 1024} {
+		b.Run(fmt.Sprintf("%d_tasks", taskCount), func(b *testing.B) {
+			wire := ScanTasks{FileScanTasks: make([]RESTFileScanTask, taskCount)}
+			for i := range wire.FileScanTasks {
+				dataFile := *base
+				wire.FileScanTasks[i] = RESTFileScanTask{
+					DataFile: &dataFile,
+				}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := DecodeScanTasks(wire, metadata, metadata.schema, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONInteger(b *testing.B) {
+	raw := json.RawMessage("12345")
+	for _, bitSize := range []int{32, 64} {
+		b.Run(fmt.Sprintf("int%d", bitSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := decodeJSONInteger(raw, bitSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeJSONIntegerBenchmarkSink = value
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONFloat(b *testing.B) {
+	raw := json.RawMessage("12345.25")
+	for _, bitSize := range []int{32, 64} {
+		b.Run(fmt.Sprintf("float%d", bitSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := decodeJSONFloat(raw, bitSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeJSONFloatBenchmarkSink = value
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONNumberForms(b *testing.B) {
+	for _, tc := range []struct {
+		name, raw string
+		floating  bool
+	}{
+		{name: "int64_exact", raw: "9007199254740993"},
+		{name: "quoted_int64", raw: `"9007199254740993"`},
+		{name: "exponent", raw: "-1.25e2", floating: true},
+		{name: "quoted_exponent", raw: `"-1.25e2"`, floating: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			raw := json.RawMessage(tc.raw)
+			b.ReportAllocs()
+			for b.Loop() {
+				if tc.floating {
+					value, err := decodeJSONFloat(raw, 64)
+					if err != nil {
+						b.Fatal(err)
+					}
+					decodeJSONFloatBenchmarkSink = value
+				} else {
+					value, err := decodeJSONInteger(raw, 64)
+					if err != nil {
+						b.Fatal(err)
+					}
+					decodeJSONIntegerBenchmarkSink = value
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeScanTasksSharedDeletionVector(b *testing.B) {
+	metadata := newScanTaskDecoderMetadata()
+	for _, taskCount := range []int{100, 1000, 10000} {
+		wire := deletionVectorScanTasksWire(1, false)
+		task := wire.FileScanTasks[0]
+		wire.FileScanTasks = make([]RESTFileScanTask, taskCount)
+		for i := range wire.FileScanTasks {
+			wire.FileScanTasks[i] = task
+		}
+
+		b.Run(fmt.Sprintf("derived-owner/tasks=%d", taskCount), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeScanTasksBenchmarkSink = len(tasks)
+			}
+		})
+	}
 }

@@ -18,17 +18,25 @@
 package sql_test
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/rand/v2"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -41,6 +49,7 @@ import (
 	_ "github.com/apache/iceberg-go/io/gocloud"
 	"github.com/apache/iceberg-go/metrics"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -631,7 +640,7 @@ func (s *SqliteCatalogTestSuite) TestV0SchemaViewOperationsUnsupported() {
 	})
 	viewID := []string{nsName, tableName()}
 
-	err := cat.CreateView(ctx, viewID, schema, "SELECT 1", nil)
+	err := cat.CreateView(ctx, viewID, schema, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil)
 	s.ErrorContains(err, "V0", "CreateView must be rejected on a V0 catalog")
 
 	_, err = cat.LoadView(ctx, viewID)
@@ -694,7 +703,7 @@ func (s *SqliteCatalogTestSuite) TestGenuineV0RowSurvivesMigrationForCommitAndRe
 		var got sql.NullString
 		qErr := sqldb.QueryRow(
 			`SELECT iceberg_type FROM iceberg_tables WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?`,
-			"default", nsStr, catalog.TableNameFromIdent(tblID),
+			"default", nsStr, catalog.ObjectNameFromIdent(tblID),
 		).Scan(&got)
 		s.Require().NoError(qErr)
 
@@ -719,7 +728,7 @@ func (s *SqliteCatalogTestSuite) TestGenuineV0RowSurvivesMigrationForCommitAndRe
 	_, err = sqldb.Exec(
 		`UPDATE iceberg_tables SET iceberg_type = NULL `+
 			`WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?`,
-		"default", nsStr, catalog.TableNameFromIdent(tblID),
+		"default", nsStr, catalog.ObjectNameFromIdent(tblID),
 	)
 	s.Require().NoError(err)
 
@@ -986,7 +995,7 @@ func (s *SqliteCatalogTestSuite) TestCreateV1Table() {
 
 		s.FileExists(strings.TrimPrefix(tbl.MetadataLocation(), "file://"))
 		s.Equal(0, tbl.SortOrder().OrderID())
-		s.Equal(1, tbl.Metadata().Version())
+		s.Equal(1, tbl.Metadata().FormatVersion())
 		s.True(tbl.Spec().Equals(*iceberg.UnpartitionedSpec))
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
 	}
@@ -1061,7 +1070,7 @@ func (s *SqliteCatalogTestSuite) TestCreateTableWithGivenLocation() {
 
 	for _, tt := range tests {
 		ns := catalog.NamespaceFromIdent(tt.tblID)
-		tblName := catalog.TableNameFromIdent(tt.tblID)
+		tblName := catalog.ObjectNameFromIdent(tt.tblID)
 
 		location := fmt.Sprintf("file://%s/%s.db/%s-given",
 			s.warehouse, tt.cat.Name(), tblName)
@@ -1311,7 +1320,7 @@ func (s *SqliteCatalogTestSuite) TestDottedNamespaceUsesOwnLocationProperties() 
 		s.Equal(location+"/orders", createdTable.Location())
 
 		viewIdent := append(slices.Clone(namespace), "orders_view")
-		s.Require().NoError(cat.CreateView(ctx, viewIdent, tableSchemaNested, "SELECT * FROM orders", nil))
+		s.Require().NoError(cat.CreateView(ctx, viewIdent, tableSchemaNested, view.Representation{SQL: "SELECT * FROM orders", Dialect: "spark"}, nil))
 		createdView, err := cat.LoadView(ctx, viewIdent)
 		s.Require().NoError(err)
 		s.Equal(location+"/orders_view", createdView.Location())
@@ -1489,6 +1498,248 @@ func (s *SqliteCatalogTestSuite) TestDropTableNotExist() {
 	}
 }
 
+// stageStringRow stages one row for the string field "foo" on tx.
+func (s *SqliteCatalogTestSuite) stageStringRow(ctx context.Context, tx *table.Transaction, value string) {
+	arrowSchema := arrow.NewSchema([]arrow.Field{{Name: "foo", Type: arrow.BinaryTypes.String}}, nil)
+	bldr := array.NewStringBuilder(memory.DefaultAllocator)
+	defer bldr.Release()
+	bldr.Append(value)
+	arr := bldr.NewArray()
+	defer arr.Release()
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{arr}, 1)
+	defer rec.Release()
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.RecordBatch{rec})
+	defer arrTable.Release()
+
+	s.Require().NoError(tx.AppendTable(ctx, arrTable, 1024, nil))
+}
+
+// appendStringRow commits one row to branch, creating the branch from
+// main's head if it does not exist.
+func (s *SqliteCatalogTestSuite) appendStringRow(ctx context.Context, tbl *table.Table, branch, value string) *table.Table {
+	tx, err := tbl.NewTransactionOnBranch(branch)
+	s.Require().NoError(err)
+	s.stageStringRow(ctx, tx, value)
+	out, err := tx.Commit(ctx)
+	s.Require().NoError(err)
+
+	return out
+}
+
+// waitPastSnapshots blocks until the wall clock in milliseconds is past
+// every snapshot timestamp of meta, so an expiry with WithOlderThan(0)
+// treats them all as old enough.
+func (s *SqliteCatalogTestSuite) waitPastSnapshots(meta table.Metadata) {
+	var newest int64
+	for _, snap := range meta.Snapshots() {
+		newest = max(newest, snap.TimestampMs)
+	}
+	s.Require().Eventually(func() bool { return time.Now().UnixMilli() > newest },
+		time.Second, time.Millisecond)
+}
+
+// createRetryingStringTable creates a single-column string table that
+// retries conflicting commits numRetries times with millisecond waits,
+// then appends one row per value.
+func (s *SqliteCatalogTestSuite) createRetryingStringTable(ctx context.Context, cat *sqlcat.Catalog, numRetries string, values ...string) table.Identifier {
+	schema := iceberg.NewSchema(1, iceberg.NestedField{
+		ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true,
+	})
+	tblID := s.randomTableIdentifier()
+	s.Require().NoError(cat.CreateNamespace(ctx, catalog.NamespaceFromIdent(tblID), nil))
+
+	tbl, err := cat.CreateTable(ctx, tblID, schema, catalog.WithProperties(iceberg.Properties{
+		table.CommitNumRetriesKey:     numRetries,
+		table.CommitMinRetryWaitMsKey: "1",
+		table.CommitMaxRetryWaitMsKey: "2",
+	}))
+	s.Require().NoError(err)
+	for _, v := range values {
+		tbl = s.appendStringRow(ctx, tbl, table.MainBranch, v)
+	}
+
+	return tblID
+}
+
+// An ExpireSnapshots call with nothing to expire must not stop the
+// transaction's append from rebasing onto a peer's append.
+func (s *SqliteCatalogTestSuite) TestStaleAppendWithNoOpExpireRetriesAfterPeerAppend() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "2", "seed")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	tx := stale.NewTransaction()
+	s.stageStringRow(ctx, tx, "stale")
+	s.Require().NoError(tx.ExpireSnapshots())
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	peer = s.appendStringRow(ctx, peer, table.MainBranch, "peer")
+	peerHead := peer.Metadata().CurrentSnapshot().SnapshotID
+
+	_, err = tx.Commit(ctx)
+	s.Require().NoError(err)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Len(current.Metadata().Snapshots(), 3)
+	parent := current.Metadata().CurrentSnapshot().ParentSnapshotID
+	s.Require().NotNil(parent)
+	s.Equal(peerHead, *parent)
+}
+
+// A rollback staged before a peer advanced the branch must not be
+// replayed against the new head, which would drop the peer's append.
+func (s *SqliteCatalogTestSuite) TestStaleRollbackFailsAfterPeerAppend() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "2", "seed", "second")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	first := stale.Metadata().CurrentSnapshot().ParentSnapshotID
+	s.Require().NotNil(first)
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	peer = s.appendStringRow(ctx, peer, table.MainBranch, "peer")
+	peerHead := peer.Metadata().CurrentSnapshot().SnapshotID
+
+	tx := stale.NewTransaction()
+	s.Require().NoError(tx.RollbackToSnapshot(*first))
+	_, err = tx.Commit(ctx)
+	s.Require().Error(err)
+	s.ErrorIs(err, table.ErrCommitFailed)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(peerHead, current.Metadata().CurrentSnapshot().SnapshotID)
+	s.Len(current.Metadata().Snapshots(), 3)
+}
+
+// Snapshot expiry staged before a peer rolled the branch back must not
+// be replayed against the new head: its retention window was computed
+// from the old head, so it would expire snapshots the rolled-back
+// branch still retains.
+func (s *SqliteCatalogTestSuite) TestStaleExpireSnapshotsFailsAfterPeerRollback() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "2", "s1", "s2", "s3", "s4")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	snaps := slices.Clone(stale.Metadata().Snapshots())
+	s.Require().Len(snaps, 4)
+	slices.SortFunc(snaps, func(a, b table.Snapshot) int { return cmp.Compare(a.SequenceNumber, b.SequenceNumber) })
+	ids := make([]int64, len(snaps))
+	for i, snap := range snaps {
+		ids[i] = snap.SnapshotID
+	}
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	peerTx := peer.NewTransaction()
+	s.Require().NoError(peerTx.RollbackToSnapshot(ids[1]))
+	_, err = peerTx.Commit(ctx)
+	s.Require().NoError(err)
+
+	s.waitPastSnapshots(stale.Metadata())
+
+	tx := stale.NewTransaction()
+	s.Require().NoError(tx.ExpireSnapshots(table.WithRetainLast(3), table.WithOlderThan(0), table.WithPostCommit(false)))
+	_, err = tx.Commit(ctx)
+	s.Require().Error(err)
+	s.ErrorIs(err, table.ErrCommitFailed)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(ids[1], current.Metadata().CurrentSnapshot().SnapshotID)
+	var remaining []int64
+	for _, snap := range current.Metadata().Snapshots() {
+		remaining = append(remaining, snap.SnapshotID)
+	}
+	s.ElementsMatch(ids, remaining)
+}
+
+// A rollback of a branch the transaction staged must not be replayed
+// against a branch a peer created meanwhile, which would point the
+// peer's branch back at main and drop its append.
+func (s *SqliteCatalogTestSuite) TestStaleRollbackOfStagedBranchFailsAfterPeerCreatesIt() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "2", "seed", "second")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	mainHead := stale.Metadata().CurrentSnapshot().SnapshotID
+
+	tx, err := stale.NewTransactionOnBranch("feature")
+	s.Require().NoError(err)
+	s.stageStringRow(ctx, tx, "stale")
+	s.Require().NoError(tx.RollbackToSnapshot(mainHead))
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	peer = s.appendStringRow(ctx, peer, "feature", "peer")
+	peerHead := peer.Metadata().SnapshotByName("feature").SnapshotID
+
+	_, err = tx.Commit(ctx)
+	s.Require().Error(err)
+	s.ErrorIs(err, table.ErrCommitFailed)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(peerHead, current.Metadata().SnapshotByName("feature").SnapshotID)
+	s.Equal(mainHead, current.Metadata().CurrentSnapshot().SnapshotID)
+	s.Len(current.Metadata().Snapshots(), 3)
+}
+
+// Snapshot expiry in a transaction that staged a new branch must not be
+// replayed against a branch a peer created meanwhile: its retention was
+// computed without the peer's branch.
+func (s *SqliteCatalogTestSuite) TestStaleExpireWithStagedBranchFailsAfterPeerCreatesIt() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "2", "seed", "second")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	peer = s.appendStringRow(ctx, peer, "feature", "peer")
+	peerHead := peer.Metadata().SnapshotByName("feature").SnapshotID
+	s.waitPastSnapshots(peer.Metadata())
+
+	tx, err := stale.NewTransactionOnBranch("feature")
+	s.Require().NoError(err)
+	s.stageStringRow(ctx, tx, "stale")
+	s.Require().NoError(tx.ExpireSnapshots(table.WithRetainLast(1), table.WithOlderThan(0), table.WithPostCommit(false)))
+	_, err = tx.Commit(ctx)
+	s.Require().Error(err)
+	s.ErrorIs(err, table.ErrCommitFailed)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(peerHead, current.Metadata().SnapshotByName("feature").SnapshotID)
+	var remaining []int64
+	for _, snap := range current.Metadata().Snapshots() {
+		remaining = append(remaining, snap.SnapshotID)
+	}
+	var expected []int64
+	for _, snap := range peer.Metadata().Snapshots() {
+		expected = append(expected, snap.SnapshotID)
+	}
+	s.ElementsMatch(expected, remaining)
+}
+
 func (s *SqliteCatalogTestSuite) TestPurgeTable() {
 	tests := []struct {
 		cat   *sqlcat.Catalog
@@ -1558,11 +1809,7 @@ func (s *SqliteCatalogTestSuite) TestPurgeTable() {
 		s.Require().NoError(err)
 		s.Require().NoError(os.WriteFile(metaLoc, newMetaBytes, 0o644))
 
-		// Assert that the catalog implements PurgeableTable
-		purger, ok := any(tt.cat).(catalog.PurgeableTable)
-		s.Require().True(ok, "catalog must implement PurgeableTable")
-
-		s.NoError(purger.PurgeTable(context.Background(), tt.tblID))
+		s.NoError(tt.cat.PurgeTable(context.Background(), tt.tblID))
 
 		// The table catalog entry should be gone
 		_, err = tt.cat.LoadTable(context.Background(), tt.tblID)
@@ -1633,10 +1880,7 @@ func (s *SqliteCatalogTestSuite) TestPurgeTableGCDisabled() {
 		metaLoc := strings.TrimPrefix(tbl.MetadataLocation(), "file://")
 		s.FileExists(metaLoc)
 
-		purger, ok := any(tt.cat).(catalog.PurgeableTable)
-		s.Require().True(ok, "catalog must implement PurgeableTable")
-
-		s.NoError(purger.PurgeTable(context.Background(), tt.tblID))
+		s.NoError(tt.cat.PurgeTable(context.Background(), tt.tblID))
 
 		// The table catalog entry should be gone
 		_, err = tt.cat.LoadTable(context.Background(), tt.tblID)
@@ -1874,7 +2118,7 @@ func (s *SqliteCatalogTestSuite) TestDropNamespaceRejectsViewOnlyNamespace() {
 	})
 
 	s.Require().NoError(cat.CreateNamespace(ctx, namespace, nil))
-	s.Require().NoError(cat.CreateView(ctx, viewID, schema, viewSQL, nil))
+	s.Require().NoError(cat.CreateView(ctx, viewID, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 
 	err := cat.DropNamespace(ctx, namespace)
 	s.ErrorIs(err, catalog.ErrNamespaceNotEmpty)
@@ -1920,6 +2164,393 @@ func (s *SqliteCatalogTestSuite) TestLoadEmptyNamespaceProperties() {
 		s.Require().NoError(err)
 		s.Empty(props)
 	}
+}
+
+func (s *SqliteCatalogTestSuite) TestCreateNamespaceConcurrent() {
+	// Two callers creating the same namespace: exactly one succeeds and the other
+	// gets ErrNamespaceAlreadyExists, not the driver's duplicate-key error.
+	const writers = 8
+
+	// A busy timeout so the writers queue on the sqlite lock instead of failing
+	// with SQLITE_BUSY, which is a different contention problem to this one.
+	loaded, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":             s.catalogUri() + "?_pragma=" + url.QueryEscape("busy_timeout(10000)"),
+		sqlcat.DriverKey:  sqliteshim.ShimName,
+		sqlcat.DialectKey: string(sqlcat.SQLite),
+		"type":            "sql",
+		"warehouse":       "file://" + s.warehouse,
+	})
+	s.Require().NoError(err)
+
+	cat := loaded.(*sqlcat.Catalog)
+	ctx := context.Background()
+	namespace := table.Identifier{databaseName()}
+
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Go(func() {
+			<-start
+			errs <- cat.CreateNamespace(ctx, namespace, nil)
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	created, alreadyExists := 0, 0
+	var unexpected []error
+	for err := range errs {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, catalog.ErrNamespaceAlreadyExists):
+			alreadyExists++
+		default:
+			unexpected = append(unexpected, err)
+		}
+	}
+
+	s.Empty(unexpected, "want nil or ErrNamespaceAlreadyExists")
+	s.Equal(1, created)
+	s.Equal(writers-1, alreadyExists)
+}
+
+// insertFailure selects how the emulated namespace insert fails.
+type insertFailure int
+
+const (
+	// failUnique: insert trips the unique constraint and the namespace exists on
+	// the re-check -- the raced create-if-absent that the fix must recover.
+	failUnique insertFailure = iota
+	// failUnrelated: insert fails for an unrelated reason and the namespace does
+	// not exist -- the original error must survive, not become "already exists".
+	failUnrelated
+	// insertSucceeds: the insert commits, exercising the savepoint happy path
+	// (SAVEPOINT -> insert -> RELEASE SAVEPOINT) on the Postgres branch.
+	insertSucceeds
+)
+
+var (
+	errEmulatedUnique    = errors.New("UNIQUE constraint failed: iceberg_namespace_properties.catalog_name, iceberg_namespace_properties.namespace, iceberg_namespace_properties.property_key")
+	errEmulatedUnrelated = errors.New("disk I/O error")
+	errEmulatedAborted   = errors.New("current transaction is aborted, commands ignored until end of transaction block")
+)
+
+// pgAbortDriver emulates Postgres for the create race: after the namespace
+// insert fails it refuses statements until a ROLLBACK TO SAVEPOINT clears it.
+type pgAbortDriver struct {
+	base            driver.Driver
+	mode            insertFailure
+	insertAttempted atomic.Bool
+	aborted         atomic.Bool
+}
+
+func (d *pgAbortDriver) Open(dsn string) (driver.Conn, error) {
+	conn, err := d.base.Open(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pgAbortConn{Conn: conn, drv: d}, nil
+}
+
+type pgAbortConn struct {
+	driver.Conn
+	drv *pgAbortDriver
+}
+
+// These match bun's emitted SQL: an "INSERT"/"EXISTS" statement naming the
+// namespace table, and its "ROLLBACK TO SAVEPOINT" prefix.
+func isNamespaceInsert(query string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "INSERT") &&
+		strings.Contains(query, "iceberg_namespace_properties")
+}
+
+func isNamespaceExistsProbe(query string) bool {
+	return strings.Contains(strings.ToUpper(query), "EXISTS") &&
+		strings.Contains(query, "iceberg_namespace_properties")
+}
+
+func isRollbackToSavepoint(query string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "ROLLBACK TO SAVEPOINT")
+}
+
+func (c *pgAbortConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	execer, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	if c.drv.aborted.Load() {
+		if isRollbackToSavepoint(query) {
+			c.drv.aborted.Store(false)
+
+			return execer.ExecContext(ctx, query, args)
+		}
+
+		return nil, errEmulatedAborted
+	}
+
+	if isNamespaceInsert(query) {
+		c.drv.insertAttempted.Store(true)
+		switch c.drv.mode {
+		case insertSucceeds:
+			return execer.ExecContext(ctx, query, args)
+		case failUnrelated:
+			c.drv.aborted.Store(true)
+
+			return nil, errEmulatedUnrelated
+		default:
+			c.drv.aborted.Store(true)
+
+			return nil, errEmulatedUnique
+		}
+	}
+
+	return execer.ExecContext(ctx, query, args)
+}
+
+func (c *pgAbortConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	if c.drv.aborted.Load() {
+		return nil, errEmulatedAborted
+	}
+
+	// Postgres probes information_schema for schema-version detection; sqlite has
+	// no such view, so answer as the V1 table this suite creates (column present).
+	if strings.Contains(query, "information_schema") {
+		return &boolRows{val: true}, nil
+	}
+
+	// The namespace exists on the re-check only in the unique-violation case: a
+	// concurrent winner committed the row. An unrelated failure leaves it absent.
+	// In the success case the insert is real, so let the probe read true persistence.
+	if isNamespaceExistsProbe(query) {
+		if c.drv.mode == insertSucceeds {
+			return queryer.QueryContext(ctx, query, args)
+		}
+
+		return &boolRows{val: c.drv.insertAttempted.Load() && c.drv.mode == failUnique}, nil
+	}
+
+	return queryer.QueryContext(ctx, query, args)
+}
+
+func (c *pgAbortConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	beginTx, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, driver.ErrBadConn
+	}
+
+	return beginTx.BeginTx(ctx, opts)
+}
+
+func (c *pgAbortConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	prepCtx, ok := c.Conn.(driver.ConnPrepareContext)
+	if !ok {
+		return nil, driver.ErrBadConn
+	}
+
+	return prepCtx.PrepareContext(ctx, query)
+}
+
+// boolRows is a single-row, single-column result carrying a SQL EXISTS answer.
+type boolRows struct {
+	val  bool
+	done bool
+}
+
+func (r *boolRows) Columns() []string { return []string{"exists"} }
+func (r *boolRows) Close() error      { return nil }
+func (r *boolRows) Next(dest []driver.Value) error {
+	// bun's Exists() scans SELECT EXISTS via QueryRowContext.Scan(&bool), so it
+	// keys on the value: emit one 0/1 row, not an empty result (that is ErrNoRows).
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	if r.val {
+		dest[0] = int64(1)
+	} else {
+		dest[0] = int64(0)
+	}
+
+	return nil
+}
+
+func (s *SqliteCatalogTestSuite) newAbortCatalog(mode insertFailure) (*sqlcat.Catalog, *pgAbortDriver) {
+	base, err := sql.Open(sqliteshim.ShimName, ":memory:")
+	s.Require().NoError(err)
+	s.Require().NoError(base.Close())
+
+	// drvName derives from databaseName() (unique per call); sql.Register panics
+	// on a duplicate name, so this must not become a fixed string.
+	drvName := "sqlite-pgabort-" + databaseName()
+	drv := &pgAbortDriver{base: base.Driver(), mode: mode}
+	sql.Register(drvName, drv)
+
+	sqldb, err := sql.Open(drvName, s.catalogUri())
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = sqldb.Close() })
+	// Single connection so the driver's abort state spans the pre-check and the
+	// transaction that follows it.
+	sqldb.SetMaxOpenConns(1)
+
+	// Postgres dialect so the savepoint-backed recovery path runs; the driver
+	// above emulates Postgres aborting the tx over an sqlite base.
+	cat, err := sqlcat.NewCatalog("default", sqldb, sqlcat.Postgres, iceberg.Properties{"warehouse": "file://" + s.warehouse})
+	s.Require().NoError(err)
+
+	return cat, drv
+}
+
+// dupInsertDriver emulates a dialect that rolls back only the failing statement
+// (SQLite): the namespace insert trips a unique violation without poisoning the
+// tx, so the re-check runs on the same tx and recovers the sentinel.
+type dupInsertDriver struct {
+	base            driver.Driver
+	insertAttempted atomic.Bool
+}
+
+func (d *dupInsertDriver) Open(dsn string) (driver.Conn, error) {
+	conn, err := d.base.Open(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dupInsertConn{Conn: conn, drv: d}, nil
+}
+
+type dupInsertConn struct {
+	driver.Conn
+	drv *dupInsertDriver
+}
+
+func (c *dupInsertConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	execer, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	if isNamespaceInsert(query) {
+		c.drv.insertAttempted.Store(true)
+
+		return nil, errEmulatedUnique
+	}
+
+	return execer.ExecContext(ctx, query, args)
+}
+
+func (c *dupInsertConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	// After the insert, the namespace exists on the re-check; before it, absent.
+	if isNamespaceExistsProbe(query) {
+		return &boolRows{val: c.drv.insertAttempted.Load()}, nil
+	}
+
+	return queryer.QueryContext(ctx, query, args)
+}
+
+func (c *dupInsertConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	beginTx, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, driver.ErrBadConn
+	}
+
+	return beginTx.BeginTx(ctx, opts)
+}
+
+func (c *dupInsertConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	prepCtx, ok := c.Conn.(driver.ConnPrepareContext)
+	if !ok {
+		return nil, driver.ErrBadConn
+	}
+
+	return prepCtx.PrepareContext(ctx, query)
+}
+
+func (s *SqliteCatalogTestSuite) newDupCatalog() (*sqlcat.Catalog, *dupInsertDriver) {
+	base, err := sql.Open(sqliteshim.ShimName, ":memory:")
+	s.Require().NoError(err)
+	s.Require().NoError(base.Close())
+
+	drvName := "sqlite-dupinsert-" + databaseName()
+	drv := &dupInsertDriver{base: base.Driver()}
+	sql.Register(drvName, drv)
+
+	sqldb, err := sql.Open(drvName, s.catalogUri())
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = sqldb.Close() })
+	sqldb.SetMaxOpenConns(1)
+
+	// SQLite dialect so the non-Postgres recovery branch (plain insert + re-check)
+	// runs; the driver rolls back only the failing statement, so no savepoint.
+	cat, err := sqlcat.NewCatalog("default", sqldb, sqlcat.SQLite, iceberg.Properties{"warehouse": "file://" + s.warehouse})
+	s.Require().NoError(err)
+
+	return cat, drv
+}
+
+// Pins the non-Postgres branch: on SQLite a lost insert race recovers the
+// sentinel via the re-check without a savepoint.
+func (s *SqliteCatalogTestSuite) TestCreateNamespaceLosesInsertRaceSQLite() {
+	namespace := table.Identifier{databaseName()}
+	cat, drv := s.newDupCatalog()
+
+	err := cat.CreateNamespace(context.Background(), namespace, nil)
+	s.ErrorIs(err, catalog.ErrNamespaceAlreadyExists)
+	s.Contains(err.Error(), namespace[0])
+	s.True(drv.insertAttempted.Load(), "the emulated insert must have run")
+}
+
+// Exercises the Postgres savepoint happy path: SAVEPOINT -> insert -> RELEASE.
+func (s *SqliteCatalogTestSuite) TestCreateNamespaceSucceedsThroughSavepoint() {
+	namespace := table.Identifier{databaseName()}
+	cat, drv := s.newAbortCatalog(insertSucceeds)
+
+	ctx := context.Background()
+	err := cat.CreateNamespace(ctx, namespace, nil)
+	s.Require().NoError(err)
+	s.True(drv.insertAttempted.Load(), "the emulated insert must have run")
+
+	// The row must survive RELEASE SAVEPOINT; a ROLLBACK there would persist none.
+	exists, err := cat.CheckNamespaceExists(ctx, namespace)
+	s.Require().NoError(err)
+	s.True(exists, "the namespace must persist through the savepoint commit")
+}
+
+// Emulates Postgres aborting the transaction: only passes if the savepoint let
+// the re-check recover the sentinel, which SQLite alone cannot show.
+func (s *SqliteCatalogTestSuite) TestCreateNamespaceLosesInsertRace() {
+	namespace := table.Identifier{databaseName()}
+	cat, drv := s.newAbortCatalog(failUnique)
+
+	err := cat.CreateNamespace(context.Background(), namespace, nil)
+	s.ErrorIs(err, catalog.ErrNamespaceAlreadyExists)
+	s.Contains(err.Error(), namespace[0])
+	s.True(drv.insertAttempted.Load(), "the emulated insert must have run")
+}
+
+// An unrelated insert failure on an absent namespace must surface its own
+// error, not a misleading ErrNamespaceAlreadyExists.
+func (s *SqliteCatalogTestSuite) TestCreateNamespaceInsertFailureSurfacesOriginalError() {
+	namespace := table.Identifier{databaseName()}
+	cat, drv := s.newAbortCatalog(failUnrelated)
+
+	err := cat.CreateNamespace(context.Background(), namespace, nil)
+	s.Error(err)
+	s.NotErrorIs(err, catalog.ErrNamespaceAlreadyExists)
+	s.Contains(err.Error(), "disk I/O error")
+	s.True(drv.insertAttempted.Load(), "the emulated insert must have run")
 }
 
 func (s *SqliteCatalogTestSuite) TestCreateNamespaceRejectsReservedProperty() {
@@ -2130,7 +2761,7 @@ func (s *SqliteCatalogTestSuite) TestCommitTable() {
 		s.EqualValues(0, tbl.Metadata().CurrentSchema().ID)
 
 		tx := tbl.NewTransaction()
-		s.Require().NoError(tx.AddFiles(ctx, []string{pqfile}, nil, false))
+		s.Require().NoError(tx.AddDataFilesByPath(ctx, []string{pqfile}, nil, false))
 		updated, err := tx.Commit(ctx)
 		s.Require().NoError(err)
 
@@ -2224,8 +2855,8 @@ func (s *SqliteCatalogTestSuite) TestCreateView() {
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
 	})
-	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
-	s.Require().NoError(db.CreateView(context.Background(), append(nestedNamespace, viewName), schema, viewSQL, nil))
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
+	s.Require().NoError(db.CreateView(context.Background(), append(nestedNamespace, viewName), schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 
 	exists, err := db.CheckViewExists(context.Background(), []string{nsName, viewName})
 	s.Require().NoError(err)
@@ -2271,7 +2902,7 @@ func TestViewOperationsRejectInvalidIdentifiers(t *testing.T) {
 
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
-			err := cat.CreateView(context.Background(), test.identifier, nil, "", nil)
+			err := cat.CreateView(context.Background(), test.identifier, nil, view.Representation{SQL: "", Dialect: "spark"}, nil)
 			assert.ErrorIs(t, err, catalog.ErrNoSuchView)
 
 			_, err = cat.CheckViewExists(context.Background(), test.identifier)
@@ -2302,7 +2933,7 @@ func (s *SqliteCatalogTestSuite) TestCreateTableConflictsWithView() {
 	db := s.getCatalogSqlite()
 	identifier := s.randomTableIdentifier()
 	s.Require().NoError(db.CreateNamespace(ctx, catalog.NamespaceFromIdent(identifier), nil))
-	s.Require().NoError(db.CreateView(ctx, identifier, tableSchemaNested, "SELECT 1", nil))
+	s.Require().NoError(db.CreateView(ctx, identifier, tableSchemaNested, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil))
 
 	metadataDir := filepath.Join(s.warehouse, identifier[0]+".db", identifier[1], "metadata")
 	before, err := os.ReadDir(metadataDir)
@@ -2328,7 +2959,7 @@ func (s *SqliteCatalogTestSuite) TestCreateViewConflictsWithTable() {
 	before, err := os.ReadDir(metadataDir)
 	s.Require().NoError(err)
 
-	err = db.CreateView(ctx, identifier, tableSchemaNested, "SELECT 1", nil)
+	err = db.CreateView(ctx, identifier, tableSchemaNested, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil)
 	s.ErrorIs(err, catalog.ErrTableAlreadyExists)
 
 	after, err := os.ReadDir(metadataDir)
@@ -2360,12 +2991,85 @@ func (s *SqliteCatalogTestSuite) TestConcurrentTableViewCollisionReturnsCatalogS
 	}()
 	go func() {
 		<-start
-		err := db.CreateView(ctx, identifier, tableSchemaNested, "SELECT 1", nil)
+		err := db.CreateView(ctx, identifier, tableSchemaNested, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil)
 		results <- createResult{objectType: sqlcat.ViewType, err: err}
 	}()
 	close(start)
 
 	first, second := <-results, <-results
+	s.Require().NotEqual(first.err == nil, second.err == nil,
+		"expected exactly one concurrent create to succeed; table/view results: %v / %v", first.err, second.err)
+	if first.err != nil {
+		first, second = second, first
+	}
+	s.Require().NoError(first.err)
+	if first.objectType == sqlcat.TableType {
+		s.ErrorIs(second.err, catalog.ErrTableAlreadyExists)
+	} else {
+		s.ErrorIs(second.err, catalog.ErrViewAlreadyExists)
+	}
+}
+
+// TestConcurrentTableViewCollisionUnderLockContention pins the lock-retry budget in
+// retrySerializableWriteTx. SQLite serializes writers and reports a lock conflict on
+// upgrade immediately, without consulting the busy handler, so the losing create only
+// observes the catalog-level collision once the winner commits. Holding the write lock
+// for longer than the retry budget used to surface SQLITE_BUSY to the caller instead of
+// ErrTableAlreadyExists/ErrViewAlreadyExists.
+func (s *SqliteCatalogTestSuite) TestConcurrentTableViewCollisionUnderLockContention() {
+	// Longer than the former 30ms budget. Attempts fire at 0/10/30/70/150/310ms,
+	// so a 50ms hold is contended through attempt 3 (70ms) and leaves attempts 4
+	// and 5 for the loser to observe the committed winner; the hold would have to
+	// drift past 150ms before the collision could land on the last attempt.
+	const holdWriteLockFor = 50 * time.Millisecond
+
+	ctx := context.Background()
+	sqlDB := s.getDB()
+	_, err := sqlDB.Exec("PRAGMA journal_mode=WAL")
+	s.Require().NoError(err)
+	_, err = sqlDB.Exec("CREATE TABLE IF NOT EXISTS lock_holder(x)")
+	s.Require().NoError(err)
+	s.Require().NoError(sqlDB.Close())
+
+	db := s.getCatalogSqlite()
+	identifier := s.randomTableIdentifier()
+	s.Require().NoError(db.CreateNamespace(ctx, catalog.NamespaceFromIdent(identifier), nil))
+
+	// Hold the database-wide write lock so both creates begin while contended.
+	holder := s.getDB()
+	tx, err := holder.BeginTx(ctx, nil)
+	s.Require().NoError(err)
+	_, err = tx.ExecContext(ctx, "INSERT INTO lock_holder VALUES (1)")
+	s.Require().NoError(err)
+
+	released := make(chan struct{})
+	time.AfterFunc(holdWriteLockFor, func() {
+		_ = tx.Rollback()
+		_ = holder.Close()
+		close(released)
+	})
+
+	type createResult struct {
+		objectType string
+		err        error
+	}
+	start := make(chan struct{})
+	results := make(chan createResult, 2)
+	go func() {
+		<-start
+		_, err := db.CreateTable(ctx, identifier, tableSchemaNested)
+		results <- createResult{objectType: sqlcat.TableType, err: err}
+	}()
+	go func() {
+		<-start
+		err := db.CreateView(ctx, identifier, tableSchemaNested, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil)
+		results <- createResult{objectType: sqlcat.ViewType, err: err}
+	}()
+	close(start)
+
+	first, second := <-results, <-results
+	<-released
+
 	s.Require().NotEqual(first.err == nil, second.err == nil,
 		"expected exactly one concurrent create to succeed; table/view results: %v / %v", first.err, second.err)
 	if first.err != nil {
@@ -2409,7 +3113,7 @@ func (s *SqliteCatalogTestSuite) TestCreateRemovesMetadataIfCatalogInsertFails()
 		{
 			name: "view",
 			create: func(identifier table.Identifier) error {
-				return db.CreateView(ctx, identifier, tableSchemaNested, "SELECT 1", nil)
+				return db.CreateView(ctx, identifier, tableSchemaNested, view.Representation{SQL: "SELECT 1", Dialect: "spark"}, nil)
 			},
 		},
 	}
@@ -2440,7 +3144,7 @@ func (s *SqliteCatalogTestSuite) TestDropView() {
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
 	})
-	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 
 	exists, err := db.CheckViewExists(context.Background(), []string{nsName, viewName})
 	s.Require().NoError(err)
@@ -2499,7 +3203,7 @@ func (s *SqliteCatalogTestSuite) TestDropViewWithInvalidMetadataLocation() {
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
 	})
-	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 
 	// Manually update the metadata location to a URL with an unsupported scheme
 	// This will cause io.LoadFS to fail with "IO for file '...' not implemented"
@@ -2535,7 +3239,7 @@ func (s *SqliteCatalogTestSuite) TestCheckViewExists() {
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
 	})
-	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 
 	exists, err = db.CheckViewExists(context.Background(), []string{nsName, viewName})
 	s.Require().NoError(err)
@@ -2555,7 +3259,7 @@ func (s *SqliteCatalogTestSuite) TestListViews() {
 		schema := iceberg.NewSchema(1, iceberg.NestedField{
 			ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
 		})
-		s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
+		s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, nil))
 	}
 
 	var foundViews []table.Identifier
@@ -2609,7 +3313,7 @@ func (s *SqliteCatalogTestSuite) TestLoadView() {
 		"comment": "Test view",
 		"owner":   "test-user",
 	}
-	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, props))
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, view.Representation{SQL: viewSQL, Dialect: "spark"}, props))
 
 	viewInfo, err := db.LoadView(context.Background(), []string{nsName, viewName})
 	s.Require().NoError(err)

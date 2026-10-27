@@ -123,11 +123,11 @@ var _ HadoopCatalogFS = (*stubHadoopCatalogFS)(nil)
 
 type stubIO struct{}
 
-func (stubIO) Open(string) (icebergio.File, error) {
+func (stubIO) Open(context.Context, string) (icebergio.File, error) {
 	return nil, fs.ErrNotExist
 }
 
-func (stubIO) Remove(string) error {
+func (stubIO) Remove(context.Context, string) error {
 	return nil
 }
 
@@ -142,7 +142,7 @@ func (s *HadoopCatalogTestSuite) SetupTest() {
 	s.warehouse, err = os.MkdirTemp("", "test_hadoop_*")
 	s.Require().NoError(err)
 
-	s.cat, err = NewCatalog("test", s.warehouse, nil)
+	s.cat, err = NewCatalog(context.Background(), "test", s.warehouse, nil)
 	s.Require().NoError(err)
 }
 
@@ -377,27 +377,27 @@ func (s *HadoopCatalogTestSuite) TestRegistrationMissingWarehouse() {
 }
 
 func (s *HadoopCatalogTestSuite) TestNewCatalogTrimsTrailingSlash() {
-	cat, err := NewCatalog("test", "/tmp/wh/", nil)
+	cat, err := NewCatalog(context.Background(), "test", "/tmp/wh/", nil)
 	s.Require().NoError(err)
 	s.Equal("/tmp/wh", cat.warehouse)
 }
 
 func (s *HadoopCatalogTestSuite) TestNewCatalogStripsFilePrefix() {
-	cat, err := NewCatalog("test", "file:///tmp/wh", nil)
+	cat, err := NewCatalog(context.Background(), "test", "file:///tmp/wh", nil)
 	s.Require().NoError(err)
 	s.Equal("/tmp/wh", cat.warehouse)
 
-	cat, err = NewCatalog("test", "file:/tmp/wh", nil)
+	cat, err = NewCatalog(context.Background(), "test", "file:/tmp/wh", nil)
 	s.Require().NoError(err)
 	s.Equal("/tmp/wh", cat.warehouse)
 }
 
 func (s *HadoopCatalogTestSuite) TestNewCatalogRequiresOptInForRemoteSchemes() {
-	_, err := NewCatalog("test", "s3://bucket/path", nil)
+	_, err := NewCatalog(context.Background(), "test", "s3://bucket/path", nil)
 	s.Require().Error(err)
 	s.Contains(err.Error(), "`allow-unsafe-commits` must be set to true")
 
-	_, err = NewCatalog("test", "hdfs://namenode/warehouse", nil)
+	_, err = NewCatalog(context.Background(), "test", "hdfs://namenode/warehouse", nil)
 	s.Require().Error(err)
 	s.Contains(err.Error(), "`allow-unsafe-commits` must be set to true")
 
@@ -408,7 +408,7 @@ func (s *HadoopCatalogTestSuite) TestNewCatalogRequiresOptInForRemoteSchemes() {
 		return &stubHadoopCatalogFS{}, nil
 	})
 
-	_, err = NewCatalog("test", scheme+"://bucket/path", nil)
+	_, err = NewCatalog(context.Background(), "test", scheme+"://bucket/path", nil)
 	s.Require().Error(err)
 	s.Contains(err.Error(), "`allow-unsafe-commits` must be set to true")
 	s.False(loadFSCalled)
@@ -423,7 +423,7 @@ func (s *HadoopCatalogTestSuite) TestNewCatalogRemoteHappyPathWithUnsafeCommits(
 		return &stubHadoopCatalogFS{}, nil
 	})
 
-	cat, err := NewCatalog("test", scheme+"://bucket/wh/", iceberg.Properties{
+	cat, err := NewCatalog(context.Background(), "test", scheme+"://bucket/wh/", iceberg.Properties{
 		"allow-unsafe-commits": "true",
 	})
 	s.Require().NoError(err)
@@ -446,7 +446,7 @@ func (s *HadoopCatalogTestSuite) TestNewCatalogRemoteRequiresHadoopCatalogFS() {
 		return stubIO{}, nil
 	})
 
-	_, err := NewCatalog("test", scheme+"://bucket/wh", iceberg.Properties{
+	_, err := NewCatalog(context.Background(), "test", scheme+"://bucket/wh", iceberg.Properties{
 		"allow-unsafe-commits": "true",
 	})
 	s.Require().Error(err)
@@ -936,7 +936,7 @@ func (s *HadoopCatalogTestSuite) TestCreateNamespaceNestedParentMissing() {
 
 func (s *HadoopCatalogTestSuite) TestCreateNamespaceWithProperties() {
 	err := s.cat.CreateNamespace(context.Background(), []string{"ns"}, iceberg.Properties{"key": "val"})
-	s.Require().Error(err)
+	s.Require().ErrorIs(err, iceberg.ErrNotImplemented)
 	s.Contains(err.Error(), "properties are not supported")
 }
 
@@ -1131,8 +1131,8 @@ func (s *HadoopCatalogTestSuite) TestLoadNamespacePropertiesFileNotDir() {
 
 func (s *HadoopCatalogTestSuite) TestUpdateNamespacePropertiesUnsupported() {
 	_, err := s.cat.UpdateNamespaceProperties(context.Background(), []string{"ns"}, nil, nil)
-	s.Require().Error(err)
-	s.Contains(err.Error(), "not yet implemented")
+	s.Require().ErrorIs(err, iceberg.ErrNotImplemented)
+	s.Contains(err.Error(), "properties are not supported")
 }
 
 func (s *HadoopCatalogTestSuite) TestDropNamespaceWithRegularFilesOnly() {
@@ -1571,7 +1571,7 @@ func (s *HadoopCatalogTestSuite) TestCreateTableAndLoad() {
 func (s *HadoopCatalogTestSuite) TestCreateTableInvalidReporterDoesNotMutate() {
 	s.Require().NoError(os.Mkdir(filepath.Join(s.warehouse, "ns"), 0o755))
 
-	_, err := NewCatalog("test", s.warehouse, iceberg.Properties{
+	_, err := NewCatalog(context.Background(), "test", s.warehouse, iceberg.Properties{
 		metrics.ReporterImplKey: "does-not-exist",
 	})
 	s.Require().Error(err)
@@ -1857,7 +1857,7 @@ func (s *HadoopCatalogTestSuite) TestCommitMetadataFileFailsClosedOnMetadataScan
 		s.cat.filesystem = originalFS
 	}()
 
-	err = s.cat.commitMetadataFile(ident, 1, tempPath, metaPath, table.ErrCommitFailed)
+	err = s.cat.commitMetadataFile(context.Background(), ident, 1, tempPath, metaPath, table.ErrCommitFailed)
 	s.Require().Error(err)
 	s.Contains(err.Error(), "failed to inspect metadata directory for version 1")
 	s.ErrorIs(err, fs.ErrPermission)
@@ -2105,8 +2105,7 @@ func (s *HadoopCatalogTestSuite) TestDropTableNamespacePreserved() {
 
 func (s *HadoopCatalogTestSuite) TestRenameTableUnsupported() {
 	_, err := s.cat.RenameTable(context.Background(), []string{"ns", "old"}, []string{"ns", "new"})
-	s.Require().Error(err)
-	s.Contains(err.Error(), "not supported")
+	s.ErrorIs(err, iceberg.ErrNotImplemented)
 }
 
 func (s *HadoopCatalogTestSuite) TestListTablesNamespaceIsFile() {
@@ -2146,6 +2145,65 @@ func (s *HadoopCatalogTestSuite) TestLoadTableNotExists() {
 	_, err := s.cat.LoadTable(ctx, []string{"ns", "tbl"})
 	s.Require().Error(err)
 	s.ErrorIs(err, catalog.ErrNoSuchTable)
+}
+
+func (s *HadoopCatalogTestSuite) TestLoadTableEnablesCatalogManifestContentCache() {
+	ctx := context.Background()
+	cat, err := NewCatalog(ctx, "test", s.warehouse, iceberg.Properties{
+		table.IOManifestCacheEnabledKey: "true",
+	})
+	s.Require().NoError(err)
+
+	identifier := table.Identifier{"cache-ns", "cache-table"}
+	s.Require().NoError(cat.CreateNamespace(ctx, identifier[:1], nil))
+	created, err := cat.CreateTable(ctx, identifier, s.testSchema())
+	s.Require().NoError(err)
+
+	builder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentData,
+		filepath.Join(created.Location(), "sample.parquet"), iceberg.ParquetFile,
+		nil, nil, nil, 1, 1,
+	)
+	s.Require().NoError(err)
+	txn := created.NewTransaction()
+	s.Require().NoError(txn.AddDataFiles(ctx, []iceberg.DataFile{builder.Build()}, nil))
+	_, err = txn.Commit(ctx)
+	s.Require().NoError(err)
+
+	loaded, err := cat.LoadTable(ctx, identifier)
+	s.Require().NoError(err)
+	s.NotContains(loaded.SavedConfig(), table.IOManifestCacheEnabledKey)
+
+	plan := func(tbl *table.Table) error {
+		tasks, err := tbl.Scan(table.WithMaxConcurrency(1)).PlanFiles(ctx)
+		if err == nil {
+			s.Len(tasks, 1)
+		}
+
+		return err
+	}
+	s.Require().NoError(plan(loaded))
+
+	fs, err := loaded.FS(ctx)
+	s.Require().NoError(err)
+	manifests, err := loaded.CurrentSnapshot().Manifests(fs)
+	s.Require().NoError(err)
+	s.Require().Len(manifests, 1)
+
+	manifestPath := manifests[0].FilePath()
+	if parsed, parseErr := url.Parse(manifestPath); parseErr == nil && parsed.Scheme == "file" {
+		manifestPath = parsed.Path
+	}
+	movedPath := manifestPath + ".temporarily-moved"
+	s.Require().NoError(os.Rename(manifestPath, movedPath))
+	defer func() { s.Require().NoError(os.Rename(movedPath, manifestPath)) }()
+
+	// A fresh handle cannot read the missing manifest, while the warmed
+	// handle can still plan using its cached immutable manifest bytes.
+	cold, err := cat.LoadTable(ctx, identifier)
+	s.Require().NoError(err)
+	s.Require().Error(plan(cold))
+	s.Require().NoError(plan(loaded))
 }
 
 func (s *HadoopCatalogTestSuite) TestLoadTablePropagatesMetadataReadError() {
@@ -2364,7 +2422,7 @@ func (s *HadoopCatalogTestSuite) TestCreateTableMetadataFormatVersion() {
 	s.Require().NoError(err)
 
 	// Default format version should be V2
-	s.Equal(2, tbl.Metadata().Version())
+	s.Equal(2, tbl.Metadata().FormatVersion())
 }
 
 // CommitTable tests
